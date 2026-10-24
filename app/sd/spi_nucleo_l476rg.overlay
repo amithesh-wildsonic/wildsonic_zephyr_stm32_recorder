@@ -1,0 +1,31 @@
+/*
+ * SD card over SPI1 (pins come from the Zephyr board file):
+ *   PA5 SCK, PA6 MISO (SD "DO"), PA7 MOSI (SD "DI"), PB6 CS (Arduino D10)
+ * Note PA5 is also the green user LED, it will flicker while writing.
+ */
+/*
+ * DMA is essential here: without it Zephyr's SPI driver is interrupt-per-byte and an
+ * 80 MHz core cannot keep up with a 20 MHz SPI clock (2.5 MB/s = 2.5 M interrupts/s).
+ * SPI1 on L4 (RM0351 DMA request map): TX = DMA1 ch3 req 1, RX = DMA1 ch2 req 1.
+ * DMA1 ch1 is taken by the audio ADC (boards/nucleo_l476rg.overlay).
+ */
+#include <zephyr/dt-bindings/dma/stm32_dma.h>
+
+&spi1 {
+	status = "okay";
+	dmas = <&dma1 3 1 (STM32_DMA_PERIPH_TX | STM32_DMA_PRIORITY_HIGH)>,
+	       <&dma1 2 1 (STM32_DMA_PERIPH_RX | STM32_DMA_PRIORITY_HIGH)>;
+	dma-names = "tx", "rx";
+
+	sdhc0: sdhc@0 {
+		compatible = "zephyr,sdhc-spi-slot";
+		reg = <0>;
+		status = "okay";
+		mmc {
+			compatible = "zephyr,sdmmc-disk";
+			disk-name = "SD";
+			status = "okay";
+		};
+		spi-max-frequency = <25000000>;
+	};
+};

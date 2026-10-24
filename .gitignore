@@ -1,0 +1,52 @@
+# Build directories and compiler outputs
+build/
+build_*/
+out/
+CMakeCache.txt
+CMakeFiles/
+*.ninja
+*.ninja_deps
+*.ninja_log
+
+# Firmware binary outputs
+*.bin
+*.elf
+*.hex
+*.map
+
+# Python virtual environment and test caches
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.pytest_cache/
+.coverage
+htmlcov/
+.venv/
+venv/
+env/
+
+# Editor and OS metadata
+.cache/
+.vscode/*
+!.vscode/settings.json
+.idea/
+*.swp
+*.swo
+*~
+Thumbs.db
+desktop.ini
+.DS_Store
+
+# Temporary prompt/log and backup files
+last_user_input.txt
+latest_user_prompt.txt
+request*.txt
+step*.txt
+user_log*.txt
+*.patch
+*.orig
+*.rej
+*_backup/
+backup_*/
+

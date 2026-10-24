@@ -1,0 +1,27 @@
+{
+  "zephyr-workbench.build.configurations": [
+    {
+      "name": "primary",
+      "board": "nucleo_l476rg",
+      "active": "true",
+      "default-runner": "stm32cubeprogrammer",
+      "west-flags": [
+        "SD_BUS=sdmmc"
+      ]
+    },
+    {
+      "name": "replay",
+      "board": "nucleo_l476rg",
+      "west-flags": [],
+      "env.EXTRA_CONF_FILE": [
+        "${workspaceFolder}/configs/integrity_replay.conf"
+      ]
+    }
+  ],
+  "zephyr-workbench.westWorkspace": "${workspaceFolder}/../../../zephyrproject",
+  "zephyr-workbench.toolchain": "zephyr",
+  "zephyr-workbench.sdk": "${workspaceFolder}/../../../zephyr-sdk-1.0.1",
+  "zephyr-workbench.intellisense.provider": "cpptools",
+  "cmake.configureOnOpen": false,
+  "cmake.enableAutomaticKitScan": false
+}

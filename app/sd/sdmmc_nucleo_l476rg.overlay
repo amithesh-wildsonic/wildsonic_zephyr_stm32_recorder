@@ -1,0 +1,33 @@
+/*
+ * SD card over SDMMC1, 4-bit  (UNTESTED on hardware - see README).
+ *   PC8 D0, PC9 D1, PC10 D2, PC11 D3, PC12 CK, PD2 CMD   (ST morpho headers)
+ * The L476 has no HSI48; the SDMMC kernel clock (CLK48) comes from MSI,
+ * so MSI is switched to 48 MHz (range 11). SYSCLK stays on HSI16 -> PLL.
+ * Add 10-47k pull-ups on CMD and D0-D3 if your breakout has none.
+ */
+&clk_msi {
+	status = "okay";
+	msi-range = <11>;
+};
+
+&sdmmc1 {
+	status = "okay";
+	pinctrl-0 = <&sdmmc1_d0_pc8 &sdmmc1_d1_pc9 &sdmmc1_d2_pc10
+		     &sdmmc1_d3_pc11 &sdmmc1_ck_pc12 &sdmmc1_cmd_pd2>;
+	pinctrl-names = "default";
+	bus-width = <4>;
+	clk-div = <2>;		/* STM32L4 formula: 48 MHz / (2 * 2) = 12 MHz; four-bit bus */
+	disk-name = "SD";
+};
+
+/*
+ * SD cards need CMD and D0-D3 pulled high (SD spec: 10-100k). Many breakouts have none,
+ * so enable the MCU's internal pull-ups (~40k). Harmless if the breakout already has
+ * its own. Keep wires short (< 10 cm): 12 MHz over long jumpers is the usual cause of
+ * "mount failed" / CRC errors.
+ */
+&sdmmc1_d0_pc8   { bias-pull-up; };
+&sdmmc1_d1_pc9   { bias-pull-up; };
+&sdmmc1_d2_pc10  { bias-pull-up; };
+&sdmmc1_d3_pc11  { bias-pull-up; };
+&sdmmc1_cmd_pd2  { bias-pull-up; };

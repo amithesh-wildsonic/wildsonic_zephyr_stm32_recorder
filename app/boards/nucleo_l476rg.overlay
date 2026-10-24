@@ -1,0 +1,50 @@
+/*
+ * Board-specific audio wiring for NUCLEO-L476RG.
+ * Everything pin/peripheral related for the audio input is here, nothing in C.
+ *
+ *   MAX4466 OUT -> PA0 (Arduino A0, ADC1_IN5)
+ *   TIM6 TRGO   -> ADC1 external trigger (sample clock)
+ *   DMA1 ch1    -> ADC1 (request 0), circular, 16-bit
+ */
+#include <zephyr/dt-bindings/dma/stm32_dma.h>
+
+/ {
+	zephyr,user {
+		io-channels = <&adc1 5>;
+		dmas = <&dma1 1 0 (STM32_DMA_PERIPH_RX | STM32_DMA_PRIORITY_VERY_HIGH |
+				   STM32_DMA_PERIPH_16BITS | STM32_DMA_MEM_16BITS |
+				   STM32_DMA_MODE_CYCLIC)>;
+		dma-names = "audio_rx";
+	};
+};
+
+&adc1 {
+	pinctrl-0 = <&adc1_in5_pa0>;
+	pinctrl-names = "default";
+};
+
+&dma1 {
+	status = "okay";
+};
+
+&pll {
+	div-m = <1>;
+	mul-n = <18>;
+	div-r = <4>;
+	div-q = <6>;
+	clocks = <&clk_hsi>;
+	status = "okay";
+};
+
+&rcc {
+	clocks = <&pll>;
+	clock-frequency = <DT_FREQ_M(72)>;
+	ahb-prescaler = <1>;
+	apb1-prescaler = <1>;
+	apb2-prescaler = <1>;
+};
+
+&timers6 {
+	status = "okay";
+};
+
