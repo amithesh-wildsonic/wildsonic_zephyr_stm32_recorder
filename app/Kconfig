@@ -85,12 +85,12 @@ config AUDIO_SAMPLE_RATE
 
 config AUDIO_BLOCK_SAMPLES
 	int "Samples per block (one DMA half-buffer / one queue item)"
-	default 2048
+	default 4096
 	help
 	  Block size in samples.
-	  For 16-bit mono: 2048 samples * 2 bytes = 4096 bytes (8 SD sectors).
-	  For 32-bit mono: 2048 samples * 4 bytes = 8192 bytes (16 SD sectors).
-	  At 192 kHz, 11,520,000 samples / 2048 = exactly 5625 blocks for a 60-second file.
+	  For 16-bit mono: 4096 samples * 2 bytes = 8192 bytes (16 SD sectors).
+	  For 32-bit mono: 4096 samples * 4 bytes = 16384 bytes (32 SD sectors).
+	  At 192 kHz, 11,520,000 samples / 4096 = exactly 2812.5 blocks for a 60-second file.
 
 choice AUDIO_DIAGNOSTIC_BLOCK_SIZE
 	prompt "ADC block size for stage diagnostics"
@@ -118,12 +118,12 @@ config AUDIO_DIAGNOSTIC_BLOCK_SAMPLES
 
 config AUDIO_NUM_BLOCKS
 	int "Number of blocks in the RAM pool (the SD-stall buffer)"
-	default 16 if AUDIO_SAMPLE_BITS_16
-	default 8 if AUDIO_SAMPLE_BITS_32
+	default 4 if AUDIO_SAMPLE_BITS_16
+	default 2 if AUDIO_SAMPLE_BITS_32
 	help
 	  Buffered time = NUM_BLOCKS * BLOCK_SAMPLES / sample_rate.
-	  With 16 blocks of 2048 samples at 16-bit: 64 KB pool, 170.7 ms buffer.
-	  With 8 blocks of 2048 samples at 32-bit: 64 KB pool, 85.3 ms buffer.
+	  With 4 blocks of 4096 samples at 16-bit: 32 KB pool, 85.3 ms buffer.
+	  With 2 blocks of 4096 samples at 32-bit: 32 KB pool, 42.7 ms buffer.
 	  Both safely fit within the 96 KB SRAM1 region without overflowing.
 
 config AUDIO_OVERSAMPLE_LOG2

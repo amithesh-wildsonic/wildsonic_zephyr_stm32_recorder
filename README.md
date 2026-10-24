@@ -114,32 +114,103 @@ ninja --version
 
 ---
 
-## 3. VS Code Setup
+## 3. Workbench for Zephyr — VS Code Setup
 
-1. **Open the Repository**:
-   Launch VS Code from the root directory:
-   ```powershell
-   cd C:\Users\amith\Downloads\wildsonic_zephyr_stm32_recorder
-   code .
-   ```
+This project uses **Workbench for Zephyr**, a Visual Studio Code extension, to manage the Zephyr development environment, toolchain, application builds, flashing, and debugging.
 
-2. **Workspace Configuration**:
-   The repository includes [`.vscode/settings.json`](file:///C:/Users/amith/Downloads/wildsonic_zephyr_stm32_recorder/.vscode/settings.json) configured to locate the firmware project under `app/`:
-   ```json
-   {
-       "cmake.sourceDirectory": "${workspaceFolder}/app",
-       "terminal.integrated.stickyScroll.enabled": false
-   }
-   ```
+### Prerequisites
 
-3. **Recommended Extensions**:
-   - **C/C++** (`ms-vscode.cpptools`)
-   - **CMake Tools** (`ms-vscode.cmake-tools`)
-   - **Python** (`ms-python.python`)
-   - **Serial Monitor** (`ms-vscode.vscode-serial-monitor`)
+- Visual Studio Code
+- Workbench for Zephyr extension by Ac6
+- A Zephyr west workspace
+- Zephyr SDK with the ARM toolchain
+- STM32 NUCLEO-L476RG board and USB connection
 
-4. **Integrated Terminal**:
-   Open a terminal in VS Code (`Ctrl+\``) and activate your Zephyr virtual environment to run build and flash commands directly.
+### 3.1 Install Workbench
+
+1. Open Visual Studio Code.
+2. Open Extensions using `Ctrl+Shift+X`.
+3. Search for **Workbench for Zephyr** by Ac6.
+4. Install the extension.
+5. Open the Workbench for Zephyr view from the Activity Bar.
+6. Select **Install Host Tools** and allow the installation to complete.
+
+Extension: [Workbench for Zephyr on VS Code Marketplace](https://marketplace.visualstudio.com/items?itemName=Ac6.zephyr-workbench)
+
+### 3.2 Register the Zephyr SDK
+
+In the Workbench view, open the toolchain management section.
+
+1. Select the option to add or import a toolchain.
+2. Select the existing Zephyr SDK installation if one is already available.
+3. Otherwise, install a compatible Zephyr SDK and select its installation directory.
+4. Verify that the ARM compiler is available for the selected toolchain.
+
+Use the SDK version compatible with the project's Zephyr workspace and existing build configuration.
+
+### 3.3 Register the west workspace
+
+1. Open the Workbench for Zephyr view.
+2. Select **Add West Workspace**.
+3. Choose the option to use a local folder.
+4. Select the existing west workspace root, which contains the `.west` directory.
+5. Confirm that Workbench detects the Zephyr source tree and workspace version.
+
+> [!IMPORTANT]
+> Do not initialize another workspace when the existing workspace is intended for this project.
+
+### 3.4 Import the STM32 recorder application
+
+1. Open **Add Application** in Workbench.
+2. Select **Import existing application**.
+3. Select the registered west workspace.
+4. Select the compatible Zephyr SDK toolchain.
+5. Select board `nucleo_l476rg`.
+6. Browse to the repository's `app/` directory.
+7. Create the application entry.
+
+The application directory must contain its Zephyr [`CMakeLists.txt`](file:///C:/Users/amith/Downloads/wildsonic_zephyr_stm32_recorder/app/CMakeLists.txt) and [`prj.conf`](file:///C:/Users/amith/Downloads/wildsonic_zephyr_stm32_recorder/app/prj.conf).
+
+### 3.5 Configure the production build
+
+Create a production build configuration for board `nucleo_l476rg`.
+
+Set the build output directory to:
+
+`build/prod`
+
+Add the project's required CMake definition:
+
+`-DSD_BUS=sdmmc`
+
+Preserve the production configuration from [`app/prj.conf`](file:///C:/Users/amith/Downloads/wildsonic_zephyr_stm32_recorder/app/prj.conf) and the project's existing board/device-tree configuration.
+
+> [!WARNING]
+> Use a separate output directory for every additional build configuration. Do not reuse the production build directory for diagnostic, integrity, synthetic-audio, or formatting builds.
+
+### 3.6 Build the firmware
+
+Select the production configuration in Workbench and run **Build**.
+
+Wait for the build to complete. The build output is available in the VS Code integrated terminal.
+
+### 3.7 Flash the Nucleo
+
+1. Connect the NUCLEO-L476RG over USB.
+2. Select the production build configuration.
+3. Use Workbench's Flash action with the configured, supported flash runner.
+4. Reset the board if required by the runner.
+5. Open the serial terminal using the firmware's configured UART settings.
+
+### 3.8 Debug the application
+
+Use Workbench's Debug Manager to configure a supported debug server and the generated ELF file.
+
+Select the appropriate ST-LINK or other supported runner, then start the debug session from VS Code.
+
+Refer to the Workbench documentation for runner installation and debug configuration:
+
+https://z-workbench.com/docs/documentation/
 
 ---
 

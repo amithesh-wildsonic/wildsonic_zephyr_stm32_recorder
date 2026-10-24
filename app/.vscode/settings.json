@@ -1,26 +1,29 @@
 {
   "zephyr-workbench.build.configurations": [
     {
-      "name": "primary",
+      "name": "TEST",
       "board": "nucleo_l476rg",
-      "active": "true",
-      "default-runner": "stm32cubeprogrammer",
       "west-flags": [
         "SD_BUS=sdmmc"
-      ]
+      ],
+      "env.EXTRA_CONF_FILE": [
+        "${workspaceFolder}/configs/test_benchmark.conf;C:/Users/amith/Downloads/wildsonic_zephyr_stm32_recorder/app/configs/test_diagnostics.conf;C:/Users/amith/Downloads/wildsonic_zephyr_stm32_recorder/app/configs/test_integrity_replay.conf;C:/Users/amith/Downloads/wildsonic_zephyr_stm32_recorder/app/configs/test_synth.conf;C:/Users/amith/Downloads/wildsonic_zephyr_stm32_recorder/app/configs/diagnostic_2048.conf"
+      ],
+      "default-runner": "stm32cubeprogrammer"
     },
     {
-      "name": "replay",
+      "name": "PRODUCTION",
       "board": "nucleo_l476rg",
-      "west-flags": [],
-      "env.EXTRA_CONF_FILE": [
-        "${workspaceFolder}/configs/integrity_replay.conf"
-      ]
+      "active": "true",
+      "west-flags": [
+        "SD_BUS=sdmmc"
+      ],
+      "default-runner": "stm32cubeprogrammer"
     }
   ],
   "zephyr-workbench.westWorkspace": "${workspaceFolder}/../../../zephyrproject",
   "zephyr-workbench.toolchain": "zephyr",
-  "zephyr-workbench.sdk": "${workspaceFolder}/../../../zephyr-sdk-1.0.1",
+  "zephyr-workbench.sdk": "global",
   "zephyr-workbench.intellisense.provider": "cpptools",
   "cmake.configureOnOpen": false,
   "cmake.enableAutomaticKitScan": false

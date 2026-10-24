@@ -35,6 +35,8 @@ else()
     src/dsp.c
     src/rtc_sleep.c
     src/rtc_calendar.c
+    src/scheduler.c
+    src/console.c
   )
   target_sources_ifdef(CONFIG_AUDIO_SRC_SYNTH app PRIVATE src/audio_in_synth.c)
   target_sources_ifdef(CONFIG_AUDIO_SRC_ADC_STM32L4 app PRIVATE src/audio_in_stm32l4.c)
