@@ -510,24 +510,6 @@ wildsonic_zephyr_stm32_recorder/
 └── README.md                    # Primary developer guide (this file)
 ```
 
-### 10.2 Basic Git Workflow
-Follow standard feature-branch conventions when contributing:
-
-```powershell
-# Check current status
-git status
-
-# Create and checkout a feature branch
-git checkout -b feature/my-new-feature
-
-# Stage and commit your changes
-git add <files>
-git commit -m "feat: description of change"
-
-# Pull latest changes from main
-git checkout main
-git pull origin main
-```
 
 ### 10.3 Reference Documentation
 - **Architecture & Pipeline**: [`docs/ARCHITECTURE.md`](file:///C:/Users/amith/Downloads/wildsonic_zephyr_stm32_recorder/docs/ARCHITECTURE.md)
@@ -543,59 +525,4 @@ git pull origin main
    - *Expected*: Active ~25 to 50 mA (dominated by SD flash write current spikes); Standby ~0.4 to 0.8 mA.
 
 ---
-
-## 10. Repository and Development Workflow
-
-### 10.1 Directory Layout
-```
-wildsonic_zephyr_stm32_recorder/
-├── app/                         # Core Zephyr application
-│   ├── boards/                  # Nucleo L476RG board devicetree overlays
-│   ├── configs/                 # Modular test and diagnostic configuration files
-│   ├── sd/                      # SDMMC and SPI storage devicetree overlays
-│   ├── src/                     # C application source files
-│   │   ├── diagnostics/         # Isolated benchmarks and diagnostic suites
-│   │   ├── audio_in_stm32l4.c   # Hardware-timed ADC/DMA audio acquisition
-│   │   ├── dsp.c                # 5-stage biquad DSP pipeline
-│   │   ├── recorder.c           # WAV writer engine and session coordinator
-│   │   └── psram_is66wvs.c      # Quad-SPI external PSRAM driver
-│   ├── CMakeLists.txt           # Application build definitions
-│   ├── Kconfig                  # Application configuration symbol menu
-│   └── prj.conf                 # Default production configuration
-├── docs/                        # Technical documentation & reference manuals
-│   ├── ARCHITECTURE.md          # Real-time pipeline, threading, and DSP math
-│   ├── HARDWARE_WIRING.md       # Pin mapping, decoupling, and electrical specs
-│   ├── BENCHMARK_VALIDATION.md  # PSRAM and SD throughput characterization
-│   └── FORMAT_SD_CARD.md        # exFAT and FAT32 microSD formatting guide
-├── tests/
-│   ├── host/                    # Automated host regression tests (pytest)
-│   └── hw_integration/          # Target-specific hardware integration tests
-├── .gitignore                   # Git exclusion rules
-└── README.md                    # Primary developer guide (this file)
-```
-
-### 10.2 Basic Git Workflow
-Follow standard feature-branch conventions when contributing:
-
-```powershell
-# Check current status
-git status
-
-# Create and checkout a feature branch
-git checkout -b feature/my-new-feature
-
-# Stage and commit your changes
-git add <files>
-git commit -m "feat: description of change"
-
-# Pull latest changes from main
-git checkout main
-git pull origin main
-```
-
-### 10.3 Reference Documentation
-- **Architecture & Pipeline**: [`docs/ARCHITECTURE.md`](file:///C:/Users/amith/Downloads/wildsonic_zephyr_stm32_recorder/docs/ARCHITECTURE.md)
-- **Hardware & Wiring**: [`docs/HARDWARE_WIRING.md`](file:///C:/Users/amith/Downloads/wildsonic_zephyr_stm32_recorder/docs/HARDWARE_WIRING.md)
-- **SD Card Formatting**: [`docs/FORMAT_SD_CARD.md`](file:///C:/Users/amith/Downloads/wildsonic_zephyr_stm32_recorder/docs/FORMAT_SD_CARD.md)
-- **Benchmark Analysis**: [`docs/BENCHMARK_VALIDATION.md`](file:///C:/Users/amith/Downloads/wildsonic_zephyr_stm32_recorder/docs/BENCHMARK_VALIDATION.md)
 
