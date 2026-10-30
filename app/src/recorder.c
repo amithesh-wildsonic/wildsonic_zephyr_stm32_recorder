@@ -195,8 +195,15 @@ static void sd_writer_thread_fn(void *p1, void *p2, void *p3) {
           uint32_t us = (uint32_t)k_cyc_to_us_floor64(diff_cyc);
 
           if (w != (ssize_t)bytes_read) {
-            LOG_ERR("SD writer fs_write failed: ret=%d, expected=%u", (int)w,
-                    bytes_read);
+            uint64_t file_offset = sd_writer_bytes_written + WAV_HEADER_BYTES;
+            uint32_t sector_approx = (uint32_t)(file_offset / 512);
+            LOG_ERR("SD writer fs_write failed: ret=%d, expected=%u, file_offset=%llu, approx_sector=%u, write_latency=%u us",
+                    (int)w, bytes_read, (unsigned long long)file_offset, sector_approx, us);
+#if defined(CONFIG_SOC_SERIES_STM32L4X)
+            LOG_ERR("SDMMC hardware registers: STA=0x%08X, DCOUNT=%u, DCTRL=0x%08X, CLKCR=0x%08X",
+                    (unsigned int)SDMMC1->STA, (unsigned int)SDMMC1->DCOUNT,
+                    (unsigned int)SDMMC1->DCTRL, (unsigned int)SDMMC1->CLKCR);
+#endif
             sd_writer_err = (w < 0) ? (int)w : -EIO;
             break;
           }
@@ -482,6 +489,13 @@ int recorder_init(void) {
     LOG_INF("SD diagnostic: sector count ret=%d count=%u", count_ret,
             sector_count);
     LOG_INF("SD diagnostic: sector size ret=%d size=%u", size_ret, sector_size);
+#if defined(SDMMC1)
+    uint32_t clkcr = SDMMC1->CLKCR;
+    uint32_t clkdiv = clkcr & 0xFF;
+    uint32_t clk_hz = 48000000U / (clkdiv + 2U);
+    LOG_INF("SDMMC hardware clock: %u Hz (CLKDIV=%u, CLKCR=0x%08X, bus=%s)",
+            clk_hz, clkdiv, clkcr, (clkcr & (1U << 11)) ? "4-bit" : "1-bit");
+#endif
   }
 
   /* Read-only filesystem diagnostic */
@@ -930,6 +944,23 @@ int recorder_verify_file(const char *path, uint32_t expected_rate,
   return recorder_verify_file_format(path, expected_rate, 1, expected_bits, expected_data_bytes);
 }
 
+static volatile bool recorder_abort_requested = false;
+static volatile bool recorder_active = false;
+static volatile int s_recorder_last_error = 0;
+static volatile int s_recorder_last_sd_error = 0;
+static struct rec_stats *s_active_stats_ptr = NULL;
+static char s_active_file_path[80] = {0};
+
+bool recorder_is_active(void) { return recorder_active; }
+
+bool recorder_is_abort_requested(void) { return recorder_abort_requested; }
+
+int recorder_get_last_error(void) { return s_recorder_last_error; }
+
+int recorder_get_last_sd_error(void) { return s_recorder_last_sd_error; }
+
+void recorder_request_stop(void) { recorder_abort_requested = true; }
+
 int recorder_sleep(uint32_t seconds, uint32_t *wake_recovery_us) {
   if (seconds == 0) {
     if (wake_recovery_us) {
@@ -938,27 +969,66 @@ int recorder_sleep(uint32_t seconds, uint32_t *wake_recovery_us) {
     return 0;
   }
 
-  /* 1. Put SD card into idle standby and flush any write cache */
-  disk_access_ioctl("SD", DISK_IOCTL_CTRL_SYNC, NULL);
+  /* 1. Reject sleep if recording is active or any recording/file operation remains in progress */
+  if (recorder_active || sd_writer_flush_req) {
+    LOG_ERR("recorder_sleep rejected: active recording or file operation in progress");
+    return -EBUSY;
+  }
 
-  /* 2. Put external IS66WVS PSRAM into documented Deep Power Down (0xB9) state
-   */
-  psram_sleep();
+  /* 2-4. Stop audio acquisition pipeline (TIM6, ADC, DMA, and wait bounded worker drain) */
+  int stop_rc = audio_in_stop();
+  if (stop_rc != 0) {
+    LOG_ERR("recorder_sleep: audio_in_stop failed (%d)", stop_rc);
+    return stop_rc;
+  }
 
-  /* 3. Confirm audio pipeline is completely stopped and in deep power-down */
-  audio_in_stop();
+  /* 5. Drain pending audio blocks */
   drain_queue();
 
-  LOG_INF("Entering STM32L476 Stop 2 low-power mode for %u seconds (RTC Wakeup "
-          "Timer)...",
-          seconds);
+  /* 6-7. Flush PSRAM staging pipeline and ensure SD writer is completely idle */
+  if (psram_staging_is_active() && psram_staging_occupied() > 0) {
+    psram_staging_flush_publish();
+    sd_writer_flush_req = true;
+    k_sem_give(&sd_writer_sem);
+    if (k_sem_take(&sd_writer_done_sem, K_MSEC(5000)) != 0) {
+      LOG_ERR("recorder_sleep: timeout flushing staging pipeline to SD");
+      sd_writer_flush_req = false;
+      return -ETIMEDOUT;
+    }
+    sd_writer_flush_req = false;
+  }
+
+  /* 8. Confirm all recording buffers committed; finalize/close any open recording file */
+  if (sd_file_ptr != NULL) {
+    fs_close(sd_file_ptr);
+    sd_file_ptr = NULL;
+  }
+
+  /* 9. Synchronize SD card and check the result */
+  int sd_sync_rc = disk_access_ioctl("SD", DISK_IOCTL_CTRL_SYNC, NULL);
+  if (sd_sync_rc != 0) {
+    LOG_ERR("recorder_sleep: SD card sync failed before sleep (%d)", sd_sync_rc);
+    return sd_sync_rc;
+  }
+
+  /* 10. Put SD card/controller into deepest supported safe idle state */
+  /* (DISK_IOCTL_CTRL_SYNC parks SD cards in idle state with clean write buffers) */
+
+  /* 11. Put PSRAM into Deep Power Down (DPD) and verify the command succeeded */
+  int psram_sleep_rc = psram_sleep();
+  if (psram_sleep_rc != 0) {
+    LOG_ERR("recorder_sleep: PSRAM DPD command failed (%d)", psram_sleep_rc);
+    return psram_sleep_rc;
+  }
+
+  /* 12. Disable unnecessary peripheral activity and enter STM32L476 Stop 2 mode */
+  LOG_INF("Entering STM32L476 Stop 2 low-power mode for %u seconds (RTC Wakeup Timer)...", seconds);
   const uint64_t t_pre = k_uptime_get();
 
-  /* 4. Enter STM32L476 Stop 2 mode */
   int res = rtc_sleep_enter_stop2(seconds);
 
   const uint64_t t_post = k_uptime_get();
-  uint64_t elapsed_ms = (t_post >= t_pre) ? (t_post - t_pre) : (seconds * 1000);
+  uint64_t elapsed_ms = (t_post >= t_pre) ? (t_post - t_pre) : ((uint64_t)seconds * 1000);
   uint64_t expected_ms = (uint64_t)seconds * 1000;
   uint32_t rec_us = (elapsed_ms > expected_ms)
                         ? (uint32_t)((elapsed_ms - expected_ms) * 1000)
@@ -967,36 +1037,49 @@ int recorder_sleep(uint32_t seconds, uint32_t *wake_recovery_us) {
     *wake_recovery_us = rec_us;
   }
 
-  /* 5. Wake external PSRAM and verify SPI/QPI interface */
-  psram_wake();
-
-  /* 6. Verify SD card is responsive and synchronized */
-  disk_access_ioctl("SD", DISK_IOCTL_CTRL_SYNC, NULL);
-
-  enum rtc_wake_source src = rtc_sleep_get_last_wake_source();
-
-  if (res == -EINTR) {
-    const char *reason = (src == RTC_WAKE_USER_BUTTON)
-                             ? "User Button (B1 / PC13)"
-                             : "Console Abort";
-    LOG_INF("Stop 2 sleep aborted by %s after %llu ms", reason, elapsed_ms);
-    return -EINTR;
+  /* Wake-up sequence:
+   * 13. Wake external PSRAM and verify SPI/QPI interface ID */
+  int psram_wake_rc = psram_wake();
+  if (psram_wake_rc != 0) {
+    LOG_ERR("recorder_sleep: PSRAM wake failed or ID mismatch (%d)", psram_wake_rc);
+    return psram_wake_rc;
   }
 
-  LOG_INF("Woke from STM32L476 Stop 2 mode via RTC Wakeup Timer (elapsed: %llu "
-          "ms, wake recovery overhead: %u us)",
+  /* 14. Verify SD card is responsive and synchronized after wake */
+  int post_sd_rc = disk_access_ioctl("SD", DISK_IOCTL_CTRL_SYNC, NULL);
+  if (post_sd_rc != 0) {
+    LOG_ERR("recorder_sleep: post-wake SD card sync failed (%d)", post_sd_rc);
+    return post_sd_rc;
+  }
+
+  if (res == -EINTR) {
+    LOG_INF("Stop 2 sleep aborted by console request after %llu ms", elapsed_ms);
+    return -EINTR;
+  }
+  if (res != 0) {
+    LOG_ERR("Stop 2 sleep returned error: %d", res);
+    return res;
+  }
+
+  LOG_INF("Woke from STM32L476 Stop 2 mode via RTC Wakeup Timer (elapsed: %llu ms, wake recovery overhead: %u us)",
           elapsed_ms, rec_us);
   return 0;
 }
 
-static volatile bool recorder_abort_requested = false;
-static volatile bool recorder_active = false;
+void recorder_get_active_progress(uint64_t *samples_written, uint64_t *expected_samples) {
+  if (s_active_stats_ptr) {
+    if (samples_written) *samples_written = s_active_stats_ptr->samples_written;
+    if (expected_samples) *expected_samples = s_active_stats_ptr->expected_samples;
+  } else {
+    if (samples_written) *samples_written = 0;
+    if (expected_samples) *expected_samples = 0;
+  }
+}
 
-bool recorder_is_active(void) { return recorder_active; }
-
-bool recorder_is_abort_requested(void) { return recorder_abort_requested; }
-
-void recorder_request_stop(void) { recorder_abort_requested = true; }
+void recorder_get_active_file(char *out_buf, size_t max_len) {
+  if (!out_buf || max_len == 0) return;
+  snprintf(out_buf, max_len, "%s", s_active_file_path);
+}
 
 int recorder_wait_idle(uint32_t timeout_ms) {
   int64_t start = k_uptime_get();
@@ -1028,6 +1111,8 @@ int recorder_record_session(uint32_t seconds, uint32_t cycle,
   }
   recorder_abort_requested = false;
   recorder_active = true;
+  s_active_stats_ptr = &st;
+  s_active_file_path[0] = '\0';
 
   bool apply_dsp = true;
   const char *mode_str = "FILTERED";
@@ -1062,6 +1147,8 @@ int recorder_record_session(uint32_t seconds, uint32_t cycle,
   if (!mounted) {
     led_indicator_set(LED_IND_ERROR);
     st.err = -ENODEV;
+    s_recorder_last_error = -ENODEV;
+    s_recorder_last_sd_error = -ENODEV;
     recorder_active = false;
     if (out)
       *out = st;
@@ -1118,10 +1205,16 @@ int recorder_record_session(uint32_t seconds, uint32_t cycle,
     led_indicator_set(LED_IND_ERROR);
     st.file[0] = '\0';
     st.err = ret;
+    s_recorder_last_error = ret;
+    s_recorder_last_sd_error = ret;
+    s_active_stats_ptr = NULL;
+    s_active_file_path[0] = '\0';
+    recorder_active = false;
     if (out)
       *out = st;
     return ret;
   }
+  snprintf(s_active_file_path, sizeof(s_active_file_path), "%s", st.file);
 
   /*
    * File pre-allocation handling:
@@ -1742,6 +1835,10 @@ int recorder_record_session(uint32_t seconds, uint32_t cycle,
   if (out) {
     *out = st;
   }
+  s_recorder_last_error = err;
+  s_recorder_last_sd_error = st.sd_write_error;
+  s_active_stats_ptr = NULL;
+  s_active_file_path[0] = '\0';
   recorder_active = false;
   if (err != 0 && !recorder_abort_requested) {
     led_indicator_set(LED_IND_ERROR);

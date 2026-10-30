@@ -918,7 +918,9 @@ int psram_sleep(void) {
   HAL_StatusTypeDef status =
       HAL_QSPI_Command(&hqspi, &sCommand, HAL_QSPI_TIMEOUT_DEFAULT_VALUE);
   if (status != HAL_OK) {
-    LOG_WRN("PSRAM DPD command failed: %d", status);
+    LOG_ERR("PSRAM DPD command failed: %d", status);
+    PSRAM_UNLOCK();
+    return -EIO;
   }
 
   PSRAM_UNLOCK();
@@ -956,8 +958,8 @@ int psram_wake(void) {
   /* Wait tDPDOUT (min 150 us) for device to exit DPD */
   k_busy_wait(200);
 
-  /* Verify PSRAM ID */
-  struct psram_id id;
+  /* Verify PSRAM ID (ensure diagnostic struct is initialized before use) */
+  struct psram_id id = {0};
   int ret = psram_read_id(&id);
   if (ret == 0 && id.mfid == PSRAM_ISSI_MFID) {
     LOG_INF("PSRAM successfully woken from Deep Power Down (MFID 0x%02X)",
@@ -965,7 +967,7 @@ int psram_wake(void) {
     return 0;
   } else {
     LOG_WRN("PSRAM wake ID check warning (code %d, MFID 0x%02X)", ret, id.mfid);
-    return ret;
+    return (ret != 0) ? ret : -EIO;
   }
 }
 

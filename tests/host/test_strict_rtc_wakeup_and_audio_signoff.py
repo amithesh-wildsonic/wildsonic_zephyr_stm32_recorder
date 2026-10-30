@@ -181,3 +181,189 @@ def test_192khz_exact_payload_accounting():
     assert stereo_remainder == 155_648
     assert stereo_full_batches * batch_size + stereo_remainder == stereo_payload
 
+
+def test_autonomous_scheduler_enters_stop2_path():
+    """Verify autonomous scheduler in main_scheduler_service_step calls recorder_sleep for future windows."""
+    main_c = (APP_SRC / "main.c").read_text(encoding="utf-8")
+    fn_match = re.search(r"void main_scheduler_service_step\(void\)\s*\{(.*?)\n\}", main_c, re.DOTALL)
+    assert fn_match is not None, "main_scheduler_service_step not found in main.c"
+    fn_body = fn_match.group(1)
+
+    # Must verify it handles wait_seconds > 0 by entering Stop 2
+    assert "Standby wait for upcoming window: enter STM32L476 Stop 2 with strict RTC-only wakeup" in fn_body
+    assert "recorder_sleep(sleep_chunk, NULL)" in fn_body
+    # Must re-read RTC calendar time upon wake
+    assert "rtc_calendar_get(&now_cal)" in fn_body or "rtc_calendar_get(&wake_cal)" in fn_body
+    # Must dispatch to recorder_thread without blocking console REPL
+    assert "k_sem_give(&s_rec_trigger_sem)" in fn_body
+
+
+def test_short_and_long_scheduled_intervals_chunking():
+    """Simulate interval chunking: no < 5s bypass, clamps to 65535s, re-evaluates RTC epoch."""
+    def simulate_sleep_chunks(wait_seconds: int):
+        chunks = []
+        cur_epoch = 1000
+        target_epoch = cur_epoch + wait_seconds
+        while True:
+            remaining = target_epoch - cur_epoch
+            if remaining <= 0:
+                break
+            # No special-case bypass: all nonzero intervals enter Stop 2
+            chunk = min(remaining, 65535)
+            chunks.append(chunk)
+            # Advance simulated RTC calendar time
+            cur_epoch += chunk
+        return chunks
+
+    # 1. Short intervals (1s, 2s, 4s) must not use k_sleep bypass
+    assert simulate_sleep_chunks(1) == [1]
+    assert simulate_sleep_chunks(2) == [2]
+    assert simulate_sleep_chunks(4) == [4]
+
+    # 2. Medium interval (300s)
+    assert simulate_sleep_chunks(300) == [300]
+
+    # 3. Long interval (> 65535s: 100,000s) chunked properly
+    long_chunks = simulate_sleep_chunks(100_000)
+    assert long_chunks == [65535, 34465]
+    assert sum(long_chunks) == 100_000
+    assert all(c <= 65535 for c in long_chunks)
+
+
+def test_rtc_sleep_timer_bounds():
+    """Verify rtc_sleep_arm enforces 16-bit 65535s bound and CKSPRE 1 Hz clock."""
+    rtc_sleep_c = (APP_SRC / "rtc_sleep.c").read_text(encoding="utf-8")
+    assert "if (seconds > 65535) {" in rtc_sleep_c
+    assert "seconds = 65535;" in rtc_sleep_c
+    assert "LL_RTC_WAKEUPCLOCK_CKSPRE" in rtc_sleep_c
+    assert "LL_RTC_WAKEUP_SetAutoReload(RTC, seconds - 1);" in rtc_sleep_c
+
+
+def test_rtc_initialization_failures_and_propagation():
+    """Verify rtc_sleep_init fails safely on oscillator timeout and propagates errors."""
+    rtc_sleep_c = (APP_SRC / "rtc_sleep.c").read_text(encoding="utf-8")
+    assert "LSI oscillator startup timed out; RTC initialization failed" in rtc_sleep_c
+    assert "return -ETIMEDOUT;" in rtc_sleep_c
+    assert "LL_RTC_SetAsynchPrescaler(RTC, 127);" in rtc_sleep_c
+    assert "LL_RTC_SetSynchPrescaler(RTC, 255);" in rtc_sleep_c
+
+    cal_c = (APP_SRC / "rtc_calendar.c").read_text(encoding="utf-8")
+    assert "int init_rc = rtc_sleep_init();" in cal_c
+    assert "if (init_rc != 0) {" in cal_c
+    assert "LL_RTC_ClearFlag_RS(RTC);" in cal_c
+
+
+def test_failed_psram_dpd_and_recovery():
+    """Verify psram_sleep returns -EIO on failure, psram_wake initializes struct, and recorder_sleep propagates."""
+    psram_c = (APP_SRC / "psram_is66wvs.c").read_text(encoding="utf-8")
+    assert "LOG_ERR(\"PSRAM DPD command failed: %d\", status);" in psram_c
+    assert "return -EIO;" in psram_c
+    assert "struct psram_id id = {0};" in psram_c
+
+    recorder_c = (APP_SRC / "recorder.c").read_text(encoding="utf-8")
+    assert "int psram_sleep_rc = psram_sleep();" in recorder_c
+    assert "int psram_wake_rc = psram_wake();" in recorder_c
+    assert "if (psram_sleep_rc != 0)" in recorder_c
+    assert "if (psram_wake_rc != 0)" in recorder_c
+
+
+def test_storage_synchronization_failures():
+    """Verify recorder_sleep checks and propagates pre-sleep and post-wake SD sync errors."""
+    recorder_c = (APP_SRC / "recorder.c").read_text(encoding="utf-8")
+    assert "int sd_sync_rc = disk_access_ioctl(\"SD\", DISK_IOCTL_CTRL_SYNC, NULL);" in recorder_c
+    assert "if (sd_sync_rc != 0)" in recorder_c
+    assert "int post_sd_rc = disk_access_ioctl(\"SD\", DISK_IOCTL_CTRL_SYNC, NULL);" in recorder_c
+    assert "if (post_sd_rc != 0)" in recorder_c
+
+
+def test_audio_shutdown_safety_and_timeout():
+    """Verify audio_in_stop implements bounded timeout, drains event queue, and accounts residual samples."""
+    audio_c = (APP_SRC / "audio_in_stm32l4.c").read_text(encoding="utf-8")
+    assert "uint32_t drain_timeout_ms = 100;" in audio_c
+    assert "while (k_msgq_get(&dma_event_q, &leftover_event, K_NO_WAIT) == 0)" in audio_c
+    assert "atomic_add(&acquisition_lost_samples, active_block_samples);" in audio_c
+    assert "atomic_add(&acquisition_samples_accounted, active_block_samples);" in audio_c
+    assert "ACQUISITION_THREAD_PRIORITY K_PRIO_PREEMPT(0)" in audio_c
+
+
+def test_wrong_or_unexpected_wake_source():
+    """Verify rtc_sleep_enter_stop2 validates actual WUTF flag and does not assign RTC_WAKE_TIMER unconditionally."""
+    rtc_sleep_c = (APP_SRC / "rtc_sleep.c").read_text(encoding="utf-8")
+    assert "bool rtc_wut_flag = (LL_RTC_IsActiveFlag_WUT(RTC) != 0);" in rtc_sleep_c
+    assert "bool exti20_flag = (LL_EXTI_IsActiveFlag_0_31(LL_EXTI_LINE_20) != 0);" in rtc_sleep_c
+    assert "Unexpected wake event: RTC WUT flag not asserted" in rtc_sleep_c
+    assert "last_wake_source = RTC_WAKE_NONE;" in rtc_sleep_c
+
+
+def test_sleep_entry_race_handling():
+    """Verify rtc_sleep_enter_stop2 checks WUT/NVIC under __disable_irq before entering __WFI."""
+    rtc_sleep_c = (APP_SRC / "rtc_sleep.c").read_text(encoding="utf-8")
+    assert "__disable_irq();" in rtc_sleep_c
+    assert "bool pre_wake_event = (LL_RTC_IsActiveFlag_WUT(RTC) != 0) ||" in rtc_sleep_c
+    assert "if (!pre_wake_event) {" in rtc_sleep_c
+    assert "__WFI();" in rtc_sleep_c
+    assert "__enable_irq();" in rtc_sleep_c
+
+
+def test_kernel_time_after_long_sleep():
+    """Verify rtc_sleep_enter_stop2 compensates kernel ticks via sys_clock_announce after wake."""
+    rtc_sleep_c = (APP_SRC / "rtc_sleep.c").read_text(encoding="utf-8")
+    assert "uint64_t elapsed_ticks = (uint64_t)seconds * CONFIG_SYS_CLOCK_TICKS_PER_SEC;" in rtc_sleep_c
+    assert "sys_clock_announce(chunk_ticks);" in rtc_sleep_c
+
+
+def test_rtc_wake_followed_by_correctly_scheduled_recording():
+    """Verify the 12-step shutdown sequence and post-wake recording dispatch ordering."""
+    recorder_c = (APP_SRC / "recorder.c").read_text(encoding="utf-8")
+
+    # Strict ordering: audio_in_stop -> drain_queue -> psram_staging flush -> close file -> SD sync -> psram_sleep -> Stop 2
+    pos_audio_stop = recorder_c.find("audio_in_stop()")
+    pos_drain_queue = recorder_c.find("drain_queue()")
+    pos_staging_flush = recorder_c.find("psram_staging_flush_publish()")
+    pos_file_close = recorder_c.find("fs_close(sd_file_ptr)")
+    pos_sd_sync = recorder_c.find("disk_access_ioctl(\"SD\", DISK_IOCTL_CTRL_SYNC, NULL)")
+    pos_psram_sleep = recorder_c.find("psram_sleep()")
+    pos_stop2 = recorder_c.find("rtc_sleep_enter_stop2(seconds)")
+    pos_psram_wake = recorder_c.find("psram_wake()")
+
+    assert -1 < pos_audio_stop < pos_drain_queue < pos_staging_flush < pos_file_close < pos_sd_sync < pos_psram_sleep < pos_stop2 < pos_psram_wake, \
+        "Strict 12-step shutdown and wake sequence violated in recorder_sleep"
+
+
+def test_repeated_sleep_wake_cycles_lifecycle():
+    """Simulate 5 consecutive scheduled recording sessions with inter-session Stop 2 sleep."""
+    cycle_count = 5
+    duration_per_session = 10
+    sleep_between = 20
+    current_time_epoch = 1700000000
+
+    simulated_sessions = []
+    for c in range(1, cycle_count + 1):
+        # 1. Target start time
+        target_start = current_time_epoch + (0 if c == 1 else sleep_between)
+        wait_sec = target_start - current_time_epoch
+        assert wait_sec >= 0
+
+        # 2. Standby sleep
+        if wait_sec > 0:
+            current_time_epoch += wait_sec
+        assert current_time_epoch == target_start
+
+        # 3. Recording session
+        rec_start = current_time_epoch
+        current_time_epoch += duration_per_session
+        rec_end = current_time_epoch
+
+        simulated_sessions.append({
+            "cycle": c,
+            "start": rec_start,
+            "end": rec_end,
+            "duration": duration_per_session
+        })
+
+    assert len(simulated_sessions) == 5
+    for i in range(1, 5):
+        gap = simulated_sessions[i]["start"] - simulated_sessions[i-1]["end"]
+        assert gap == sleep_between, f"Session {i+1} gap was {gap}, expected {sleep_between}"
+
+

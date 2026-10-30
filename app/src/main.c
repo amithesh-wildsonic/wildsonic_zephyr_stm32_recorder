@@ -39,6 +39,7 @@
 #include "config_store.h"
 #include "led_indicator.h"
 #include "audio_format.h"
+#include "ble_comm.h"
 #if defined(CONFIG_WILDSONIC_VERBOSE_LOGS)
 #include "psram_benchmark.h"
 #endif
@@ -101,11 +102,16 @@ static void apply_dsp_settings(void) {
 
 /* Console Character I/O */
 int console_poll_char(unsigned char *c) {
+  if (console_async_is_active()) {
+    return console_async_get_char(c);
+  }
   if (!console_dev || !device_is_ready(console_dev)) {
     return -ENODEV;
   }
   return uart_poll_in(console_dev, c);
 }
+
+static int64_t s_console_last_activity_ms = 0;
 
 static bool console_read_line(char *buf, size_t max_len) {
   size_t pos = 0;
@@ -113,73 +119,78 @@ static bool console_read_line(char *buf, size_t max_len) {
 
   while (1) {
     unsigned char c;
-    if (console_poll_char(&c) == 0) {
-      /* If \n follows \r within 100 ms (CRLF sequence), discard the trailing \n
-       */
-      if (c == '\n' && pos == 0 && (k_uptime_get() - last_cr_time) < 100) {
-        continue;
-      }
+    int rc = console_async_wait_char(&c, 20);
+    if (rc != 0 && !console_async_is_active()) {
+      rc = console_poll_char(&c);
+    }
 
-      if (c == '\r' || c == '\n') {
-        if (c == '\r') {
-          last_cr_time = k_uptime_get();
+    if (rc == 0) {
+      s_console_last_activity_ms = k_uptime_get();
+      /* Drain and echo all pending characters in ring buffer without delay */
+      do {
+        /* If \n follows \r within 100 ms (CRLF sequence), discard the trailing \n */
+        if (c == '\n' && pos == 0 && (k_uptime_get() - last_cr_time) < 100) {
+          continue;
         }
-        buf[pos] = '\0';
-        printk("\r\n");
-        return true;
-      } else if (c == '\b' || c == 127) {
-        if (pos > 0) {
-          pos--;
-          printk("\b \b");
-        }
-      } else if (c == 0x1B) {
-        /*
-         * Escape sequence handling:
-         * Check if this is an ANSI escape sequence (such as arrow keys \x1B[A).
-         * Consume ANSI sequence silently without line-clearing or echo
-         * glitches. If standalone ESC, erase current line with backspaces
-         * cleanly.
-         */
-        k_busy_wait(2000);
-        unsigned char next_c;
-        if (console_poll_char(&next_c) == 0) {
-          if (next_c == '[') {
-            unsigned char seq_c;
-            while (console_poll_char(&seq_c) == 0) {
-              if ((seq_c >= 'A' && seq_c <= 'Z') ||
-                  (seq_c >= 'a' && seq_c <= 'z') || seq_c == '~') {
-                break;
-              }
-            }
-            continue;
+
+        if (c == '\r' || c == '\n') {
+          if (c == '\r') {
+            last_cr_time = k_uptime_get();
           }
-        }
-        if (pos == 0) {
-          /* ESC at prompt */
-        } else {
-          while (pos > 0) {
-            printk("\b \b");
+          buf[pos] = '\0';
+          printk("\r\n");
+          return true;
+        } else if (c == '\b' || c == 127) {
+          if (pos > 0) {
             pos--;
+            printk("\b \b");
           }
-          buf[0] = '\0';
+        } else if (c == 0x1B) {
+          /*
+           * Escape sequence handling:
+           * Check if this is an ANSI escape sequence (such as arrow keys \x1B[A).
+           * Consume ANSI sequence silently without line-clearing or echo
+           * glitches. If standalone ESC, erase current line with backspaces
+           * cleanly.
+           */
+          k_busy_wait(2000);
+          unsigned char next_c;
+          if (console_poll_char(&next_c) == 0) {
+            if (next_c == '[') {
+              unsigned char seq_c;
+              while (console_poll_char(&seq_c) == 0) {
+                if ((seq_c >= 'A' && seq_c <= 'Z') ||
+                    (seq_c >= 'a' && seq_c <= 'z') || seq_c == '~') {
+                  break;
+                }
+              }
+              continue;
+            }
+          }
+          if (pos == 0) {
+            /* ESC at prompt */
+          } else {
+            while (pos > 0) {
+              printk("\b \b");
+              pos--;
+            }
+            buf[0] = '\0';
+          }
+        } else if (c >= 32 && c < 127) {
+          if (pos < max_len - 1) {
+            buf[pos++] = (char)c;
+            printk("%c", c);
+          }
         }
-      } else if (c >= 32 && c < 127) {
-        if (pos < max_len - 1) {
-          buf[pos++] = (char)c;
-          printk("%c", c);
-        }
-      }
+      } while (console_async_get_char(&c) == 0);
     } else {
       /* When user is idle at the prompt (pos == 0), flush pending logs and service scheduler */
       if (pos == 0) {
-        if (log_process()) {
-          printk("> ");
-        }
+        log_process();
         if (!main_is_scheduler_paused()) {
           main_scheduler_service_step();
         }
       }
-      k_sleep(K_MSEC(50));
     }
   }
 }
@@ -1176,31 +1187,33 @@ static void run_scheduled_recording(void) {
 
       printk("\n---- [SCHEDULE STANDBY: NEXT SESSION AT %s LOCAL (%lld s WAIT)] ----\n",
              start_str, (long long)interval.wait_seconds);
-      printk("  Power Mode            : Low-Power Standby / Quiet Delay\n");
+      printk("  Power Mode            : STM32L476 Stop 2 (Strict RTC-only Wakeup)\n");
       printk("  Wakeup Target         : %s (in %lld seconds)\n", start_str, (long long)interval.wait_seconds);
       printk("  Type 'stop' to abort schedule\n");
 
-      int64_t remaining_sec = interval.wait_seconds;
       bool aborted = false;
-      while (remaining_sec > 0) {
-        if (recorder_is_abort_requested()) {
-          printk("\n[Schedule aborted by user stop request during wait]\n");
+      while (!recorder_is_abort_requested()) {
+        struct rtc_calendar_time now_c;
+        if (rtc_calendar_get(&now_c) != 0 || !rtc_calendar_is_valid()) {
           aborted = true;
           break;
         }
-        /* If wait is very short (< 5s), remain in low-power idle */
-        if (remaining_sec < 5) {
-          k_sleep(K_SECONDS(remaining_sec));
+        time_t cur_u = scheduler_calendar_to_epoch(&now_c);
+        int64_t rem = (int64_t)(interval.start_time_utc - cur_u);
+        if (rem <= 0) {
           break;
         }
         /* Enter true STM32L476 Stop 2 low-power sleep with strict RTC-only wakeup */
-        uint32_t sleep_chunk = (remaining_sec > 65535) ? 65535 : (uint32_t)remaining_sec;
+        uint32_t sleep_chunk = (rem > 65535) ? 65535 : (uint32_t)rem;
         int sleep_rc = recorder_sleep(sleep_chunk, NULL);
         if (sleep_rc != 0) {
           aborted = true;
           break;
         }
-        remaining_sec -= sleep_chunk;
+      }
+      if (recorder_is_abort_requested()) {
+        printk("\n[Schedule aborted by user stop request during wait]\n");
+        aborted = true;
       }
       if (aborted) {
         break;
@@ -1250,7 +1263,6 @@ static bool s_schedule_paused = false;
 static uint32_t s_schedule_cycle = 1;
 static time_t s_last_end_time_local = 0;
 static time_t s_last_evaluated_window_utc = 0;
-static int64_t s_last_standby_log_uptime_ms = 0;
 static bool s_rtc_uninit_logged = false;
 static bool s_no_window_logged = false;
 
@@ -1360,12 +1372,23 @@ static void recorder_thread_fn(void *p1, void *p2, void *p3) {
   }
 }
 
+static uint32_t s_sleep_attempt_counter = 0;
+static int64_t s_sleep_backoff_until_ms = 0;
+static uint32_t s_consecutive_sleep_failures = 0;
+static int s_last_sleep_error = 0;
+static int64_t s_last_sleep_error_log_ms = 0;
+
 bool main_is_scheduler_paused(void) {
   return s_schedule_paused;
 }
 
 void main_scheduler_service_step(void) {
   if (s_schedule_paused || s_rec_busy || recorder_is_active()) {
+    return;
+  }
+
+  /* Do not attempt sleep while in backoff recovery window after a failed attempt */
+  if (k_uptime_get() < s_sleep_backoff_until_ms) {
     return;
   }
 
@@ -1447,25 +1470,139 @@ void main_scheduler_service_step(void) {
     k_sem_give(&s_rec_trigger_sem);
     return;
   } else {
-    /* Standby wait for upcoming window */
-    int64_t now_ms = k_uptime_get();
-    if (interval.start_time_utc != s_last_evaluated_window_utc ||
-        (now_ms - s_last_standby_log_uptime_ms) > 10000) {
-      struct rtc_calendar_time sched_start_cal;
-      time_t sched_start_local = interval.start_time_utc + scfg.time_zone_offset;
-      scheduler_epoch_to_calendar(sched_start_local, &sched_start_cal);
-      char start_str[32];
-      rtc_calendar_format(&sched_start_cal, start_str, sizeof(start_str));
+    /* Standby wait for upcoming window: enter STM32L476 Stop 2 with strict RTC-only wakeup */
+    /* If console was recently active, keep system awake so user can interact */
+    if (k_uptime_get() - s_console_last_activity_ms < 10000) {
+      return;
+    }
+
+    struct rtc_calendar_time sched_start_cal;
+    time_t sched_start_local = interval.start_time_utc + scfg.time_zone_offset;
+    scheduler_epoch_to_calendar(sched_start_local, &sched_start_cal);
+    char start_str[32];
+    rtc_calendar_format(&sched_start_cal, start_str, sizeof(start_str));
 
 #if defined(CONFIG_WILDSONIC_VERBOSE_LOGS)
-      printk("\n[SCHEDULER] Standby wait: %lld s remaining until Session %u (Target: %s Local)\n",
-             (long long)interval.wait_seconds, s_schedule_cycle, start_str);
-      printk("  Console active; enter commands to modify staged settings.\n> ");
+    printk("\n[SCHEDULER] Standby wait: %lld s remaining until Session %u (Target: %s Local)\n",
+           (long long)interval.wait_seconds, s_schedule_cycle, start_str);
+    printk("  Entering STM32L476 Stop 2 low-power standby (strict RTC-only wake)...\n");
 #endif
 
-      s_last_evaluated_window_utc = interval.start_time_utc;
-      s_last_standby_log_uptime_ms = now_ms;
+    while (!s_schedule_paused && !recorder_is_abort_requested()) {
+      struct rtc_calendar_time now_cal;
+      if (rtc_calendar_get(&now_cal) != 0 || !rtc_calendar_is_valid()) {
+        break;
+      }
+      time_t cur_u = scheduler_calendar_to_epoch(&now_cal);
+      int64_t remaining_sec = (int64_t)(interval.start_time_utc - cur_u);
+      if (remaining_sec <= 0) {
+        /* Scheduled start time reached */
+        break;
+      }
+
+      /* Enforce safe sleep chunk bounds (max 65535 s for 16-bit RTC wake timer) */
+      uint32_t sleep_chunk = (remaining_sec > 65535) ? 65535 : (uint32_t)remaining_sec;
+
+      s_sleep_attempt_counter++;
+      uint32_t attempt_num = s_sleep_attempt_counter;
+
+      int sleep_rc = recorder_sleep(sleep_chunk, NULL);
+      if (sleep_rc != 0) {
+        if (sleep_rc == -EINTR) {
+          LOG_INF("Autonomous sleep attempt %u aborted by console request (resetting consecutive failure counter, was %u)",
+                  attempt_num, s_consecutive_sleep_failures);
+          s_consecutive_sleep_failures = 0;
+          s_sleep_backoff_until_ms = 0;
+          s_last_sleep_error = 0;
+        } else {
+          s_consecutive_sleep_failures++;
+          /* Bounded backoff: 1000 ms base, up to 10000 ms */
+          uint32_t backoff_ms = 1000U * (s_consecutive_sleep_failures > 10 ? 10U : s_consecutive_sleep_failures);
+          s_sleep_backoff_until_ms = k_uptime_get() + backoff_ms;
+
+          /* Rate-limit console error diagnostics (max once every 5 seconds) */
+          if (k_uptime_get() - s_last_sleep_error_log_ms >= 5000 || sleep_rc != s_last_sleep_error) {
+            LOG_ERR("Autonomous sleep attempt %u returned error: %d (consecutive_failures=%u, backing off for %u ms)",
+                    attempt_num, sleep_rc, s_consecutive_sleep_failures, backoff_ms);
+            s_last_sleep_error = sleep_rc;
+            s_last_sleep_error_log_ms = k_uptime_get();
+          }
+        }
+        break;
+      } else {
+        /* Successful sleep: reset backoff and failure counters */
+        if (s_consecutive_sleep_failures > 0) {
+          LOG_INF("Autonomous sleep attempt %u succeeded: resetting consecutive failure counter (was %u)",
+                  attempt_num, s_consecutive_sleep_failures);
+        }
+        s_consecutive_sleep_failures = 0;
+        s_sleep_backoff_until_ms = 0;
+        s_last_sleep_error = 0;
+      }
     }
+
+    if (s_schedule_paused || recorder_is_abort_requested()) {
+      return;
+    }
+
+    /* Re-evaluate RTC calendar time after waking from sleep before dispatching */
+    struct rtc_calendar_time wake_cal;
+    if (rtc_calendar_get(&wake_cal) != 0 || !rtc_calendar_is_valid()) {
+      return;
+    }
+    time_t wake_utc = scheduler_calendar_to_epoch(&wake_cal);
+    if (wake_utc < interval.start_time_utc) {
+      /* Woke early (e.g. chunk completion); return to let outer loop service or re-sleep */
+      return;
+    }
+
+    /* Start recording session at configured scheduled time */
+    char utc_str[32], local_str[32], date_buf[64], dow_buf[32], tz_buf[16];
+    struct rtc_calendar_time now_local_cal;
+    time_t wake_local = wake_utc + scfg.time_zone_offset;
+    scheduler_epoch_to_calendar(wake_local, &now_local_cal);
+
+    rtc_calendar_format(&wake_cal, utc_str, sizeof(utc_str));
+    rtc_calendar_format(&now_local_cal, local_str, sizeof(local_str));
+
+    if (scfg.start_date.year > 0 || scfg.end_date.year > 0) {
+      scheduler_format_date_range(&scfg.start_date, &scfg.end_date, date_buf, sizeof(date_buf));
+    } else {
+      snprintf(date_buf, sizeof(date_buf), "ALL (Unconstrained)");
+    }
+    scheduler_format_days_of_week(scfg.day_of_week_mask, dow_buf, sizeof(dow_buf));
+    scheduler_format_timezone(scfg.time_zone_offset, tz_buf, sizeof(tz_buf));
+
+#if defined(CONFIG_WILDSONIC_VERBOSE_LOGS)
+    printk("\n=========================================================================\n");
+    printk("           [SCHEDULER] AUTONOMOUS RECORDING SESSION %u START              \n", s_schedule_cycle);
+    printk("=========================================================================\n");
+    printk("  Current UTC Time      : %s\n", utc_str);
+    printk("  Current Local Time    : %s (%s)\n", local_str, tz_buf);
+    printk("  Active Date Range     : %s\n", date_buf);
+    printk("  Days of Week Mask     : %s (0x%02X)\n", dow_buf, scfg.day_of_week_mask);
+    printk("  Session Duration      : %u seconds\n", interval.duration_seconds);
+    printk("  Inter-Session Sleep   : %u seconds\n", scfg.sleep_interval);
+    printk("  Recording Mode        : %s\n", mode_to_string(settings.mode));
+    printk("  Sampling Rate / Bits  : %u Hz / 16-bit\n", settings.sample_rate);
+    printk("  Block Size / Pool     : %u samples (%u B) / %u blocks\n",
+           CONFIG_AUDIO_BLOCK_SAMPLES, (uint32_t)(CONFIG_AUDIO_BLOCK_SAMPLES * (CONFIG_AUDIO_SAMPLE_BITS / 8)),
+           CONFIG_AUDIO_NUM_BLOCKS);
+    printk("  Storage Destination   : SDMMC (/SD:)\n");
+    printk("  Control               : Asynchronous console active; type commands or 'stop'\n");
+    printk("=========================================================================\n");
+#endif
+
+    /* Dispatch autonomous recording to recorder_thread without blocking console REPL */
+    s_rec_req.duration_sec = interval.duration_seconds;
+    s_rec_req.cycle = s_schedule_cycle;
+    s_rec_req.mode = settings.mode;
+    s_rec_req.is_autonomous = true;
+    s_rec_req.start_time_utc = interval.start_time_utc;
+    s_rec_req.tz_offset = scfg.time_zone_offset;
+    s_rec_busy = true;
+    k_sem_give(&s_rec_trigger_sem);
+    return;
   }
 }
 
@@ -1698,6 +1835,15 @@ int main(void) {
 
   scheduler_init();
   console_init();
+  console_async_init(console_dev);
+
+  const struct device *ble_dev = DEVICE_DT_GET_OR_NULL(DT_NODELABEL(usart1));
+  if (ble_dev && device_is_ready(ble_dev)) {
+    ble_comm_init(ble_dev);
+  } else {
+    LOG_WRN("USART1 BLE device not available or ready");
+  }
+
   config_store_init();
   config_store_import_sd();
 
@@ -1769,8 +1915,9 @@ int main(void) {
       K_NO_WAIT);
   k_thread_name_set(recorder_tid, "recorder");
 
-  /* Prioritize real-time audio threads over serial console REPL */
-  k_thread_priority_set(k_current_get(), 5);
+  /* Prioritize serial console responsiveness while awaiting interactive input */
+  k_thread_priority_set(k_current_get(), 1);
+  s_console_last_activity_ms = k_uptime_get();
 
   /* Complete all synchronous diagnostic & boot logging before displaying
    * interactive prompt */
@@ -1791,7 +1938,10 @@ int main(void) {
       k_sleep(K_MSEC(1));
     }
     printk("> ");
+    k_thread_priority_set(k_current_get(), 1);
     if (console_read_line(line_buf, sizeof(line_buf))) {
+      /* Yield CPU to audio acquisition & storage while executing command handlers */
+      k_thread_priority_set(k_current_get(), 4);
       console_process_line(line_buf);
     }
   }

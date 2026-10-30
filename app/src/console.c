@@ -27,12 +27,18 @@
 #include "recorder.h"
 #include "psram_is66wvs.h"
 #include "audio_format.h"
+#include "ble_comm.h"
 
 #include <zephyr/kernel.h>
 #include <zephyr/sys/reboot.h>
 #include <zephyr/fs/fs.h>
 #include <zephyr/logging/log.h>
 #include <zephyr/logging/log_ctrl.h>
+#include <zephyr/drivers/uart.h>
+#include <zephyr/sys/ring_buffer.h>
+#if defined(CONFIG_SOC_SERIES_STM32L4X)
+#include <stm32_ll_usart.h>
+#endif
 
 #include <ctype.h>
 #include <stdio.h>
@@ -42,6 +48,123 @@
 #include <math.h>
 
 LOG_MODULE_REGISTER(ws_console, CONFIG_LOG_DEFAULT_LEVEL);
+
+#define CONSOLE_RX_BUF_SIZE 256
+RING_BUF_DECLARE(s_console_rx_rb, CONSOLE_RX_BUF_SIZE);
+static struct k_sem s_console_rx_sem;
+static const struct device *s_console_uart_dev = NULL;
+static bool s_console_async_active = false;
+
+#if defined(CONFIG_UART_INTERRUPT_DRIVEN)
+static void console_uart_isr(const struct device *dev, void *user_data)
+{
+	ARG_UNUSED(user_data);
+
+	uart_irq_update(dev);
+	while (uart_irq_rx_ready(dev)) {
+		uint8_t rx_byte;
+		if (uart_fifo_read(dev, &rx_byte, 1) <= 0) {
+			break;
+		}
+		if (ring_buf_put(&s_console_rx_rb, &rx_byte, 1) > 0) {
+			k_sem_give(&s_console_rx_sem);
+		}
+	}
+	(void)uart_err_check(dev);
+}
+#endif
+
+int console_async_init(const struct device *dev)
+{
+	if (!dev || !device_is_ready(dev)) {
+		return -ENODEV;
+	}
+	s_console_uart_dev = dev;
+	k_sem_init(&s_console_rx_sem, 0, CONSOLE_RX_BUF_SIZE);
+	ring_buf_reset(&s_console_rx_rb);
+
+#if defined(CONFIG_UART_INTERRUPT_DRIVEN)
+	uart_irq_callback_user_data_set(dev, console_uart_isr, NULL);
+	uart_irq_rx_enable(dev);
+	s_console_async_active = true;
+#endif
+	return 0;
+}
+
+bool console_async_is_active(void)
+{
+	return s_console_async_active;
+}
+
+int console_async_get_char(unsigned char *c)
+{
+	if (!s_console_async_active) {
+		return -ENODEV;
+	}
+	if (k_sem_take(&s_console_rx_sem, K_NO_WAIT) == 0) {
+		uint8_t byte;
+		if (ring_buf_get(&s_console_rx_rb, &byte, 1) == 1) {
+			if (c) {
+				*c = byte;
+			}
+			return 0;
+		}
+	}
+	return -EAGAIN;
+}
+
+int console_async_wait_char(unsigned char *c, int32_t timeout_ms)
+{
+	if (!s_console_async_active) {
+		return -ENODEV;
+	}
+	k_timeout_t to = (timeout_ms < 0) ? K_FOREVER :
+	                 (timeout_ms == 0) ? K_NO_WAIT : K_MSEC(timeout_ms);
+	if (k_sem_take(&s_console_rx_sem, to) == 0) {
+		uint8_t byte;
+		if (ring_buf_get(&s_console_rx_rb, &byte, 1) == 1) {
+			if (c) {
+				*c = byte;
+			}
+			return 0;
+		}
+	}
+	return -ETIMEDOUT;
+}
+
+void console_async_suspend(void)
+{
+	if (s_console_uart_dev && s_console_async_active) {
+#if defined(CONFIG_UART_INTERRUPT_DRIVEN)
+		uart_irq_rx_disable(s_console_uart_dev);
+#endif
+		ring_buf_reset(&s_console_rx_rb);
+		k_sem_reset(&s_console_rx_sem);
+	}
+}
+
+void console_async_resume(void)
+{
+	if (s_console_uart_dev && s_console_async_active) {
+#if defined(CONFIG_SOC_SERIES_STM32L4X)
+		/* Clear only RX error and wakeup flags; NEVER clear TCCF (Transmission Complete) */
+		LL_USART_ClearFlag_ORE(USART2);
+		LL_USART_ClearFlag_FE(USART2);
+		LL_USART_ClearFlag_NE(USART2);
+		LL_USART_ClearFlag_PE(USART2);
+		LL_USART_ClearFlag_IDLE(USART2);
+		LL_USART_ClearFlag_WKUP(USART2);
+
+		/* Discard pending character in RDR only if RXNE is asserted */
+		if (LL_USART_IsActiveFlag_RXNE(USART2)) {
+			(void)USART2->RDR;
+		}
+#endif
+#if defined(CONFIG_UART_INTERRUPT_DRIVEN)
+		uart_irq_rx_enable(s_console_uart_dev);
+#endif
+	}
+}
 
 static struct wildsonic_config g_cfg = {
 	.serial_number = "WS4760001",
@@ -124,6 +247,10 @@ enum console_cmd_id {
 	CMD_TEST_ALARM,
 	CMD_PSRAM,
 	CMD_CONFIG_WIZARD,
+	CMD_GET_STATUS,
+	CMD_GET_DEV_INFO,
+	CMD_GET_CONFIG,
+	CMD_STOP_RECORDING,
 	CMD_NUM_CMDS
 };
 
@@ -190,6 +317,10 @@ static const char *console_cmd_lookup_table[] = {
 	"TEST_ALARM",
 	"PSRAM",
 	"CONFIG",
+	"GET_STATUS",
+	"GET_DEV_INFO",
+	"GET_CONFIG",
+	"STOP_RECORDING",
 };
 
 /* Command Descriptions */
@@ -255,6 +386,10 @@ static const char *console_cmd_description_table[] = {
 	"Configure custom/default alarm sequence (GPIO 1.7 + RTC)",
 	"Configure PSRAM circular staging buffer (on, off, status, burst)",
 	"Run guided interactive configuration wizard",
+	"Get current system, scheduler, and recording status",
+	"Get hardware platform and firmware device information",
+	"Get current device audio, storage, and schedule configuration",
+	"Safely stop active recording, drain buffers, and close file",
 };
 
 BUILD_ASSERT(ARRAY_SIZE(console_cmd_lookup_table) == (size_t)CMD_NUM_CMDS,
@@ -382,6 +517,7 @@ static void handle_samf(const char *p_args, size_t args_length)
 	} else {
 		/* Recording active: stage in RAM without modifying running session */
 		g_cfg.sampling_rate = val;
+		printk("\nOK: Value staged for next session (active session unaffected)\n");
 	}
 
 #if defined(CONFIG_WILDSONIC_VERBOSE_LOGS)
@@ -428,6 +564,9 @@ static void handle_btps(const char *p_args, size_t args_length)
 		if (settings) {
 			settings->sample_bits = 32;
 		}
+		if (recorder_is_active()) {
+			printk("\nOK: Value staged for next session (active session unaffected)\n");
+		}
 #if defined(CONFIG_WILDSONIC_VERBOSE_LOGS)
 		uint32_t bytes_per_sec = g_cfg.sampling_rate * (g_cfg.num_audio_channels ? g_cfg.num_audio_channels : 1) * 4;
 		printk("\n================================================================================\n");
@@ -457,6 +596,9 @@ static void handle_btps(const char *p_args, size_t args_length)
 	if (settings) {
 		settings->sample_bits = 16;
 	}
+	if (recorder_is_active()) {
+		printk("\nOK: Value staged for next session (active session unaffected)\n");
+	}
 	printk("\nValue is set to 16\n");
 	printk("\nSend APPLY command and reboot for changes to take effect\n");
 }
@@ -475,6 +617,9 @@ static void handle_numch(const char *p_args, size_t args_length)
 		g_cfg.num_audio_channels = 2;
 		if (settings) {
 			settings->channels = 2;
+		}
+		if (recorder_is_active()) {
+			printk("\nOK: Value staged for next session (active session unaffected)\n");
 		}
 #if defined(CONFIG_WILDSONIC_VERBOSE_LOGS)
 		uint32_t bytes_per_sec = g_cfg.sampling_rate * 2 * (g_cfg.audio_sampling_width ? (g_cfg.audio_sampling_width / 8) : 2);
@@ -499,6 +644,9 @@ static void handle_numch(const char *p_args, size_t args_length)
 	g_cfg.num_audio_channels = 1;
 	if (settings) {
 		settings->channels = 1;
+	}
+	if (recorder_is_active()) {
+		printk("\nOK: Value staged for next session (active session unaffected)\n");
 	}
 	printk("\nValue is set to 1\n");
 	printk("\nSend APPLY command and reboot for changes to take effect\n");
@@ -625,6 +773,9 @@ static void handle_rect(const char *p_args, size_t args_length)
 	scheduler_set_config(&scfg);
 	main_scheduler_resume();
 
+	if (recorder_is_active()) {
+		printk("\nOK: Value staged for next session (active session unaffected)\n");
+	}
 	printk("\nValue is set to %u\n", g_cfg.recording_length);
 	printk("\nSend APPLY command and reboot for changes to take effect\n");
 }
@@ -635,6 +786,10 @@ static void handle_sleep(const char *p_args, size_t args_length)
 	struct app_settings *settings = main_get_settings();
 
 	if (args_length == 0) {
+		if (recorder_is_active()) {
+			printk("\nBUSY: Cannot enter sleep while recording is active. Send STOP_RECORDING first.\n");
+			return;
+		}
 		printk("\nValue is set to %u\n", g_cfg.sleep_pause_interval);
 		return;
 	}
@@ -661,6 +816,9 @@ static void handle_sleep(const char *p_args, size_t args_length)
 	scheduler_set_config(&scfg);
 	main_scheduler_resume();
 
+	if (recorder_is_active()) {
+		printk("\nOK: Value staged for next session (active session unaffected)\n");
+	}
 	printk("\nValue is set to %u\n", g_cfg.sleep_pause_interval);
 	printk("\nSend APPLY command and reboot for changes to take effect\n");
 }
@@ -691,7 +849,11 @@ static void handle_datetime(const char *p_args, size_t args_length)
 	struct rtc_calendar_time new_cal;
 	int parse_res = rtc_calendar_parse(p_args, &new_cal);
 	if (parse_res == 0) {
-		rtc_calendar_set(&new_cal);
+		int set_res = rtc_calendar_set(&new_cal);
+		if (set_res != 0) {
+			printk("\n[ERROR] Failed to set RTC hardware calendar (%d)\n", set_res);
+			return;
+		}
 		time_t new_utc = scheduler_calendar_to_epoch(&new_cal);
 		g_cfg.boot_time_utc = new_utc;
 
@@ -912,6 +1074,8 @@ static void handle_gain(const char *p_args, size_t args_length)
 	settings->digital_gain = powf(10.0f, ((float)gain_t10 / 10.0f) / 20.0f);
 	if (!recorder_is_active()) {
 		main_apply_dsp_settings();
+	} else {
+		printk("\nOK: Value staged for next session (active session unaffected)\n");
 	}
 
 	printk("\nAudio gain set to 0.1*%d\n", gain_t10);
@@ -1115,9 +1279,112 @@ static void handle_default(void)
 	printk("\nDefault device configurations are set\n");
 }
 
+/* GET_STATUS handler */
+static void handle_get_status(void)
+{
+	printk("\n=== SYSTEM & RECORDING STATUS ===\n");
+	if (recorder_is_active()) {
+		printk("  Recording State       : ACTIVE\n");
+		char cur_file[80] = {0};
+		recorder_get_active_file(cur_file, sizeof(cur_file));
+		if (cur_file[0] != '\0') {
+			printk("  Active File           : %s\n", cur_file);
+		}
+		uint64_t samples_written = 0, expected_samples = 0;
+		recorder_get_active_progress(&samples_written, &expected_samples);
+		printk("  Samples Written       : %llu / %llu\n",
+		       (unsigned long long)samples_written, (unsigned long long)expected_samples);
+		printk("  Active Sample Rate    : %u Hz\n", audio_in_rate());
+		printk("  Active Bit Depth      : %u-bit\n", g_cfg.audio_sampling_width);
+		printk("  Active Channels       : %u (%s)\n",
+		       g_cfg.num_audio_channels,
+		       (g_cfg.num_audio_channels == 2) ? "Duplicated Mono Container" : "Mono");
+	} else {
+		printk("  Recording State       : IDLE\n");
+		printk("  Scheduler Status      : %s\n",
+		       main_is_scheduler_paused() ? "PAUSED" : "RUNNING");
+		printk("  Configured Rate       : %u Hz\n", g_cfg.sampling_rate);
+		printk("  Configured Bit Depth  : %u-bit\n", g_cfg.audio_sampling_width);
+		printk("  Configured Channels   : %u\n", g_cfg.num_audio_channels);
+		printk("  Configured Record Time: %u seconds\n", g_cfg.recording_length);
+		printk("  Configured Sleep Time : %u seconds\n", g_cfg.sleep_pause_interval);
+	}
+
+	if (rtc_calendar_is_valid()) {
+		struct rtc_calendar_time cur_cal;
+		if (rtc_calendar_get(&cur_cal) == 0) {
+			char rtc_str[32];
+			rtc_calendar_format(&cur_cal, rtc_str, sizeof(rtc_str));
+			printk("  RTC Current Time      : %s UTC\n", rtc_str);
+		}
+	} else {
+		printk("  RTC Current Time      : UNINITIALIZED\n");
+	}
+
+	int last_sd_err = recorder_get_last_sd_error();
+	if (last_sd_err != 0) {
+		printk("  Last Storage Error    : %d\n", last_sd_err);
+	}
+	printk("OK\n");
+}
+
+/* GET_DEV_INFO handler */
+static void handle_get_dev_info(void)
+{
+	printk("\n=== DEVICE INFORMATION ===\n");
+	printk("  Hardware Platform     : STM32L476RG Nucleo-64 (ARM Cortex-M4F)\n");
+	printk("  Core Clock Frequency  : 72 MHz (PLL HSI)\n");
+	printk("  Audio Acquisition     : 12-bit SAR ADC, TIM6 TRGO DMA\n");
+	printk("  External Memory       : ISSI IS66WVS4M8 4MB Quad-SPI PSRAM @ 18 MHz\n");
+	printk("  Storage Media         : MicroSD Card via SDMMC1 4-bit @ 6 MHz (FatFs /SD:)\n");
+	printk("  SRAM Architecture     : 128 KiB (SRAM1: 96 KiB, SRAM2: 32 KiB)\n");
+	printk("  Flash Memory          : 1024 KiB Dual-Bank\n");
+	printk("  Power Management      : STM32L4 Stop 2 Deep Sleep (Strict RTC Wakeup)\n");
+	printk("  Firmware Version      : 2.1.0-prod (Zephyr RTOS)\n");
+	printk("OK\n");
+}
+
+/* GET_CONFIG handler */
+static void handle_get_config(void)
+{
+	printk("\n=== DEVICE CONFIGURATION ===\n");
+	printk("  Serial Number (SN)    : %s\n", g_cfg.serial_number);
+	printk("  Device Name (DNAME)   : %s\n", g_cfg.device_name);
+	printk("  Sampling Rate (SAMF)  : %u Hz\n", g_cfg.sampling_rate);
+	printk("  Bits Per Sample (BTPS): %u-bit\n", g_cfg.audio_sampling_width);
+	printk("  Channels (NUMCH)      : %u (%s)\n",
+	       g_cfg.num_audio_channels,
+	       (g_cfg.num_audio_channels == 2) ? "Duplicated Mono Container" : "Mono");
+	printk("  Record Time (RECT)    : %u seconds\n", g_cfg.recording_length);
+	printk("  Sleep Interval (SLEEP): %u seconds\n", g_cfg.sleep_pause_interval);
+	printk("  Mic Gain (GAIN)       : %.1f dB\n", (double)((float)g_cfg.mic_gain_times_ten / 10.0f));
+	printk("  Lower Cutoff (LCUTOFF): %u Hz\n", g_cfg.lower_cutoff_frequency);
+	printk("  Upper Cutoff (UCUTOFF): %u Hz\n", g_cfg.upper_cutoff_frequency);
+	printk("  Folder Mode (FLDR)    : %u (%s)\n",
+	       g_cfg.folder_structure,
+	       (g_cfg.folder_structure == 0) ? "Flat" :
+	       (g_cfg.folder_structure == 1) ? "Daily" : "Hourly");
+	printk("OK\n");
+}
+
+/* STOP_RECORDING handler */
+static void handle_stop_recording(void)
+{
+	if (recorder_is_active()) {
+		recorder_request_stop();
+		printk("\nOK: Stop recording requested; finalizing WAV container and closing file.\n");
+	} else {
+		printk("\nOK: Recorder is already idle.\n");
+	}
+}
+
 /* APPLY handler */
 static void handle_apply(void)
 {
+	if (recorder_is_active()) {
+		printk("\nBUSY: Cannot commit to flash while recording is active. Send STOP_RECORDING first.\n");
+		return;
+	}
 	g_cfg.save_config_flag = true;
 	config_store_save();
 	/* Canonical Maxim notification: */
@@ -1132,13 +1399,28 @@ static void handle_rbt(void)
 	if (recorder_is_active()) {
 		printk("[REBOOT] Stopping active recording safely...\n");
 		recorder_request_stop();
-		if (recorder_wait_idle(5000) != 0) {
-			printk("[REBOOT] Warning: timeout waiting for recorder to finalize.\n");
+		int wait_rc = recorder_wait_idle(5000);
+		if (wait_rc != 0) {
+			LOG_ERR("RBT: Recorder shutdown timeout (%d); aborting reboot to preserve data", wait_rc);
+			printk("[ERROR] Timeout waiting for recorder to finalize (%d); aborting reboot.\n", wait_rc);
+			return;
 		}
 	}
+
+	int last_err = recorder_get_last_error();
+	int last_sd = recorder_get_last_sd_error();
+	if (last_err != 0 || last_sd != 0) {
+		LOG_ERR("RBT: Previous storage error detected (%d); preserving error state and canceling reboot",
+		        last_err != 0 ? last_err : last_sd);
+		printk("[ERROR] Storage error detected (%d); reboot aborted to preserve error diagnosis.\n",
+		       last_err != 0 ? last_err : last_sd);
+		return;
+	}
+
 	led_indicator_set(LED_IND_OFF);
 	if (g_cfg.save_config_flag) {
 		config_store_save();
+		g_cfg.save_config_flag = false;
 	}
 	printk("\nRebooting device.\n");
 	while (log_process()) {
@@ -1152,9 +1434,50 @@ static void handle_rbt(void)
 /* ARBT handler */
 static void handle_arbt(void)
 {
-	g_cfg.save_config_flag = true;
-	config_store_save();
-	handle_rbt();
+	/* Immediate acknowledgment to console */
+	printk("\n[ACK] ARBT: Applying configuration and initiating orderly shutdown...\n");
+
+	/* Save configuration exactly ONCE */
+	g_cfg.save_config_flag = false;
+	int save_rc = config_store_save();
+	if (save_rc != 0) {
+		LOG_ERR("ARBT: Failed to save configuration to flash (%d)", save_rc);
+		printk("[ERROR] Flash save failed (%d). Reboot aborted.\n", save_rc);
+		return;
+	}
+	printk("[ACK] Configuration committed to persistent flash (1 save operation).\n");
+
+	/* If recording is active, request orderly stop and wait for clean drain */
+	if (recorder_is_active()) {
+		printk("[REBOOT] Stopping active recording safely...\n");
+		recorder_request_stop();
+		int wait_rc = recorder_wait_idle(5000);
+		if (wait_rc != 0) {
+			LOG_ERR("ARBT: Recorder shutdown timeout (%d); aborting reboot to preserve storage", wait_rc);
+			printk("[ERROR] Storage shutdown timed out (%d); aborting reboot to prevent corruption.\n", wait_rc);
+			return;
+		}
+	}
+
+	/* Verify no storage failure occurred before reboot */
+	int last_err = recorder_get_last_error();
+	int last_sd = recorder_get_last_sd_error();
+	if (last_err != 0 || last_sd != 0) {
+		LOG_ERR("ARBT: Session experienced storage error (%d); preserving error state",
+		        last_err != 0 ? last_err : last_sd);
+		printk("[ERROR] Storage error detected (%d); reboot aborted to preserve error diagnosis.\n",
+		       last_err != 0 ? last_err : last_sd);
+		return;
+	}
+
+	led_indicator_set(LED_IND_OFF);
+	printk("\nAll buffers flushed and WAV container closed cleanly. Rebooting device.\n");
+	while (log_process()) {
+		k_sleep(K_MSEC(2));
+	}
+#if defined(CONFIG_REBOOT)
+	sys_reboot(SYS_REBOOT_COLD);
+#endif
 }
 
 /* SDFMT handler */
@@ -1169,6 +1492,20 @@ static void handle_sdfmt(const char *p_args, size_t args_length)
 	}
 }
 
+/* BLEPAIR handler */
+static void handle_blepair(const char *p_args, size_t args_length)
+{
+	uint32_t seconds = 300;
+	if (args_length > 0) {
+		unsigned long val = strtoul(p_args, NULL, 10);
+		if (val > 0) {
+			seconds = (uint32_t)val;
+		}
+	}
+	ble_comm_open_pairing_window(seconds);
+	printk("\nBLE Access: UNLOCKED (%u s)\n", (unsigned int)seconds);
+}
+
 /* Initialize Console */
 void console_init(void)
 {
@@ -1179,9 +1516,9 @@ void console_init(void)
 }
 
 /* Process incoming command line */
-void console_process_line(char *cmd_line)
+int console_process_line_source(char *cmd_line, bool from_ble, char *out_resp, size_t out_resp_size)
 {
-	if (!cmd_line) return;
+	if (!cmd_line) return -EINVAL;
 
 	/* Trim leading whitespace */
 	char *p = cmd_line;
@@ -1197,29 +1534,55 @@ void console_process_line(char *cmd_line)
 		if (main_is_scheduler_paused()) {
 			main_scheduler_resume();
 		}
-		return;
+		return 0;
+	}
+
+	if (out_resp && out_resp_size > 0) {
+		out_resp[0] = '\0';
 	}
 
 	if (strncasecmp(p, "BITS", 4) == 0 && (p[4] == ' ' || p[4] == '\0' || p[4] == '=')) {
 		const char *arg = p + 4;
 		while (*arg == ' ' || *arg == '=') arg++;
 		handle_btps(arg, strlen(arg));
-		return;
+		return 0;
 	}
 	if (strncasecmp(p, "CHANNELS", 8) == 0 && (p[8] == ' ' || p[8] == '\0' || p[8] == '=')) {
 		const char *arg = p + 8;
 		while (*arg == ' ' || *arg == '=') arg++;
 		handle_numch(arg, strlen(arg));
-		return;
+		return 0;
 	}
 #if defined(CONFIG_WILDSONIC_VERBOSE_LOGS)
 	if (strncasecmp(p, "SOURCE", 6) == 0 && (p[6] == ' ' || p[6] == '\0' || p[6] == '=')) {
 		const char *arg = p + 6;
 		while (*arg == ' ' || *arg == '=') arg++;
 		handle_source(arg, strlen(arg));
-		return;
+		return 0;
 	}
 #endif
+
+	if (strcasecmp(p, "STATUS") == 0) {
+		if (from_ble) {
+			ble_comm_send_status_info();
+		} else {
+			handle_get_status();
+		}
+		return 0;
+	}
+	if (strcasecmp(p, "DEVINFO") == 0) {
+		if (from_ble) {
+			ble_comm_send_dev_info();
+		} else {
+			handle_get_dev_info();
+		}
+		return 0;
+	}
+	if (strcasecmp(p, "stop") == 0) {
+		handle_stop_recording();
+		if (out_resp && out_resp_size > 0) snprintf(out_resp, out_resp_size, "OK");
+		return 0;
+	}
 
 	size_t arg_offset = 0;
 	enum console_cmd_id cmd_id = console_cmd_lookup_func(p, len, &arg_offset);
@@ -1358,7 +1721,7 @@ void console_process_line(char *cmd_line)
 		handle_audio(p_args, args_len);
 		break;
 	case CMD_BLEPAIR:
-		report_deferred_hardware("BLEPAIR");
+		handle_blepair(p_args, args_len);
 		break;
 	case CMD_WILDLY:
 		/* Silently ignored per reference behavior */
@@ -1414,12 +1777,44 @@ void console_process_line(char *cmd_line)
 	case CMD_CONFIG_WIZARD:
 		main_run_guided_config();
 		break;
+	case CMD_GET_STATUS:
+		if (from_ble) {
+			ble_comm_send_status_info();
+		} else {
+			handle_get_status();
+		}
+		break;
+	case CMD_GET_DEV_INFO:
+		if (from_ble) {
+			ble_comm_send_dev_info();
+		} else {
+			handle_get_dev_info();
+		}
+		break;
+	case CMD_GET_CONFIG:
+		handle_get_config();
+		break;
+	case CMD_STOP_RECORDING:
+		handle_stop_recording();
+		break;
 
 	default:
-		printk("\nUnknown or BAD command : %s\n", p);
-		display_console_commands();
-		break;
+		if (!from_ble) {
+			printk("\nUnknown or BAD command : %s\n", p);
+			display_console_commands();
+		}
+		return -EINVAL;
 	}
+
+	if (out_resp && out_resp_size > 0 && out_resp[0] == '\0') {
+		snprintf(out_resp, out_resp_size, "OK");
+	}
+	return 0;
+}
+
+void console_process_line(char *cmd_line)
+{
+	(void)console_process_line_source(cmd_line, false, NULL, 0);
 }
 
 struct wildsonic_config *console_get_config(void)

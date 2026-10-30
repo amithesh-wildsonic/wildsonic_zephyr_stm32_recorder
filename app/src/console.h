@@ -48,6 +48,17 @@ void console_init(void);
 void console_process_line(char *cmd_line);
 
 /**
+ * @brief Process an entire command line from a specific source (Console or BLE).
+ *
+ * @param cmd_line Null-terminated input string.
+ * @param from_ble True if invoked from BLE transport, false if from console UART.
+ * @param out_resp Optional output buffer for response back to source.
+ * @param out_resp_size Size of out_resp buffer.
+ * @return 0 on success, negative errno on error.
+ */
+int console_process_line_source(char *cmd_line, bool from_ble, char *out_resp, size_t out_resp_size);
+
+/**
  * @brief Get pointer to staged configuration in RAM.
  */
 struct wildsonic_config *console_get_config(void);
@@ -56,6 +67,50 @@ struct wildsonic_config *console_get_config(void);
  * @brief Synchronize staged RAM configuration with audio pipeline and scheduler.
  */
 void console_sync_staged_to_active(void);
+
+struct device;
+
+/**
+ * @brief Initialize asynchronous interrupt-driven console UART RX with ring buffer.
+ *
+ * @param dev UART device instance.
+ * @return 0 on success, negative errno on error.
+ */
+int console_async_init(const struct device *dev);
+
+/**
+ * @brief Check whether asynchronous interrupt-driven console RX is active.
+ *
+ * @return true if active, false otherwise.
+ */
+bool console_async_is_active(void);
+
+/**
+ * @brief Get a character from the async console RX ring buffer (non-blocking).
+ *
+ * @param c Output character pointer.
+ * @return 0 if character retrieved, -EAGAIN if ring buffer is empty.
+ */
+int console_async_get_char(unsigned char *c);
+
+/**
+ * @brief Wait for a character from the async console RX ring buffer with timeout in milliseconds.
+ *
+ * @param c Output character pointer.
+ * @param timeout_ms Maximum wait time in milliseconds (-1 for forever, 0 for no wait).
+ * @return 0 if character retrieved, -ETIMEDOUT if timed out.
+ */
+int console_async_wait_char(unsigned char *c, int32_t timeout_ms);
+
+/**
+ * @brief Suspend console UART RX interrupts (e.g. prior to entering Stop 2 sleep).
+ */
+void console_async_suspend(void);
+
+/**
+ * @brief Resume console UART RX interrupts (e.g. after waking from Stop 2 sleep).
+ */
+void console_async_resume(void);
 
 struct wildsonic_assert_record {
 	bool asserted;
