@@ -167,8 +167,8 @@ void console_async_resume(void)
 }
 
 static struct wildsonic_config g_cfg = {
-	.serial_number = "WS4760001",
-	.device_name = "WildSonic",
+	.serial_number = "0",
+	.device_name = "",
 	.device_password = "wildsonic123",
 	.sampling_rate = CONFIG_AUDIO_SAMPLE_RATE,
 	.recording_length = 600,
@@ -442,9 +442,10 @@ static void display_console_help(void)
 }
 
 /* Explicit deferred hardware notice */
-static void report_deferred_hardware(const char *cmd_name)
+static int report_deferred_hardware(const char *cmd_name)
 {
 	printk("\n[DEFERRED] Command '%s' requires hardware not populated on STM32L476RG.\n", cmd_name);
+	return -ENOTSUP;
 }
 
 /* Look up command index from string */
@@ -1186,25 +1187,25 @@ static void handle_version(void)
 	       __DATE__, __TIME__);
 }
 
-/* SN handler */
-static void handle_sn(const char *p_args, size_t args_length)
+/* SN handler (max 3 alphanumeric chars per original WildSonic) */
+static int handle_sn(const char *p_args, size_t args_length)
 {
 	if (args_length == 0) {
 		printk("\nValue is set to %s\n", g_cfg.serial_number);
-		return;
+		return 0;
 	}
 
-	if (args_length >= sizeof(g_cfg.serial_number)) {
+	if (args_length > 3) {
 		printk("\nInvalid value %s\n", p_args);
 		printk("\nValue is set to %s\n", g_cfg.serial_number);
-		return;
+		return -EINVAL;
 	}
 
 	for (size_t i = 0; i < args_length; i++) {
 		if (!isalnum((unsigned char)p_args[i])) {
 			printk("\nInvalid value %s\n", p_args);
 			printk("\nValue is set to %s\n", g_cfg.serial_number);
-			return;
+			return -EINVAL;
 		}
 	}
 
@@ -1212,6 +1213,38 @@ static void handle_sn(const char *p_args, size_t args_length)
 	g_cfg.serial_number[sizeof(g_cfg.serial_number) - 1] = '\0';
 	printk("\nValue is set to %s\n", g_cfg.serial_number);
 	printk("\nSend APPLY command and reboot for changes to take effect\n");
+	ble_comm_notify_name_changed();
+	return 0;
+}
+
+/* DNAME handler (max 6 alphanumeric chars per original WildSonic) */
+static int handle_dname(const char *p_args, size_t args_length)
+{
+	if (args_length == 0) {
+		printk("\nValue is set to %s\n", g_cfg.device_name);
+		return 0;
+	}
+
+	if (args_length > 6) {
+		printk("\nInvalid value %s\n", p_args);
+		printk("\nValue is set to %s\n", g_cfg.device_name);
+		return -EINVAL;
+	}
+
+	for (size_t i = 0; i < args_length; i++) {
+		if (!isalnum((unsigned char)p_args[i])) {
+			printk("\nInvalid value %s\n", p_args);
+			printk("\nValue is set to %s\n", g_cfg.device_name);
+			return -EINVAL;
+		}
+	}
+
+	strncpy(g_cfg.device_name, p_args, sizeof(g_cfg.device_name) - 1);
+	g_cfg.device_name[sizeof(g_cfg.device_name) - 1] = '\0';
+	printk("\nValue is set to %s\n", g_cfg.device_name);
+	printk("\nSend APPLY command and reboot for changes to take effect\n");
+	ble_comm_notify_name_changed();
+	return 0;
 }
 
 /* PW handler */
@@ -1495,6 +1528,10 @@ static void handle_sdfmt(const char *p_args, size_t args_length)
 /* BLEPAIR handler */
 static void handle_blepair(const char *p_args, size_t args_length)
 {
+	if (args_length > 0 && (strncasecmp(p_args, "LOCK", 4) == 0 || strcmp(p_args, "0") == 0)) {
+		ble_comm_lock_pairing();
+		return;
+	}
 	uint32_t seconds = 300;
 	if (args_length > 0) {
 		unsigned long val = strtoul(p_args, NULL, 10);
@@ -1503,7 +1540,6 @@ static void handle_blepair(const char *p_args, size_t args_length)
 		}
 	}
 	ble_comm_open_pairing_window(seconds);
-	printk("\nBLE Access: UNLOCKED (%u s)\n", (unsigned int)seconds);
 }
 
 /* Initialize Console */
@@ -1595,11 +1631,9 @@ int console_process_line_source(char *cmd_line, bool from_ble, char *out_resp, s
 		display_console_help();
 		break;
 	case CMD_SERIAL_NUMBER:
-		handle_sn(p_args, args_len);
-		break;
+		return handle_sn(p_args, args_len);
 	case CMD_DEVICE_NAME:
-		report_deferred_hardware("DNAME");
-		break;
+		return handle_dname(p_args, args_len);
 	case CMD_PASSWORD:
 		handle_pw(p_args, args_len);
 		break;

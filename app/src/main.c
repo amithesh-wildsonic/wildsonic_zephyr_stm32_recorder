@@ -40,6 +40,7 @@
 #include "led_indicator.h"
 #include "audio_format.h"
 #include "ble_comm.h"
+#include "scheduler_retention.h"
 #if defined(CONFIG_WILDSONIC_VERBOSE_LOGS)
 #include "psram_benchmark.h"
 #endif
@@ -234,39 +235,39 @@ static const char *mode_to_string(enum recorder_mode m) {
 
 uint32_t g_boot_csr = 0;
 
-static void __maybe_unused print_reset_reason(void) {
+static void print_reset_reason(void) {
   uint32_t csr = g_boot_csr ? g_boot_csr : RCC->CSR;
-  printk("  MCU Reset Reason  : [0x%08X] ", csr);
+  printk("  MCU Reset Reason  : [0x%08X] ", (unsigned int)csr);
   bool known = false;
-  if (LL_RCC_IsActiveFlag_LPWRRST()) {
+  if (csr & RCC_CSR_LPWRRSTF) {
     printk("Low-Power Reset; ");
     known = true;
   }
-  if (LL_RCC_IsActiveFlag_WWDGRST()) {
+  if (csr & RCC_CSR_WWDGRSTF) {
     printk("Window Watchdog Reset (WWDG); ");
     known = true;
   }
-  if (LL_RCC_IsActiveFlag_IWDGRST()) {
+  if (csr & RCC_CSR_IWDGRSTF) {
     printk("Independent Watchdog Reset (IWDG); ");
     known = true;
   }
-  if (LL_RCC_IsActiveFlag_SFTRST()) {
+  if (csr & RCC_CSR_SFTRSTF) {
     printk("Software Reset (SystemReset / Fatal Error); ");
     known = true;
   }
-  if (LL_RCC_IsActiveFlag_BORRST()) {
+  if (csr & RCC_CSR_BORRSTF) {
     printk("Brownout Reset (BOR) / Power-On; ");
     known = true;
   }
-  if (LL_RCC_IsActiveFlag_PINRST()) {
+  if (csr & RCC_CSR_PINRSTF) {
     printk("External Reset Pin (NRST); ");
     known = true;
   }
-  if (LL_RCC_IsActiveFlag_OBLRST()) {
+  if (csr & RCC_CSR_OBLRSTF) {
     printk("Option Byte Loader Reset; ");
     known = true;
   }
-  if (LL_RCC_IsActiveFlag_FWRST()) {
+  if (csr & RCC_CSR_FWRSTF) {
     printk("Firewall Reset; ");
     known = true;
   }
@@ -288,6 +289,7 @@ static void print_banner(void) {
   printk("Version: %s\n", "v1.2.0");
   printk("GIT Branch: %s, SHA: %s\n", "production", "d7a4f91");
   printk("Build Date: %s %s\n", __DATE__, __TIME__);
+  print_reset_reason();
 #endif
 }
 
@@ -1341,8 +1343,6 @@ static void recorder_thread_fn(void *p1, void *p2, void *p3) {
                                                &s_rec_last_stats);
 
     if (s_rec_req.is_autonomous) {
-      s_last_end_time_local = s_rec_req.start_time_utc + s_rec_req.tz_offset + s_rec_req.duration_sec;
-
 #if defined(CONFIG_WILDSONIC_VERBOSE_LOGS)
       printk("\n[SCHEDULER] Session %u finished: status=%d, err=%d, samples=%llu, duration=%u s\n",
              s_rec_req.cycle, s_rec_last_result, s_rec_last_stats.err,
@@ -1358,6 +1358,10 @@ static void recorder_thread_fn(void *p1, void *p2, void *p3) {
                s_rec_req.cycle, (s_rec_last_result != 0) ? s_rec_last_result : s_rec_last_stats.err);
         s_schedule_paused = true;
       } else {
+        time_t end_utc = s_rec_req.start_time_utc + s_rec_req.duration_sec;
+        s_last_end_time_local = end_utc + s_rec_req.tz_offset;
+        scheduler_retention_save(end_utc);
+
         s_schedule_cycle++;
         if (settings.cycles > 0 && s_schedule_cycle > settings.cycles) {
           printk("\n[SCHEDULER] Configured target cycles (%u) completed successfully.\n\n> ", settings.cycles);
@@ -1755,11 +1759,12 @@ void main_psram_command(int matched, const char *arg1, const char *arg2) {
 
 int main(void) {
   g_boot_csr = RCC->CSR;
-  LL_RCC_ClearResetFlags();
 
   led_indicator_init();
-
   print_banner();
+
+  /* Clear the hardware reset flags only AFTER logging them */
+  LL_RCC_ClearResetFlags();
 
 #ifdef CONFIG_PSRAM_TEST_ENABLE
   /* 1. Independent External PSRAM Bring-up & Multi-Pass Memory Test */
@@ -1834,6 +1839,21 @@ int main(void) {
   printk("SD card initialized successfully\n");
 
   scheduler_init();
+  scheduler_retention_init();
+  time_t retained_end_utc = 0;
+  if (scheduler_retention_restore(&retained_end_utc) == 0) {
+    struct schedule_config scfg;
+    scheduler_get_config(&scfg);
+    s_last_end_time_local = retained_end_utc + scfg.time_zone_offset;
+    char buf[32];
+    struct rtc_calendar_time cal;
+    scheduler_epoch_to_calendar(retained_end_utc, &cal);
+    rtc_calendar_format(&cal, buf, sizeof(buf));
+    printk("[SCHEDULER] Restored previous session end from RTC backup: %s UTC (timestamp=%lld)\n",
+           buf, (long long)retained_end_utc);
+  } else {
+    s_last_end_time_local = 0;
+  }
   console_init();
   console_async_init(console_dev);
 

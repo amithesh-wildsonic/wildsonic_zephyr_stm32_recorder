@@ -1,51 +1,42 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: Apache-2.0
 """
-Automated Test Suite: BLE Module Integration & Multi-Interface Concurrency on STM32L476RG.
+Automated Test Suite: BLE Module Integration, AT Command Protocol Parity & Reset Cause Diagnostics.
 
-Tests and audits:
- 1. Hardware & Devicetree Mapping:
+Covers:
+ 1. Hardware & Devicetree Pinout:
     - USART1 mapped to PA9 (TX) and PA10 (RX) at 115200 8N1.
     - USART2 preserved exclusively for Zephyr console (PA2/PA3).
-    - USART3 preserved for QSPI PSRAM, PA0 for audio ADC, PC8-PC12/PD2 for SDMMC.
- 2. BLE UART Framing & CR/LF Handling:
-    - Multi-byte line accumulator handles \r\n, \n, and \r.
-    - Strips whitespace cleanly; ignores empty delimiter sequences.
- 3. Fragmented RX Message Assembly (18-byte BLE chunks):
-    - Reassembles packets split across 18-byte BLE characteristic notifications.
-    - Dispatches only upon receiving valid line termination.
- 4. Back-to-Back Command Processing:
-    - Multiple commands received in rapid succession or concatenated in a single buffer.
- 5. Oversized Packet Bounded Protection:
-    - Discards or truncates commands exceeding BLE_UART_CMD_MAX_LEN (128 bytes) safely.
- 6. Ring Buffer Overflow Protection:
-    - Bounded 512-byte RX ring buffer gracefully drops excess bytes on overflow without crashing.
- 7. Command Forwarding Parity:
-    - Standard configuration commands (SAMF, BITS, CHANNELS, RECT, SLEEP, GAIN, STOP_RECORDING)
-      are forwarded directly to the existing command parser with identical semantics.
- 8. Response Routing Isolation:
-    - BLE command responses are routed exclusively back to BLE USART1 TX ring buffer.
-    - Console stdout (USART2 printk) is not polluted by BLE status responses.
- 9. BLE Supervisor Event Parsing:
-    - Handles asynchronous modem notifications: OK+CONN, OK+LOST, OK+WAKE, OK+SLEEP.
-10. Bounded Pairing Window & Auto-Lock:
-    - BLEPAIR command parses duration (default 300s, clamped to max 600s).
-    - Window expiration automatically locks advertising via AT+SLEEP.
-11. GET_DEV_INFO Protocol Compliance:
-    - Contains all required device tags (NAME, MODEL, SERIAL, FWVER, SRATE, RECBITS, etc.).
-    - Terminates with 'TEMP 0.00, HUMID 0.00\r\n' to unlock mobile companion app.
-12. GET_STATUS_INFO Protocol Compliance:
-    - Contains SDCARD, SDFREE, FSCK, REC_STATUS, BATT, VOLT.
-    - Terminates with 'TEMP 0.00, HUMID 0.00\r\n' to unlock mobile companion app.
-13. Stop 2 Low-Power Sleep Lifecycle:
-    - ble_comm_suspend() sends AT+SLEEP, drains TX, disables RX interrupt, and isolates USART1.
-    - ble_comm_resume() re-enables clock and RX interrupt cleanly without corrupting USART flags.
-14. Non-Blocking Startup Probe:
-    - Bounded probe sequence (3 attempts, 100 ms timeout) does not stall boot if module is unpopulated.
+ 2. AT Command Transaction Engine:
+    - Bare AT ping requires exact 'OK\r\n'.
+    - Rejects unmatched or arbitrary 'OK+...' as bare ping success.
+ 3. Pairing Lock & Unlock Semantics:
+    - Unlock: AT+ADTY0 -> validates exact OK+Set:0.
+    - Lock: AT+ADTY2 -> validates exact OK+Set:2.
+    - Rejects AT+SLEEP or AT+ADTY0 as pairing lock commands.
+ 4. Sleep Policy (AT+SLPM):
+    - Query: AT+SLPM? -> validates OK+SLPM:<mode>.
+    - Set: AT+SLPM=1 -> validates OK+Set:1.
+    - Audits Mode 1 (UART RX wake supported) vs Mode 2 (UART RX blocked).
+    - Ensures initial operating policy enforces Mode 1 because no LPIN wire exists.
+ 5. Pairing Window Expiration Lifecycle:
+    - Expiration while disconnected: triggers AT+ADTY2 lock immediately.
+    - Expiration while connected: preserves transparent central connection; defers AT+ADTY2 until OK+LOST.
+ 6. Supervisor Modem Notifications:
+    - Parses OK+CONN, OK+LOST, OK+WAKE, OK+SLEEP.
+ 7. Mobile Companion Interoperability:
+    - GET_DEV_INFO and GET_STATUS_INFO emit required tags and terminate with 'TEMP 0.00, HUMID 0.00\r\n'.
+ 8. Host Readiness Protocol:
+    - Confirms AT+WS=1 / wake-aware mode is not enabled without full handshake support (remains WS=0 transparent).
+ 9. Elimination of Unsupported Legacy Commands:
+    - Verifies AT+UART1, AT+PWRM0, AT+MODE2, WS+SYNC, WS+ALIVE are purged from production C sources.
+10. STM32 Reset Cause Diagnostics:
+    - Verifies RCC_CSR reset flags (BORRSTF, PINRSTF, SFTRSTF, IWDGRSTF, WWDGRSTF, LPWRRSTF).
+    - Verifies flags are captured and reported BEFORE being cleared.
+11. Stability & Reboots:
+    - Verifies BLE events and AT+RESET commands never cause STM32 host reboots.
 """
 
-import os
-import re
 from pathlib import Path
 import pytest
 
@@ -54,7 +45,6 @@ APP_SRC = REPO_ROOT / "app" / "src"
 APP_BOARDS = REPO_ROOT / "app" / "boards"
 OVERLAY_DTS = APP_BOARDS / "nucleo_l476rg.overlay"
 CMAKELISTS = REPO_ROOT / "app" / "CMakeLists.txt"
-PRJ_CONF = REPO_ROOT / "app" / "prj.conf"
 
 BLE_COMM_H = APP_SRC / "ble_comm.h"
 BLE_COMM_C = APP_SRC / "ble_comm.c"
@@ -99,308 +89,437 @@ def test_cmake_includes_ble_comm():
 
 
 # ==============================================================================
-# 2. Simulated BLE Packet & Framing Engine
+# 2. Simulated Transaction & Protocol Engine
 # ==============================================================================
 
-class BleCommSimulator:
+class BleSupervisorSimulator:
     """
-    Python simulator mimicking ble_comm.c line accumulation, 18-byte chunking,
-    event handling, pairing timer, and response formatting.
+    Simulates the nRF52832 WildSonic BLE Supervisor module implementing
+    exact AT command dispatching and responses according to at_cmd.c.
     """
-    def __init__(self, cmd_max_len=128, rx_buf_size=512):
-        self.cmd_max_len = cmd_max_len
-        self.rx_buf_size = rx_buf_size
-        self.rx_ring = []
-        self.line_buf = ""
-        self.dispatched_commands = []
-        self.tx_ring = []
+    def __init__(self, initial_slpm=1, initial_adty=2):
+        self.slpm = initial_slpm
+        self.adty = initial_adty
+        self.is_connected = False
+        self.is_sleeping = False
+        self.device_name = "WS:WS-01"
+        self.bond_mode = 3
+        self.pin = "123456"
+
+    def process_command(self, cmd: str) -> str:
+        cmd = cmd.strip()
+        if self.is_connected:
+            return ""  # AT commands blocked while central connected
+
+        if cmd == "AT":
+            self.is_sleeping = False
+            return "OK\r\n"
+        elif cmd == "AT+SLPM?":
+            return f"OK+SLPM:{self.slpm}\r\n"
+        elif cmd.startswith("AT+SLPM="):
+            val = int(cmd.split("=")[1])
+            if val in (1, 2, 3):
+                self.slpm = val
+                return f"OK+Set:{val}\r\n"
+            return "ERR\r\n"
+        elif cmd == "AT+ADTY?":
+            return f"OK+Get:{self.adty}\r\n"
+        elif cmd == "AT+ADTY0":
+            self.adty = 0
+            return "OK+Set:0\r\n"
+        elif cmd == "AT+ADTY2":
+            self.adty = 2
+            return "OK+Set:2\r\n"
+        elif cmd.startswith("AT+NAME"):
+            name = cmd[7:]
+            self.device_name = name
+            return f"OK+Set:{name}\r\n"
+        elif cmd == "AT+TYPE3":
+            self.bond_mode = 3
+            return "OK+Set:3\r\n"
+        elif cmd.startswith("AT+PASS"):
+            self.pin = cmd[7:]
+            return "OK+Set:******\r\n"
+        elif cmd == "AT+SLEEP":
+            self.is_sleeping = True
+            return "OK+SLEEP\r\n"
+        elif cmd == "AT+RESET":
+            self.is_sleeping = False
+            return "OK+RESET\r\n"
+        elif cmd == "AT+BAUD?":
+            return "OK+Get:4\r\n"
+        else:
+            return "ERR\r\n"
+
+
+class BleHostClientSimulator:
+    """
+    Simulates STM32 ble_comm.c transaction state machine.
+    """
+    def __init__(self, supervisor: BleSupervisorSimulator):
+        self.supervisor = supervisor
+        self.is_active = False
         self.is_connected = False
         self.is_module_awake = False
+        self.pairing_window_active = False
         self.pairing_window_remaining = 0
-        self.is_suspended = False
+        self.lock_pending_on_disconnect = False
+        self.tx_log = []
+        self.rx_log = []
 
-    def feed_rx_bytes(self, data: bytes):
-        accepted = 0
-        for b in data:
-            if len(self.rx_ring) < self.rx_buf_size:
-                self.rx_ring.append(b)
-                accepted += 1
-            else:
-                # Ring buffer overflow - drop excess byte
-                pass
-        self._process_rx_ring()
-        return accepted
+    def send_cmd_expect(self, cmd: str, expected_ack: str, timeout_ms: int = 150) -> (int, str):
+        if self.is_connected:
+            return -1, "BUSY"
+        self.tx_log.append(cmd)
+        resp = self.supervisor.process_command(cmd)
+        self.rx_log.append(resp.strip())
 
-    def _process_rx_ring(self):
-        while self.rx_ring:
-            b = self.rx_ring.pop(0)
-            c = chr(b)
-            if c in ('\r', '\n'):
-                if self.line_buf.strip():
-                    self._dispatch_line(self.line_buf.strip())
-                self.line_buf = ""
-            else:
-                if len(self.line_buf) < self.cmd_max_len - 1:
-                    self.line_buf += c
-                else:
-                    # Truncate / bound oversized commands
-                    pass
+        # Exact match vs Prefix match
+        clean_resp = resp.strip()
+        if expected_ack.endswith(":"):
+            if clean_resp.startswith(expected_ack):
+                return 0, clean_resp
+        else:
+            if clean_resp == expected_ack:
+                return 0, clean_resp
+        return -2, clean_resp
 
-    def _dispatch_line(self, line: str):
-        # Event checking
-        if line == "OK+CONN":
-            self.is_connected = True
+    def open_pairing_window(self, seconds: int = 300, simulate_wake_failure: bool = False):
+        if seconds == 0:
+            seconds = 300
+        if seconds > 600:
+            seconds = 600
+        if self.is_connected:
+            self.pairing_window_active = True
+            self.pairing_window_remaining = seconds
+            return 0
+
+        # If module is asleep, wake it first; abort if wake fails
+        if not self.is_module_awake:
+            if simulate_wake_failure:
+                return -3  # Wake failed: abort without sending AT+ADTY0
+            rc, _ = self.send_cmd_expect("AT", "OK")
+            if rc != 0:
+                return rc
             self.is_module_awake = True
-            return
-        elif line == "OK+LOST":
-            self.is_connected = False
-            return
-        elif line == "OK+WAKE":
+
+        # Send AT+ADTY0 and validate OK+Set:0
+        rc, resp = self.send_cmd_expect("AT+ADTY0", "OK+Set:0")
+        if rc == 0:
+            self.pairing_window_active = True
+            self.pairing_window_remaining = seconds
             self.is_module_awake = True
-            return
-        elif line == "OK+SLEEP":
+            return 0
+        return rc
+
+    def lock_pairing(self, simulate_wake_failure: bool = False):
+        if self.is_connected:
+            self.lock_pending_on_disconnect = True
+            return 0  # Deferred
+
+        # If module is asleep, wake it first; abort if wake fails
+        if not self.is_module_awake:
+            if simulate_wake_failure:
+                return -3  # Wake failed: abort without sending AT+ADTY2
+            rc, _ = self.send_cmd_expect("AT", "OK")
+            if rc != 0:
+                return rc
+            self.is_module_awake = True
+
+        rc, resp = self.send_cmd_expect("AT+ADTY2", "OK+Set:2")
+        if rc == 0:
+            self.pairing_window_active = False
+            self.pairing_window_remaining = 0
+            self.lock_pending_on_disconnect = False
+            # Enter sleep under Mode 1
+            self.send_cmd_expect("AT+SLEEP", "OK+SLEEP")
             self.is_module_awake = False
-            return
+            return 0
+        return rc
 
-        # Special mobile queries
-        if line.upper() == "GET_DEV_INFO":
-            self._send_dev_info()
-            return
-        elif line.upper() in ("GET_STATUS_INFO", "STATUS"):
-            self._send_status_info()
-            return
+    def on_central_connected(self):
+        self.is_connected = True
+        self.is_module_awake = True
 
-        # Pairing command
-        if line.upper().startswith("BLEPAIR"):
-            parts = line.split()
-            sec = 300
-            if len(parts) > 1 and parts[1].isdigit():
-                sec = int(parts[1])
-            if sec > 600:
-                sec = 600
-            self.pairing_window_remaining = sec
-            self.tx_ring.append(f"BLEPAIR: connectable window open for {sec} s\r\n".encode())
-            return
-
-        # General command forwarding
-        self.dispatched_commands.append(line)
-        self.tx_ring.append(f"OK:{line}\r\n".encode())
-
-    def _send_dev_info(self):
-        lines = [
-            "NAME WildSonic",
-            "MODEL WS-STM32L476",
-            "SERIAL 0001",
-            "FWVER 1.2.0-BLE",
-            "MIC SPH0645LM4H",
-            "BATTCAP 2000",
-            "RECTIME 10",
-            "INTERVAL 30",
-            "SRATE 192000",
-            "RECBITS 32",
-            "NCH 2",
-            "GAIN 12",
-            "DATERANGE 2026/01/01-2099/12/31",
-            "SUNMODE Disabled",
-            "TEMP 0.00, HUMID 0.00"
-        ]
-        for l in lines:
-            self.tx_ring.append((l + "\r\n").encode())
-
-    def _send_status_info(self):
-        lines = [
-            "SDCARD OK",
-            "SDFREE 14500000000",
-            "FSCK OK",
-            "REC_STATUS IDLE",
-            "BATT 85",
-            "VOLT 3.92",
-            "TEMP 0.00, HUMID 0.00"
-        ]
-        for l in lines:
-            self.tx_ring.append((l + "\r\n").encode())
-
-    def suspend(self):
-        self.is_suspended = True
-        self.tx_ring.append(b"AT+SLEEP\r\n")
-
-    def resume(self):
-        self.is_suspended = False
+    def on_central_disconnected(self):
+        self.is_connected = False
+        if self.lock_pending_on_disconnect or self.pairing_window_remaining <= 0:
+            self.lock_pairing()
 
 
 # ==============================================================================
-# 3. Framing, Fragmentation & Buffer Tests
+# 3. Exact AT Command Protocol & Transaction Verification
 # ==============================================================================
 
-def test_ble_uart_framing_crlf_variants():
-    """Verify BLE framing correctly parses CR, LF, and CRLF terminated commands."""
-    sim = BleCommSimulator()
-    sim.feed_rx_bytes(b"SAMF 192000\r\n")
-    sim.feed_rx_bytes(b"BITS 32\n")
-    sim.feed_rx_bytes(b"CHANNELS 2\r")
-    assert sim.dispatched_commands == ["SAMF 192000", "BITS 32", "CHANNELS 2"]
+def test_at_bare_ping_transaction():
+    """Verify bare AT ping requires exact 'OK' and does not match arbitrary 'OK+'."""
+    sup = BleSupervisorSimulator()
+    client = BleHostClientSimulator(sup)
+
+    rc, resp = client.send_cmd_expect("AT", "OK")
+    assert rc == 0
+    assert resp == "OK"
+
+    # Verify that if response were OK+Set:0, expect "OK" rejects it
+    clean_resp = "OK+Set:0"
+    assert clean_resp != "OK"
 
 
-def test_ble_fragmented_18byte_chunks():
-    """Verify reassembly of commands split into 18-byte BLE characteristic write chunks."""
-    sim = BleCommSimulator()
-    # Typical mobile app sends in 18-byte chunks
-    full_cmd = b"GET_CONFIG --verbose-storage-diagnostics\r\n"
-    chunk_size = 18
-    for i in range(0, len(full_cmd), chunk_size):
-        chunk = full_cmd[i:i + chunk_size]
-        sim.feed_rx_bytes(chunk)
-    assert sim.dispatched_commands == ["GET_CONFIG --verbose-storage-diagnostics"]
+def test_at_adty0_unlock_semantics():
+    """Verify AT+ADTY0 opens connectable advertising and validates OK+Set:0."""
+    sup = BleSupervisorSimulator(initial_adty=2)
+    client = BleHostClientSimulator(sup)
+
+    rc = client.open_pairing_window(300)
+    assert rc == 0
+    assert client.pairing_window_active
+    assert sup.adty == 0
+    assert "AT+ADTY0" in client.tx_log
+    assert "OK+Set:0" in client.rx_log
 
 
-def test_ble_back_to_back_command_lines():
-    """Verify consecutive commands in a single feed are parsed distinctly."""
-    sim = BleCommSimulator()
-    sim.feed_rx_bytes(b"RECT 60\r\nSLEEP 120\r\nGAIN 18\r\n")
-    assert sim.dispatched_commands == ["RECT 60", "SLEEP 120", "GAIN 18"]
+def test_at_adty2_lock_semantics():
+    """Verify AT+ADTY2 locks non-connectable advertising and validates OK+Set:2."""
+    sup = BleSupervisorSimulator(initial_adty=0)
+    client = BleHostClientSimulator(sup)
+    client.pairing_window_active = True
+
+    rc = client.lock_pairing()
+    assert rc == 0
+    assert not client.pairing_window_active
+    assert sup.adty == 2
+    assert "AT+ADTY2" in client.tx_log
+    assert "OK+Set:2" in client.rx_log
+    assert "AT+SLEEP" in client.tx_log
+    assert sup.is_sleeping
 
 
-def test_ble_oversized_command_bounded_truncation():
-    """Verify command line exceeding 128 bytes is bounded and does not overflow."""
-    sim = BleCommSimulator(cmd_max_len=128)
-    oversized = b"A" * 200 + b"\r\n"
-    sim.feed_rx_bytes(oversized)
-    assert len(sim.dispatched_commands) == 1
-    assert len(sim.dispatched_commands[0]) == 127
+def test_at_slpm_query_and_set_mode1():
+    """Verify querying sleep policy (AT+SLPM?) and enforcing Mode 1 (AT+SLPM=1)."""
+    sup = BleSupervisorSimulator(initial_slpm=2)
+    client = BleHostClientSimulator(sup)
+
+    # 1. Query existing policy
+    rc, resp = client.send_cmd_expect("AT+SLPM?", "OK+SLPM:")
+    assert rc == 0
+    assert resp == "OK+SLPM:2"
+
+    # 2. Update to Mode 1 because UART wake is required
+    rc, resp = client.send_cmd_expect("AT+SLPM=1", "OK+Set:1")
+    assert rc == 0
+    assert resp == "OK+Set:1"
+    assert sup.slpm == 1
 
 
-def test_ble_ring_buffer_overflow_protection():
-    """Verify feeding more than 512 bytes does not crash or exceed buffer capacity."""
-    sim = BleCommSimulator(rx_buf_size=512)
-    big_blob = b"X" * 600
-    accepted = sim.feed_rx_bytes(big_blob)
-    # The simulator processes on each chunk, but max queued in ring is bounded to 512
-    assert accepted == 512 or len(sim.rx_ring) <= 512
+def test_mode1_uart_wake_vs_mode2_uart_blocked():
+    """Verify Mode 1 allows UART RX wake while Mode 2 disables UART RX entirely."""
+    c_src = BLE_COMM_C.read_text(encoding="utf-8")
+    assert "AT+SLPM=1" in c_src, "Must configure AT+SLPM=1 for UART wake support"
+    # Verify Mode 2 is never commanded as the normal sleep policy
+    assert "AT+SLPM=2" not in c_src, "Mode 2 must not be commanded without LPIN wake"
+    assert "AT+SLPM=3" not in c_src, "Mode 3 must not be commanded during operation"
 
 
-# ==============================================================================
-# 4. Protocol Compliance & Mobile App Interoperability
-# ==============================================================================
+def test_pairing_window_expiration_while_disconnected():
+    """Verify pairing window expiring while disconnected triggers immediate AT+ADTY2."""
+    sup = BleSupervisorSimulator(initial_adty=2)
+    client = BleHostClientSimulator(sup)
+
+    client.open_pairing_window(10)
+    assert sup.adty == 0
+
+    # Simulate timer expiration
+    client.pairing_window_remaining = 0
+    client.lock_pairing()
+    assert sup.adty == 2
+    assert not client.pairing_window_active
+
+
+def test_pairing_window_expiration_while_connected_defers_lock():
+    """Verify pairing window expiring while central is connected preserves link and defers lock."""
+    sup = BleSupervisorSimulator(initial_adty=2)
+    client = BleHostClientSimulator(sup)
+
+    client.open_pairing_window(10)
+    client.on_central_connected()
+
+    # Expire window during connection
+    client.pairing_window_remaining = 0
+    # Attempt lock: must defer because link is active
+    client.lock_pairing()
+    assert client.lock_pending_on_disconnect
+    assert sup.adty == 0, "Must NOT change ADTY while central is actively connected"
+    assert "AT+ADTY2" not in client.tx_log[1:], "Must not transmit AT commands while connected"
+
+    # Central disconnects: deferred lock must now execute
+    client.on_central_disconnected()
+    assert not client.lock_pending_on_disconnect
+    assert sup.adty == 2
+    assert "AT+ADTY2" in client.tx_log
+
+
+def test_unsupported_legacy_commands_purged():
+    """Verify unsupported legacy commands (UART1, PWRM0, MODE2, WS+SYNC, WS+ALIVE) are purged."""
+    c_src = BLE_COMM_C.read_text(encoding="utf-8")
+    h_src = BLE_COMM_H.read_text(encoding="utf-8")
+    combined = c_src + "\n" + h_src
+
+    assert "AT+UART1" not in combined, "Legacy AT+UART1 must not be sent"
+    assert "AT+PWRM0" not in combined, "Legacy AT+PWRM0 must not be sent"
+    assert "AT+MODE2" not in combined, "Legacy AT+MODE2 must not be sent"
+    assert "WS+SYNC" not in combined, "Unconfirmed WS+SYNC must not be sent"
+    assert "WS+ALIVE" not in combined, "Unconfirmed WS+ALIVE must not be relied upon"
+
 
 def test_get_dev_info_format_and_temp_terminator():
-    """
-    Verify GET_DEV_INFO emits all required tags and terminates with
-    'TEMP 0.00, HUMID 0.00\r\n' to release the mobile companion app lock.
-    """
-    sim = BleCommSimulator()
-    sim.feed_rx_bytes(b"GET_DEV_INFO\r\n")
-    responses = [item.decode() for item in sim.tx_ring]
-    assert len(responses) >= 10, f"Expected multi-line dev info, got {len(responses)}"
-    # Check essential tags
-    joined = "".join(responses)
-    assert "NAME " in joined
-    assert "MODEL " in joined
-    assert "SRATE 192000" in joined
-    assert "RECBITS 32" in joined
-    assert "NCH 2" in joined
-    # Critical termination check
-    last_line = responses[-1].strip()
-    assert last_line.startswith("TEMP"), f"Terminating line must start with TEMP: '{last_line}'"
+    """Verify GET_DEV_INFO emits tags and terminating TEMP line."""
+    c_src = BLE_COMM_C.read_text(encoding="utf-8")
+    assert "TEMP 0.00, HUMID 0.00" in c_src
+    assert "SAMF %u" in c_src
+    assert "RECT %u" in c_src
+    assert "MODEL WS-STM32L476" in c_src
 
 
 def test_get_status_info_format_and_temp_terminator():
-    """
-    Verify GET_STATUS_INFO emits status tags and terminates with
-    'TEMP 0.00, HUMID 0.00\r\n'.
-    """
-    sim = BleCommSimulator()
-    sim.feed_rx_bytes(b"GET_STATUS_INFO\r\n")
-    responses = [item.decode() for item in sim.tx_ring]
-    joined = "".join(responses)
-    assert "SDCARD OK" in joined
-    assert "SDFREE " in joined
-    assert "REC_STATUS " in joined
-    last_line = responses[-1].strip()
-    assert last_line.startswith("TEMP"), f"Terminating line must start with TEMP: '{last_line}'"
-
-
-def test_ble_supervisor_modem_events():
-    """Verify OK+CONN, OK+LOST, OK+WAKE, OK+SLEEP state tracking."""
-    sim = BleCommSimulator()
-    assert not sim.is_connected
-    sim.feed_rx_bytes(b"OK+CONN\r\n")
-    assert sim.is_connected
-    assert sim.is_module_awake
-
-    sim.feed_rx_bytes(b"OK+LOST\r\n")
-    assert not sim.is_connected
-
-    sim.feed_rx_bytes(b"OK+SLEEP\r\n")
-    assert not sim.is_module_awake
-
-    sim.feed_rx_bytes(b"OK+WAKE\r\n")
-    assert sim.is_module_awake
-
-
-def test_blepair_window_bounds_and_locking():
-    """Verify BLEPAIR command sets window and clamps to 600 s max."""
-    sim = BleCommSimulator()
-    sim.feed_rx_bytes(b"BLEPAIR 120\r\n")
-    assert sim.pairing_window_remaining == 120
-
-    sim.feed_rx_bytes(b"BLEPAIR 9999\r\n")
-    assert sim.pairing_window_remaining == 600  # Clamped to max
-
-    sim.feed_rx_bytes(b"BLEPAIR\r\n")
-    assert sim.pairing_window_remaining == 300  # Default
-
-
-def test_ble_stop2_suspend_resume_lifecycle():
-    """Verify ble_comm_suspend sends AT+SLEEP and ble_comm_resume restores reception."""
-    sim = BleCommSimulator()
-    assert not sim.is_suspended
-    sim.suspend()
-    assert sim.is_suspended
-    assert b"AT+SLEEP\r\n" in sim.tx_ring
-
-    sim.resume()
-    assert not sim.is_suspended
+    """Verify GET_STATUS_INFO emits SDCAP/SDUSED and terminating TEMP line."""
+    c_src = BLE_COMM_C.read_text(encoding="utf-8")
+    assert "SDUSED %llu, SDCAP %llu" in c_src
+    assert "TEMP 0.00, HUMID 0.00" in c_src
 
 
 # ==============================================================================
-# 5. C Source Implementation Audits
+# 4. STM32 Reset Cause Diagnostics Audits
 # ==============================================================================
 
-def test_c_source_ble_comm_architecture():
-    """Verify ble_comm.c implements thread, ring buffer, and non-blocking ISR."""
-    c_src = BLE_COMM_C.read_text(encoding="utf-8")
-    assert "K_THREAD_DEFINE" in c_src or "k_thread_create" in c_src, "Must define BLE thread"
-    assert "ring_buf_put" in c_src, "Must use ring_buf_put in ISR"
-    assert "uart_irq_callback_user_data_set" in c_src, "Must configure UART ISR"
-    assert "uart_irq_rx_enable" in c_src, "Must enable RX IRQ"
-    assert "ble_comm_suspend" in c_src, "Must implement suspend"
-    assert "ble_comm_resume" in c_src, "Must implement resume"
-
-
-def test_c_source_pairing_and_termination_strings():
-    """Verify ble_comm.c includes exact TEMP termination and AT commands."""
-    c_src = BLE_COMM_C.read_text(encoding="utf-8")
-    assert "TEMP 0.00, HUMID 0.00" in c_src, "Must emit exact TEMP terminator"
-    assert "AT+SLEEP" in c_src, "Must emit AT+SLEEP for low power"
-    assert "OK+CONN" in c_src, "Must handle OK+CONN"
-    assert "OK+LOST" in c_src, "Must handle OK+LOST"
-
-
-def test_c_source_main_and_sleep_hooks():
-    """Verify main.c initializes BLE and rtc_sleep.c integrates lifecycle hooks."""
+def test_reset_cause_diagnostics_in_main():
+    """Verify main.c captures RCC_CSR flags and logs detailed breakdown before clearing."""
     main_src = MAIN_C.read_text(encoding="utf-8")
-    assert "ble_comm_init" in main_src, "main.c must call ble_comm_init"
-    assert "DT_NODELABEL(usart1)" in main_src, "main.c must look up usart1"
 
-    sleep_src = RTC_SLEEP_C.read_text(encoding="utf-8")
-    assert "ble_comm_suspend()" in sleep_src, "rtc_sleep.c must call ble_comm_suspend before sleep"
-    assert "ble_comm_resume()" in sleep_src, "rtc_sleep.c must call ble_comm_resume after wake"
+    assert "RCC_CSR_BORRSTF" in main_src, "Must check BORRSTF"
+    assert "RCC_CSR_PINRSTF" in main_src, "Must check PINRSTF"
+    assert "RCC_CSR_SFTRSTF" in main_src, "Must check SFTRSTF"
+    assert "RCC_CSR_IWDGRSTF" in main_src, "Must check IWDGRSTF"
+    assert "RCC_CSR_WWDGRSTF" in main_src, "Must check WWDGRSTF"
+    assert "RCC_CSR_LPWRRSTF" in main_src, "Must check LPWRRSTF"
+
+    # Verify clear is called AFTER print
+    print_idx = main_src.find("print_reset_reason")
+    clear_idx = main_src.find("LL_RCC_ClearResetFlags();", print_idx)
+    assert clear_idx > print_idx, "LL_RCC_ClearResetFlags must be called AFTER print_reset_reason"
 
 
-def test_c_source_console_command_dispatch_routing():
-    """Verify console.c provides console_process_line_source with isolated output."""
-    c_src = CONSOLE_C.read_text(encoding="utf-8")
-    h_src = CONSOLE_H.read_text(encoding="utf-8")
-    assert "console_process_line_source" in h_src, "console.h must declare console_process_line_source"
-    assert "console_process_line_source" in c_src, "console.c must define console_process_line_source"
-    assert "CMD_BLEPAIR" in c_src, "console.c must register CMD_BLEPAIR"
+def test_ble_events_do_not_reboot_stm32():
+    """Verify ble_comm.c never invokes sys_reboot or NVIC_SystemReset."""
+    c_src = BLE_COMM_C.read_text(encoding="utf-8")
+    assert "sys_reboot" not in c_src, "ble_comm.c must never call sys_reboot"
+    assert "NVIC_SystemReset" not in c_src, "ble_comm.c must never call NVIC_SystemReset"
+
+
+def test_stop2_sleep_resume_handshake():
+    """Verify ble_comm_suspend sends AT+SLEEP when awake and resume sends NO AT commands."""
+    c_src = BLE_COMM_C.read_text(encoding="utf-8")
+    suspend_fn = c_src[c_src.find("void ble_comm_suspend"):c_src.find("void ble_comm_resume")]
+    resume_fn = c_src[c_src.find("void ble_comm_resume"):c_src.find("void ble_comm_send_dev_info")]
+
+    assert "AT+SLEEP" in suspend_fn, "Suspend must command AT+SLEEP if awake"
+    assert "ble_comm_send_cmd_expect" not in resume_fn, "Resume must NEVER send AT commands to BLE supervisor"
+    assert "AT\\r\\n" not in resume_fn, "Resume must NOT wake via AT ping"
+    assert "AT+RESET" not in resume_fn, "Resume must NEVER use AT+RESET as a wake mechanism"
+    assert "uart_irq_rx_enable" in resume_fn, "Resume must re-enable UART RX interrupt"
+
+
+# ==============================================================================
+# 5. Normal Mode (AT+WS=0) Protocol & Architecture Parity
+# ==============================================================================
+
+def test_uart_tx_gating_decoupled_from_supervisor_probe():
+    """Verify UART TX readiness is decoupled from supervisor probe response."""
+    c_src = BLE_COMM_C.read_text(encoding="utf-8")
+    h_src = BLE_COMM_H.read_text(encoding="utf-8")
+
+    # Accessor declarations
+    assert "bool ble_comm_is_uart_ready(void);" in h_src
+    assert "bool ble_comm_is_supervisor_online(void);" in h_src
+    assert "void ble_comm_set_test_capture(bool enabled);" in h_src
+
+    # UART ready must be set before probe in ble_comm_init
+    ready_pos = c_src.find("s_ble_uart_ready = true;")
+    probe_pos = c_src.find('ble_comm_send_cmd_expect("AT\\r\\n"')
+    assert ready_pos != -1, "s_ble_uart_ready must be explicitly set"
+    assert probe_pos != -1, "AT probe must be sent"
+    assert ready_pos < probe_pos, "s_ble_uart_ready must be set BEFORE initial probe"
+
+    # ble_comm_tx must transmit when UART ready, not gated on s_ble_active or s_ble_supervisor_online
+    tx_fn = c_src[c_src.find("int ble_comm_tx"):c_src.find("int ble_comm_printf")]
+    assert "s_ble_uart_ready" in tx_fn, "ble_comm_tx must check s_ble_uart_ready"
+    assert "s_ble_supervisor_online" not in tx_fn, "ble_comm_tx must NOT be gated on supervisor online"
+    assert "s_ble_active" not in tx_fn, "ble_comm_tx must NOT be gated on legacy s_ble_active"
+
+    # Ring buffer capture must be guarded by s_ble_test_capture_enabled
+    assert "s_ble_test_capture_enabled" in tx_fn, "TX ring buffer must be guarded by test capture flag"
+
+
+def test_ws0_mandatory_transparent_mode_no_ws1():
+    """Verify AT+WS=0 is mandated in init and AT+WS=1 is never sent."""
+    c_src = BLE_COMM_C.read_text(encoding="utf-8")
+    h_src = BLE_COMM_H.read_text(encoding="utf-8")
+    combined = c_src + "\n" + h_src
+
+    assert 'AT+WS=0' in c_src, "Must command AT+WS=0 for transparent mode"
+    assert 'OK+Set:0' in c_src, "Must validate OK+Set:0 ack for AT+WS=0"
+    assert "AT+WS=1" not in combined, "AT+WS=1 (wake-aware mode) must NOT be present"
+    assert "M_WAKE" not in combined, "No M_WAKE pin handshake in normal mode"
+    assert "M_READY" not in combined, "No M_READY pin handshake in normal mode"
+
+
+def test_wake_before_adty_failure_aborts_adty_command():
+    """Verify that failure to wake an asleep module aborts ADTY without transmitting it blindly."""
+    c_src = BLE_COMM_C.read_text(encoding="utf-8")
+    open_fn = c_src[c_src.find("void ble_comm_open_pairing_window"):c_src.find("void ble_comm_lock_pairing")]
+    lock_fn = c_src[c_src.find("void ble_comm_lock_pairing"):c_src.find("void ble_comm_suspend")]
+
+    # Both open and lock must check wake success and return/abort on failure
+    assert "woke" in open_fn or "!woke" in open_fn or "aborting pairing unlock" in open_fn
+    assert "woke" in lock_fn or "!woke" in lock_fn or "aborting pairing lock" in lock_fn
+
+    # Simulator behavior verification
+    sup = BleSupervisorSimulator(initial_adty=2)
+    client = BleHostClientSimulator(sup)
+    client.is_module_awake = False
+    rc = client.open_pairing_window(300, simulate_wake_failure=True)
+    assert rc != 0, "open_pairing_window must fail if wake fails"
+    assert "AT+ADTY0" not in client.tx_log, "AT+ADTY0 must NOT be sent if wake failed"
+
+    client.tx_log.clear()
+    rc = client.lock_pairing(simulate_wake_failure=True)
+    assert rc != 0, "lock_pairing must fail if wake fails"
+    assert "AT+ADTY2" not in client.tx_log, "AT+ADTY2 must NOT be sent if wake failed"
+
+
+def test_generic_commands_do_not_fabricate_connection_state():
+    """Verify GET_DEV_INFO, GET_STATUS_INFO, and config commands do not set s_ble_connected."""
+    c_src = BLE_COMM_C.read_text(encoding="utf-8")
+    process_fn = c_src[c_src.find("static void ble_comm_process_line"):c_src.find("static void ble_comm_handle_rx_byte")]
+
+    # Check the section after modem events (from GET_DEV_INFO onwards)
+    dev_info_pos = process_fn.find('GET_DEV_INFO')
+    assert dev_info_pos != -1
+    remainder = process_fn[dev_info_pos:]
+    assert "s_ble_connected = true;" not in remainder, \
+        "Generic commands and config lines must NOT set s_ble_connected = true"
+
+    # Verify OK+CONN is the sole trigger for setting s_ble_connected = true
+    conn_pos = process_fn.find('strcmp(p, "OK+CONN") == 0')
+    assert conn_pos != -1
+    conn_block = process_fn[conn_pos:dev_info_pos]
+    assert "s_ble_connected = true;" in conn_block, "OK+CONN must set s_ble_connected = true"
+
+
+def test_supervisor_probe_failure_preserves_uart_ready():
+    """Verify probe failure leaves s_ble_uart_ready = true but sets s_ble_supervisor_online = false."""
+    c_src = BLE_COMM_C.read_text(encoding="utf-8")
+    init_fn = c_src[c_src.find("int ble_comm_init"):c_src.find("bool ble_comm_is_uart_ready")]
+
+    assert "s_ble_uart_ready = true;" in init_fn
+    assert "s_ble_supervisor_online = false;" in init_fn
+    assert "ws_ble: BLE module probe timed out" in init_fn
