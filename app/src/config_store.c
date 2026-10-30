@@ -69,10 +69,9 @@ void config_store_load_defaults(void)
 {
 	struct wildsonic_config *cfg = console_get_config();
 	if (cfg) {
-		strncpy(cfg->serial_number, "WS4760001", sizeof(cfg->serial_number) - 1);
+		strncpy(cfg->serial_number, "0", sizeof(cfg->serial_number) - 1);
 		cfg->serial_number[sizeof(cfg->serial_number) - 1] = '\0';
-		strncpy(cfg->device_name, "WildSonic", sizeof(cfg->device_name) - 1);
-		cfg->device_name[sizeof(cfg->device_name) - 1] = '\0';
+		cfg->device_name[0] = '\0';
 		strncpy(cfg->device_password, "wildsonic123", sizeof(cfg->device_password) - 1);
 		cfg->device_password[sizeof(cfg->device_password) - 1] = '\0';
 
@@ -143,10 +142,21 @@ static void unpack_record_to_system(const struct wildsonic_persisted_config *rec
 
 	struct wildsonic_config *cfg = console_get_config();
 	if (cfg) {
-		strncpy(cfg->serial_number, rec->serial_number, sizeof(cfg->serial_number) - 1);
+		/* Migrate or sanitize legacy serial number and device name */
+		if (strcmp(rec->serial_number, "WS4760001") == 0 || strlen(rec->serial_number) > 3) {
+			strncpy(cfg->serial_number, "0", sizeof(cfg->serial_number) - 1);
+		} else {
+			strncpy(cfg->serial_number, rec->serial_number, sizeof(cfg->serial_number) - 1);
+		}
 		cfg->serial_number[sizeof(cfg->serial_number) - 1] = '\0';
-		strncpy(cfg->device_name, rec->device_name, sizeof(cfg->device_name) - 1);
+
+		if (strcmp(rec->device_name, "WildSonic") == 0 || strlen(rec->device_name) > 6) {
+			cfg->device_name[0] = '\0';
+		} else {
+			strncpy(cfg->device_name, rec->device_name, sizeof(cfg->device_name) - 1);
+		}
 		cfg->device_name[sizeof(cfg->device_name) - 1] = '\0';
+
 		strncpy(cfg->device_password, rec->device_password, sizeof(cfg->device_password) - 1);
 		cfg->device_password[sizeof(cfg->device_password) - 1] = '\0';
 
@@ -554,8 +564,12 @@ int config_store_import_sd(void)
 			} else if (strcasecmp(key, "date_range") == 0 || strcasecmp(key, "daterange") == 0) {
 				snprintf(cmd_buf, sizeof(cmd_buf), "DATERANGE %s", val);
 			} else if (strncasecmp(key, "time_of_day_", 12) == 0) {
-				int idx = atoi(key + 12);
-				snprintf(cmd_buf, sizeof(cmd_buf), "TIMEOFDAY %d %s", idx, val);
+				if (isdigit((unsigned char)key[12]) && key[13] == '\0') {
+					int idx = key[12] - '0';
+					snprintf(cmd_buf, sizeof(cmd_buf), "TIMEOFDAY %d %s", idx, val);
+				} else {
+					printk("\nUnknown or BAD config option : %s\n", key);
+				}
 			} else if (strcasecmp(key, "time_of_day") == 0 || strcasecmp(key, "timeofday") == 0) {
 				snprintf(cmd_buf, sizeof(cmd_buf), "TIMEOFDAY %s", val);
 			} else if (strcasecmp(key, "days_of_week") == 0 || strcasecmp(key, "daysofweek") == 0) {
@@ -566,11 +580,32 @@ int config_store_import_sd(void)
 				snprintf(cmd_buf, sizeof(cmd_buf), "DATETIME %s", val);
 			} else if (strcasecmp(key, "folder_structure") == 0 || strcasecmp(key, "fldr") == 0) {
 				snprintf(cmd_buf, sizeof(cmd_buf), "FLDR %s", val);
+			} else if (strcasecmp(key, "transmission_mode") == 0 || strcasecmp(key, "gsm") == 0 ||
+			           strcasecmp(key, "location") == 0 ||
+			           strcasecmp(key, "sms_frequency") == 0 || strcasecmp(key, "smsfreq") == 0 ||
+			           strcasecmp(key, "low_battery_threshold") == 0 || strcasecmp(key, "lbat") == 0 ||
+			           strcasecmp(key, "sun_recording_mode") == 0 ||
+			           strcasecmp(key, "sunrise_interval_before") == 0 ||
+			           strcasecmp(key, "sunrise_interval_after") == 0 ||
+			           strcasecmp(key, "sunset_interval_before") == 0 ||
+			           strcasecmp(key, "sunset_interval_after") == 0 ||
+			           strcasecmp(key, "sunrise_sunset_rounding") == 0) {
+				LOG_INF("config_store_import_sd: ignoring unsupported hardware setting '%s'", key);
+			} else if (strcasecmp(key, "build_version") == 0 ||
+			           strcasecmp(key, "build_datetime") == 0 ||
+			           strcasecmp(key, "build_sha") == 0) {
+				LOG_INF("config_store_import_sd: ignoring status metadata '%s'", key);
+			} else {
+				printk("\nUnknown or BAD config option : %s\n", key);
 			}
 
 			if (cmd_buf[0] != '\0') {
-				console_process_line(cmd_buf);
-				updated = true;
+				int rc = console_process_line_source(cmd_buf, false, NULL, 0);
+				if (rc == 0) {
+					updated = true;
+				} else {
+					LOG_WRN("config_store_import_sd: command '%s' failed (%d)", cmd_buf, rc);
+				}
 			}
 		} else {
 			line[line_pos++] = ch;

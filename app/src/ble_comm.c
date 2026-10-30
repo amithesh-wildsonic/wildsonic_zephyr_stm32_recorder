@@ -4,6 +4,7 @@
 #include "main.h"
 #include "recorder.h"
 #include "rtc_calendar.h"
+#include "scheduler_retention.h"
 
 #include <zephyr/kernel.h>
 #include <zephyr/drivers/uart.h>
@@ -25,7 +26,7 @@ LOG_MODULE_REGISTER(ws_ble, CONFIG_LOG_DEFAULT_LEVEL);
 
 #define BLE_RX_BUF_SIZE 512
 #define BLE_TX_BUF_SIZE 1024
-#define BLE_COMM_STACK_SIZE 2048
+#define BLE_COMM_STACK_SIZE 3072
 #define BLE_COMM_PRIORITY 8
 #define BLE_RESPONSE_PACING_MS 20
 
@@ -33,20 +34,38 @@ RING_BUF_DECLARE(s_ble_rx_rb, BLE_RX_BUF_SIZE);
 RING_BUF_DECLARE(s_ble_tx_rb, BLE_TX_BUF_SIZE);
 
 static struct k_sem s_ble_rx_sem;
+static struct k_mutex s_ble_cmd_mutex;
+static struct k_mutex s_ble_report_mutex;
+static struct k_sem s_ble_ack_sem;
+static struct k_work s_ble_lock_work;
+
 static const struct device *s_ble_uart_dev = NULL;
-static bool s_ble_active = false;
+static bool s_ble_uart_ready = false;
+static bool s_ble_supervisor_online = false;
 static bool s_ble_connected = false;
 static bool s_ble_module_awake = false;
 static bool s_pairing_window_active = false;
 static int64_t s_pairing_window_end_ms = 0;
+static bool s_lock_pending_on_disconnect = false;
+static bool s_ble_test_capture_enabled = false;
+
+static uint8_t s_current_slpm = 1;
+static uint8_t s_current_adty = 0;
+static bool s_name_update_pending = false;
 
 static char s_ble_cmd_buf[BLE_UART_CMD_MAX_LEN];
 static size_t s_ble_cmd_len = 0;
 static bool s_ble_overflow = false;
 
+static const char *s_expected_ack = NULL;
+static char s_ack_resp_buf[64] = {0};
+static bool s_ack_matched = false;
+
 K_THREAD_STACK_DEFINE(s_ble_stack, BLE_COMM_STACK_SIZE);
 static struct k_thread s_ble_thread;
 static bool s_ble_thread_started = false;
+
+static void ble_lock_work_fn(struct k_work *work);
 
 #if defined(CONFIG_UART_INTERRUPT_DRIVEN)
 static void ble_uart_isr(const struct device *dev, void *user_data)
@@ -73,10 +92,12 @@ int ble_comm_tx(const uint8_t *data, size_t len)
 		return 0;
 	}
 
-	/* Copy to host-test drain ring buffer */
-	ring_buf_put(&s_ble_tx_rb, data, len);
+	/* Copy to host-test drain ring buffer only when test capture is enabled */
+	if (s_ble_test_capture_enabled) {
+		ring_buf_put(&s_ble_tx_rb, data, len);
+	}
 
-	if (s_ble_uart_dev && s_ble_active) {
+	if (s_ble_uart_dev && s_ble_uart_ready) {
 		for (size_t i = 0; i < len; i++) {
 			uart_poll_out(s_ble_uart_dev, data[i]);
 		}
@@ -101,6 +122,88 @@ int ble_comm_printf(const char *format, ...)
 	return ble_comm_tx((const uint8_t *)buf, (size_t)num);
 }
 
+uint32_t ble_comm_calc_fingerprint(const char *adv_name, const char *pin, uint8_t ws_mode, uint8_t slpm, uint8_t adty, uint8_t type)
+{
+	uint32_t h = 0x811C9DC5U;
+	const uint32_t prime = 0x01000193U;
+	h = (h ^ ws_mode) * prime;
+	h = (h ^ slpm) * prime;
+	h = (h ^ adty) * prime;
+	h = (h ^ type) * prime;
+	if (adv_name) {
+		for (const char *p = adv_name; *p; p++) {
+			h = (h ^ (uint8_t)*p) * prime;
+		}
+	}
+	if (pin) {
+		for (const char *p = pin; *p; p++) {
+			h = (h ^ (uint8_t)*p) * prime;
+		}
+	}
+	return h;
+}
+
+int ble_comm_send_cmd_expect(const char *cmd, const char *expected_ack, char *resp_out, size_t resp_max, uint32_t timeout_ms)
+{
+	if ((!s_ble_uart_ready && !s_ble_test_capture_enabled) || !cmd || !expected_ack) {
+		return -EINVAL;
+	}
+
+	/* Guard: AT commands are strictly blocked while BLE is connected */
+	if (s_ble_connected) {
+		LOG_WRN("AT command '%s' rejected: BLE connection active", cmd);
+		return -EBUSY;
+	}
+
+	if (k_mutex_lock(&s_ble_cmd_mutex, K_MSEC(timeout_ms)) != 0) {
+		return -EBUSY;
+	}
+
+	s_expected_ack = expected_ack;
+	s_ack_matched = false;
+	s_ack_resp_buf[0] = '\0';
+	k_sem_reset(&s_ble_ack_sem);
+
+	/* Transmit exact command over USART1 with CRLF if not already present */
+	size_t cmd_len = strlen(cmd);
+	ble_comm_tx((const uint8_t *)cmd, cmd_len);
+	if (cmd_len < 2 || cmd[cmd_len - 1] != '\n') {
+		ble_comm_tx((const uint8_t *)"\r\n", 2);
+	}
+
+	/* Wait for expected response with bounded timeout */
+	int rc = k_sem_take(&s_ble_ack_sem, K_MSEC(timeout_ms));
+
+	/* If first transmission woke a sleeping Mode 1 module (indicated by s_ble_module_awake),
+	 * but the command itself timed out or was missed during wake transition, retry once */
+	if ((rc != 0 || !s_ack_matched) && s_ble_module_awake && !s_ble_connected) {
+		k_sem_reset(&s_ble_ack_sem);
+		s_expected_ack = expected_ack;
+		s_ack_matched = false;
+		s_ack_resp_buf[0] = '\0';
+
+		ble_comm_tx((const uint8_t *)cmd, cmd_len);
+		if (cmd_len < 2 || cmd[cmd_len - 1] != '\n') {
+			ble_comm_tx((const uint8_t *)"\r\n", 2);
+		}
+		rc = k_sem_take(&s_ble_ack_sem, K_MSEC(timeout_ms));
+	}
+
+	s_expected_ack = NULL;
+
+	if (rc == 0 && s_ack_matched) {
+		if (resp_out && resp_max > 0) {
+			strncpy(resp_out, s_ack_resp_buf, resp_max - 1);
+			resp_out[resp_max - 1] = '\0';
+		}
+		k_mutex_unlock(&s_ble_cmd_mutex);
+		return 0;
+	}
+
+	k_mutex_unlock(&s_ble_cmd_mutex);
+	return -ETIMEDOUT;
+}
+
 static void ble_comm_process_line(char *line)
 {
 	if (!line) return;
@@ -116,49 +219,101 @@ static void ble_comm_process_line(char *line)
 	}
 	if (len == 0) return;
 
-	/* 1. BLE Module Supervisor Events */
+	/* 1. BLE Module Supervisor Modem Events */
 	if (strcmp(p, "OK+CONN") == 0) {
 		s_ble_connected = true;
 		s_ble_module_awake = true;
-		s_pairing_window_active = false;
-		LOG_INF("[BLE] Device connected from central");
+		s_ble_supervisor_online = true;
+		s_lock_pending_on_disconnect = false;
+		LOG_INF("[BLE] Central connected (timestamp=%lld ms)", k_uptime_get());
 		return;
 	}
 	if (strcmp(p, "OK+LOST") == 0) {
 		s_ble_connected = false;
-		LOG_INF("[BLE] Device disconnected from central");
-		ble_comm_lock_pairing();
-		return;
-	}
-	if (strcmp(p, "OK+WAKE") == 0 || strcmp(p, "WS+ALIVE") == 0) {
-		s_ble_module_awake = true;
-		return;
-	}
-	if (strcmp(p, "OK+SLEEP") == 0) {
 		s_ble_module_awake = false;
+		LOG_INF("[BLE] Central disconnected (timestamp=%lld ms)", k_uptime_get());
+		if (s_name_update_pending) {
+			s_name_update_pending = false;
+			ble_comm_apply_advertised_name();
+		}
+		if (s_lock_pending_on_disconnect) {
+			s_lock_pending_on_disconnect = false;
+			s_pairing_window_active = false;
+			k_work_submit(&s_ble_lock_work);
+		}
 		return;
 	}
-	if (strncmp(p, "OK+", 3) == 0 || strcmp(p, "OK") == 0) {
-		/* Command acknowledgment from module */
+	if (strcmp(p, "OK+WAKE") == 0) {
+		s_ble_module_awake = true;
+		s_ble_supervisor_online = true;
+		if (s_expected_ack != NULL && strcmp(s_expected_ack, "OK+WAKE") == 0) {
+			strncpy(s_ack_resp_buf, p, sizeof(s_ack_resp_buf) - 1);
+			s_ack_resp_buf[sizeof(s_ack_resp_buf) - 1] = '\0';
+			s_ack_matched = true;
+			k_sem_give(&s_ble_ack_sem);
+		}
 		return;
 	}
 
-	/* 2. Mobile Companion Application Requests */
+	/* 2. Command Transaction ACK Matching */
+	if (s_expected_ack != NULL) {
+		bool match = false;
+		size_t exp_len = strlen(s_expected_ack);
+		if (s_expected_ack[exp_len - 1] == ':') {
+			/* Prefix match, e.g. "OK+SLPM:", "OK+Get:", "OK+Set:" */
+			if (strncmp(p, s_expected_ack, exp_len) == 0) {
+				match = true;
+			}
+		} else {
+			/* Exact match, e.g. "OK", "OK+Set:0", "OK+Set:1", "OK+Set:2", "OK+SLEEP", "OK+RESET" */
+			if (strcmp(p, s_expected_ack) == 0) {
+				match = true;
+			}
+		}
+
+		if (match) {
+			strncpy(s_ack_resp_buf, p, sizeof(s_ack_resp_buf) - 1);
+			s_ack_resp_buf[sizeof(s_ack_resp_buf) - 1] = '\0';
+			s_ack_matched = true;
+			k_sem_give(&s_ble_ack_sem);
+			return;
+		}
+	}
+
+	if (strcmp(p, "OK+SLEEP") == 0) {
+		s_ble_module_awake = false;
+		if (s_expected_ack != NULL && strcmp(s_expected_ack, "OK+SLEEP") == 0) {
+			strncpy(s_ack_resp_buf, p, sizeof(s_ack_resp_buf) - 1);
+			s_ack_resp_buf[sizeof(s_ack_resp_buf) - 1] = '\0';
+			s_ack_matched = true;
+			k_sem_give(&s_ble_ack_sem);
+		}
+		return;
+	}
+	if (strcmp(p, "OK") == 0 || strncmp(p, "OK+", 3) == 0) {
+		/* Unmatched or late ACK, ignore cleanly without forwarding to dispatcher */
+		return;
+	}
+
+	/* 3. Mobile Companion Application Requests */
+	s_ble_connected = true;
+	s_ble_module_awake = true;
+	s_ble_supervisor_online = true;
+
 	if (strcasecmp(p, "GET_DEV_INFO") == 0) {
-		s_ble_connected = true;
 		s_ble_module_awake = true;
+		LOG_INF("[BLE] RX: GET_DEV_INFO (dispatching formatted device report)");
 		ble_comm_send_dev_info();
 		return;
 	}
 	if (strcasecmp(p, "GET_STATUS_INFO") == 0 || strcasecmp(p, "STATUS") == 0) {
-		s_ble_connected = true;
 		s_ble_module_awake = true;
+		LOG_INF("[BLE] RX: GET_STATUS_INFO (dispatching formatted status report)");
 		ble_comm_send_status_info();
 		return;
 	}
 
-	/* 3. Configuration & Control Commands */
-	s_ble_connected = true;
+	/* 4. Configuration & Control Commands (Forwarded to existing dispatcher) */
 	s_ble_module_awake = true;
 
 	char resp_buf[64] = {0};
@@ -176,22 +331,7 @@ static void ble_comm_process_line(char *line)
 
 static void ble_comm_handle_rx_byte(char c)
 {
-	/* Backspace */
-	if (c == '\b') {
-		if (s_ble_cmd_len > 0) {
-			s_ble_cmd_len--;
-		}
-		return;
-	}
-
-	/* Escape cancels line */
-	if (c == 0x1B) {
-		s_ble_cmd_len = 0;
-		s_ble_overflow = false;
-		return;
-	}
-
-	/* Line delimiter */
+	/* Delimiter check */
 	if (c == '\r' || c == '\n') {
 		if (s_ble_overflow) {
 			s_ble_overflow = false;
@@ -216,6 +356,12 @@ static void ble_comm_handle_rx_byte(char c)
 	}
 }
 
+static void ble_lock_work_fn(struct k_work *work)
+{
+	ARG_UNUSED(work);
+	ble_comm_lock_pairing();
+}
+
 static void ble_comm_thread_fn(void *arg1, void *arg2, void *arg3)
 {
 	ARG_UNUSED(arg1);
@@ -226,12 +372,16 @@ static void ble_comm_thread_fn(void *arg1, void *arg2, void *arg3)
 		int ret = k_sem_take(&s_ble_rx_sem, K_MSEC(100));
 
 		/* Service pairing window timeout */
-		if (s_pairing_window_active && !s_ble_connected) {
+		if (s_pairing_window_active) {
 			int64_t now = k_uptime_get();
 			if (now >= s_pairing_window_end_ms) {
 				s_pairing_window_active = false;
-				ble_comm_lock_pairing();
-				printk("\nBLE Access: LOCKED (pairing window expired)\n>");
+				if (s_ble_connected) {
+					s_lock_pending_on_disconnect = true;
+					LOG_INF("[BLE] Pairing window expired while connected; will lock on disconnect");
+				} else {
+					k_work_submit(&s_ble_lock_work);
+				}
 			}
 		}
 
@@ -249,66 +399,296 @@ static void ble_comm_thread_fn(void *arg1, void *arg2, void *arg3)
 int ble_comm_init(const struct device *uart_dev)
 {
 	if (!uart_dev || !device_is_ready(uart_dev)) {
-		LOG_WRN("BLE UART (USART1) device not ready or NULL; BLE disabled");
 		return -ENODEV;
 	}
-
 	s_ble_uart_dev = uart_dev;
-	k_sem_init(&s_ble_rx_sem, 0, BLE_RX_BUF_SIZE);
-	ring_buf_reset(&s_ble_rx_rb);
-	ring_buf_reset(&s_ble_tx_rb);
-	s_ble_connected = false;
-	s_ble_module_awake = false;
-	s_pairing_window_active = false;
-	s_ble_cmd_len = 0;
-	s_ble_overflow = false;
+
+	k_mutex_init(&s_ble_cmd_mutex);
+	k_mutex_init(&s_ble_report_mutex);
+	k_sem_init(&s_ble_rx_sem, 0, UINT_MAX);
+	k_sem_init(&s_ble_ack_sem, 0, 1);
+	k_work_init(&s_ble_lock_work, ble_lock_work_fn);
 
 #if defined(CONFIG_UART_INTERRUPT_DRIVEN)
-	uart_irq_callback_user_data_set(uart_dev, ble_uart_isr, NULL);
-	uart_irq_rx_enable(uart_dev);
-	s_ble_active = true;
+	uart_irq_callback_user_data_set(s_ble_uart_dev, ble_uart_isr, NULL);
+	uart_irq_rx_enable(s_ble_uart_dev);
 #endif
+
+	/* Mark UART hardware as ready so initial probes can transmit */
+	s_ble_uart_ready = true;
 
 	if (!s_ble_thread_started) {
 		k_thread_create(&s_ble_thread, s_ble_stack,
 		                K_THREAD_STACK_SIZEOF(s_ble_stack),
 		                ble_comm_thread_fn, NULL, NULL, NULL,
-		                K_PRIO_PREEMPT(BLE_COMM_PRIORITY), 0, K_NO_WAIT);
+		                BLE_COMM_PRIORITY, 0, K_NO_WAIT);
 		k_thread_name_set(&s_ble_thread, "ble_comm");
 		s_ble_thread_started = true;
 	}
 
-	/* Bounded probe with BLE module: up to 3 attempts, 50 ms delay */
+	/*
+	 * Compute target BLE provisioning fingerprint.
+	 * Hashes BLE-specific settings only: ws_mode=0, slpm=1, adty=0, type=3, pin="123456", adv_name.
+	 * Excludes audio parameters.
+	 */
+	struct wildsonic_config *cfg = console_get_config();
+	char adv_name[16];
+	ble_comm_build_advertised_name(cfg ? cfg->device_name : NULL,
+	                               cfg ? cfg->serial_number : NULL,
+	                               adv_name, sizeof(adv_name));
+
+	uint32_t target_fp = ble_comm_calc_fingerprint(adv_name, "123456", 0, 1, 0, 3);
+
+	/* Check retained provisioning fingerprint in RTC backup registers */
+	uint32_t retained_fp = 0;
+	if (ble_retention_restore_fingerprint(&retained_fp) == 0 && retained_fp == target_fp) {
+		/*
+		 * Fingerprint matches: BLE supervisor was previously provisioned and holds
+		 * persistent configuration in its NVS. It is currently in Mode 1 low-power connectable
+		 * advertising.
+		 * Do NOT send AT probes, pings, or configuration commands.
+		 */
+		s_ble_supervisor_online = true;
+		s_ble_module_awake = false;
+		s_current_adty = 0;
+		s_current_slpm = 1;
+		s_pairing_window_active = false;
+		s_pairing_window_end_ms = 0;
+		s_lock_pending_on_disconnect = false;
+		LOG_INF("[BLE] Supervisor provisioning retained (fp=0x%08X); skipping AT configuration", target_fp);
+		LOG_INF("[BLE] Access: UNLOCKED (initial boot state)");
+		printk("[BLE] Access: UNLOCKED (initial boot state)\n");
+		return 0;
+	}
+
+	/*
+	 * Phase 1 & 2: Bounded probe for BLE supervisor module
+	 * Send bare "AT\r\n" and wait for exact "OK\r\n".
+	 * Up to 5 attempts with 100 ms timeout per attempt.
+	 */
 	bool probed = false;
-	for (int i = 0; i < 3; i++) {
-		ble_comm_tx((const uint8_t *)"AT\r\n", 4);
-		k_msleep(50);
-		if (s_ble_module_awake || s_ble_connected) {
+	for (int i = 0; i < 5; i++) {
+		if (ble_comm_send_cmd_expect("AT\r\n", "OK", NULL, 0, 100) == 0) {
 			probed = true;
 			break;
 		}
+		k_msleep(30);
 	}
 
-	if (probed) {
-		LOG_INF("BLE module detected and responsive on USART1");
-		struct wildsonic_config *cfg = console_get_config();
-		char name_cmd[96];
-		snprintf(name_cmd, sizeof(name_cmd), "AT+NAMEWS:%s-%s\r\n",
-		         cfg->device_name[0] ? cfg->device_name : "WS",
-		         cfg->serial_number[0] ? cfg->serial_number : "01");
-		ble_comm_tx((const uint8_t *)name_cmd, strlen(name_cmd));
-		k_msleep(50);
-		ble_comm_lock_pairing();
+	if (!probed) {
+		s_ble_supervisor_online = false;
+		s_ble_module_awake = false;
+		LOG_INF("ws_ble: BLE module probe timed out; supervisor UART wake path unavailable; proceeding normally without BLE");
+		return 0;
+	}
+
+	s_ble_supervisor_online = true;
+	s_ble_module_awake = true;
+	LOG_INF("[BLE] Supervisor detected and responsive on USART1");
+
+	/*
+	 * Phase 3: Configure normal transparent mode (AT+WS=0)
+	 * WildSonic BLE supervisor: AT+WS=0 sets m_ws_mode = 0 (transparent data bridge).
+	 */
+	bool prov_ok = true;
+	if (ble_comm_send_cmd_expect("AT+WS=0\r\n", "OK+Set:0", NULL, 0, 150) == 0) {
+		LOG_INF("[BLE] Configured normal transparent mode (AT+WS=0)");
 	} else {
-		LOG_INF("BLE module probe timed out; proceeding normally without BLE");
+		LOG_WRN("[BLE] Warning: AT+WS=0 returned unexpected response");
+		prov_ok = false;
+	}
+
+	/*
+	 * Phase 4: Configure Sleep Mode 1 (Light sleep, UART RX wake-on-interrupt).
+	 */
+	if (ble_comm_send_cmd_expect("AT+SLPM=1\r\n", "OK+Set:1", NULL, 0, 150) == 0) {
+		s_current_slpm = 1;
+		LOG_INF("[BLE] Sleep policy successfully set to Mode 1 (persisted in NVS)");
+	} else {
+		LOG_WRN("[BLE] Failed to set AT+SLPM=1");
+		prov_ok = false;
+	}
+
+	/*
+	 * Phase 5: Configure advertised name, bond authentication, PIN, and initial unlock
+	 */
+	char name_cmd[64];
+	snprintf(name_cmd, sizeof(name_cmd), "AT+NAME%s\r\n", adv_name);
+	if (ble_comm_send_cmd_expect(name_cmd, "OK+Set:", NULL, 0, 150) == 0) {
+		LOG_INF("[BLE] Configured advertised name: %s", adv_name);
+	} else {
+		LOG_WRN("[BLE] Warning: AT+NAME failed");
+		prov_ok = false;
+	}
+
+	/* Configure bond authentication: AT+TYPE3 */
+	if (ble_comm_send_cmd_expect("AT+TYPE3\r\n", "OK+Set:3", NULL, 0, 150) != 0) {
+		LOG_WRN("[BLE] Warning: AT+TYPE3 failed");
+		prov_ok = false;
+	}
+
+	/* Configure pairing PIN: AT+PASS123456 (do not log PIN) */
+	if (ble_comm_send_cmd_expect("AT+PASS123456\r\n", "OK+Set:", NULL, 0, 150) != 0) {
+		LOG_WRN("[BLE] Warning: AT+PASS failed");
+		prov_ok = false;
+	}
+
+	/* Start in unlocked connectable state: AT+ADTY0 */
+	if (ble_comm_send_cmd_expect("AT+ADTY0\r\n", "OK+Set:0", NULL, 0, 150) == 0) {
+		s_current_adty = 0;
+		s_pairing_window_active = false;
+		s_pairing_window_end_ms = 0;
+		s_lock_pending_on_disconnect = false;
+		LOG_INF("[BLE] Access: UNLOCKED (initial boot state)");
+		printk("[BLE] Access: UNLOCKED (initial boot state)\n");
+	} else {
+		LOG_WRN("[BLE] Warning: initial unlock (AT+ADTY0) failed");
+		prov_ok = false;
+	}
+
+	/*
+	 * Phase 6: Put module in Mode 1 low-power sleep
+	 */
+	if (ble_comm_send_cmd_expect("AT+SLEEP\r\n", "OK+SLEEP", NULL, 0, 100) == 0) {
+		s_ble_module_awake = false;
+	} else {
+		LOG_WRN("[BLE] Warning: AT+SLEEP failed");
+		prov_ok = false;
+	}
+
+	/* Commit fingerprint only upon 100% successful provisioning */
+	if (prov_ok) {
+		ble_retention_save_fingerprint(target_fp);
+		LOG_INF("[BLE] Provisioning successfully persisted (fp=0x%08X)", target_fp);
 	}
 
 	return 0;
 }
 
+static int ble_comm_wake_module(void)
+{
+	if (s_ble_module_awake) {
+		return 0;
+	}
+	for (int i = 0; i < 3; i++) {
+		if (ble_comm_send_cmd_expect("AT\r\n", "OK", NULL, 0, 100) == 0) {
+			s_ble_module_awake = true;
+			return 0;
+		}
+		k_msleep(20);
+	}
+	return -ETIMEDOUT;
+}
+
+int ble_comm_build_advertised_name(const char *dname, const char *sn, char *out, size_t max_len)
+{
+	if (!out || max_len == 0) {
+		return -EINVAL;
+	}
+
+	const char *p_name = dname;
+	const char *p_sn = sn;
+	size_t name_len = p_name ? strlen(p_name) : 0;
+	size_t sn_len = p_sn ? strlen(p_sn) : 0;
+
+	bool name_valid = (name_len > 0 && name_len <= 6);
+	for (size_t i = 0; name_valid && i < name_len; i++) {
+		if (!isalnum((unsigned char)p_name[i])) {
+			name_valid = false;
+		}
+	}
+
+	bool sn_valid = (sn_len > 0 && sn_len <= 3);
+	for (size_t i = 0; sn_valid && i < sn_len; i++) {
+		if (!isalnum((unsigned char)p_sn[i])) {
+			sn_valid = false;
+		}
+	}
+
+	const char *use_name = name_valid ? p_name : "XXX";
+	const char *use_sn = sn_valid ? p_sn : "00";
+
+	char temp[32];
+	int written = snprintf(temp, sizeof(temp), "WS:%s-%s", use_name, use_sn);
+	if (written < 0 || (size_t)written > 12) {
+		return -EINVAL;
+	}
+	if ((size_t)written >= max_len) {
+		return -EINVAL;
+	}
+
+	memcpy(out, temp, (size_t)written + 1);
+	return 0;
+}
+
+void ble_comm_apply_advertised_name(void)
+{
+	if (!s_ble_supervisor_online || !s_ble_uart_ready) {
+		return;
+	}
+	if (s_ble_connected) {
+		s_name_update_pending = true;
+		LOG_INF("[BLE] Central connected: deferring AT+NAME update until disconnect");
+		return;
+	}
+
+	struct wildsonic_config *cfg = console_get_config();
+	char adv_name[16];
+	if (ble_comm_build_advertised_name(cfg ? cfg->device_name : NULL,
+	                                   cfg ? cfg->serial_number : NULL,
+	                                   adv_name, sizeof(adv_name)) != 0) {
+		LOG_ERR("[BLE] Failed to build advertised name (exceeds max length)");
+		return;
+	}
+
+	bool was_awake = s_ble_module_awake;
+	if (!s_ble_module_awake) {
+		if (ble_comm_wake_module() != 0) {
+			LOG_ERR("[BLE] Failed to wake module for AT+NAME update");
+			return;
+		}
+	}
+
+	char cmd[48];
+	snprintf(cmd, sizeof(cmd), "AT+NAME%s\r\n", adv_name);
+	if (ble_comm_send_cmd_expect(cmd, "OK+Set:", NULL, 0, 150) == 0) {
+		LOG_INF("[BLE] Advertised name updated to: %s", adv_name);
+		uint32_t new_fp = ble_comm_calc_fingerprint(adv_name, "123456", 0, 1, 0, 3);
+		ble_retention_save_fingerprint(new_fp);
+	} else {
+		LOG_WRN("[BLE] AT+NAME command failed");
+	}
+
+	if (!was_awake) {
+		ble_comm_send_cmd_expect("AT+SLEEP\r\n", "OK+SLEEP", NULL, 0, 100);
+		s_ble_module_awake = false;
+	}
+	s_name_update_pending = false;
+}
+
+void ble_comm_notify_name_changed(void)
+{
+	if (s_ble_connected) {
+		s_name_update_pending = true;
+		LOG_INF("[BLE] Device name/SN updated while connected; AT+NAME deferred");
+	} else {
+		ble_comm_apply_advertised_name();
+	}
+}
+
+bool ble_comm_is_uart_ready(void)
+{
+	return s_ble_uart_ready;
+}
+
+bool ble_comm_is_supervisor_online(void)
+{
+	return s_ble_supervisor_online;
+}
+
 bool ble_comm_is_active(void)
 {
-	return s_ble_active;
+	return s_ble_supervisor_online;
 }
 
 bool ble_comm_is_connected(void)
@@ -323,7 +703,16 @@ bool ble_comm_is_module_awake(void)
 
 bool ble_comm_is_pairing_window_active(void)
 {
-	return s_pairing_window_active;
+	if (s_current_adty != 0) {
+		return false;
+	}
+	if (s_pairing_window_active) {
+		int64_t now = k_uptime_get();
+		if (now >= s_pairing_window_end_ms) {
+			return false;
+		}
+	}
+	return true;
 }
 
 uint32_t ble_comm_get_pairing_window_remaining(void)
@@ -331,59 +720,147 @@ uint32_t ble_comm_get_pairing_window_remaining(void)
 	if (!s_pairing_window_active) {
 		return 0;
 	}
-	int64_t now = k_uptime_get();
-	if (now >= s_pairing_window_end_ms) {
+	int64_t rem_ms = s_pairing_window_end_ms - k_uptime_get();
+	if (rem_ms <= 0) {
 		return 0;
 	}
-	return (uint32_t)((s_pairing_window_end_ms - now) / 1000LL);
+	return (uint32_t)(rem_ms / 1000);
+}
+
+int ble_comm_query_sleep_policy(uint8_t *mode)
+{
+	char resp[32] = {0};
+	int rc = ble_comm_send_cmd_expect("AT+SLPM?\r\n", "OK+SLPM:", resp, sizeof(resp), 150);
+	if (rc == 0) {
+		char *colon = strchr(resp, ':');
+		if (colon && colon[1] >= '1' && colon[1] <= '3') {
+			if (mode) *mode = (uint8_t)(colon[1] - '0');
+			s_current_slpm = (uint8_t)(colon[1] - '0');
+			return 0;
+		}
+	}
+	return rc;
+}
+
+int ble_comm_set_sleep_policy(uint8_t mode)
+{
+	if (mode < 1 || mode > 3) return -EINVAL;
+	char cmd[32];
+	snprintf(cmd, sizeof(cmd), "AT+SLPM=%u\r\n", mode);
+	char expected[32];
+	snprintf(expected, sizeof(expected), "OK+Set:%u", mode);
+	int rc = ble_comm_send_cmd_expect(cmd, expected, NULL, 0, 150);
+	if (rc == 0) {
+		s_current_slpm = mode;
+	}
+	return rc;
+}
+
+int ble_comm_query_adv_type(uint8_t *adty)
+{
+	char resp[32] = {0};
+	int rc = ble_comm_send_cmd_expect("AT+ADTY?\r\n", "OK+Get:", resp, sizeof(resp), 150);
+	if (rc == 0) {
+		char *colon = strchr(resp, ':');
+		if (colon && colon[1] >= '0' && colon[1] <= '3') {
+			if (adty) *adty = (uint8_t)(colon[1] - '0');
+			s_current_adty = (uint8_t)(colon[1] - '0');
+			return 0;
+		}
+	}
+	return rc;
 }
 
 void ble_comm_open_pairing_window(uint32_t seconds)
 {
 	if (seconds == 0) {
 		seconds = BLE_PAIR_WINDOW_DEFAULT_SECONDS;
-	} else if (seconds > BLE_PAIR_WINDOW_MAX_SECONDS) {
+	}
+	if (seconds > BLE_PAIR_WINDOW_MAX_SECONDS) {
 		seconds = BLE_PAIR_WINDOW_MAX_SECONDS;
 	}
 
-	s_pairing_window_active = true;
-	s_pairing_window_end_ms = k_uptime_get() + (int64_t)seconds * 1000LL;
+	if (!s_ble_supervisor_online) {
+		LOG_WRN("BLE supervisor offline; cannot open pairing window");
+		return;
+	}
 
-	/* Wake module if in sleep mode */
-	ble_comm_tx((const uint8_t *)"AT\r\n", 4);
-	k_msleep(50);
-	/* Set connectable advertising */
-	ble_comm_tx((const uint8_t *)"AT+ADTY0\r\n", 10);
-	k_msleep(50);
-	ble_comm_tx((const uint8_t *)"AT+RESET\r\n", 10);
-	s_ble_module_awake = true;
+	if (s_ble_connected) {
+		LOG_INF("[BLE] Device already connected; extending active session");
+		s_pairing_window_active = true;
+		s_pairing_window_end_ms = k_uptime_get() + ((int64_t)seconds * 1000);
+		s_lock_pending_on_disconnect = false;
+		return;
+	}
 
-	LOG_INF("BLE Access: UNLOCKED (%u s)", (unsigned int)seconds);
+	/* If module is asleep, wake it with AT ping; abort if wake fails */
+	if (ble_comm_wake_module() != 0) {
+		LOG_ERR("BLE wake failed; aborting pairing unlock");
+		printk("\n[ERROR] Failed to wake BLE module\n>");
+		return;
+	}
+
+	/* Transmit AT+ADTY0\r\n and validate exact OK+Set:0\r\n */
+	int rc = ble_comm_send_cmd_expect("AT+ADTY0\r\n", "OK+Set:0", NULL, 0, 150);
+	if (rc == 0) {
+		s_current_adty = 0;
+		s_pairing_window_active = true;
+		s_pairing_window_end_ms = k_uptime_get() + ((int64_t)seconds * 1000);
+		s_lock_pending_on_disconnect = false;
+		LOG_INF("BLE Access: UNLOCKED (%u s)", (unsigned int)seconds);
+		printk("\nBLE Access: UNLOCKED (%u s)\n>", (unsigned int)seconds);
+	} else {
+		LOG_ERR("BLE unlock failed: no OK+Set:0 response (rc=%d)", rc);
+		printk("\n[ERROR] Failed to unlock BLE pairing (supervisor unresponsive)\n>");
+	}
 }
 
 void ble_comm_lock_pairing(void)
 {
-	s_pairing_window_active = false;
-	s_pairing_window_end_ms = 0;
+	if (!s_ble_supervisor_online) {
+		s_pairing_window_active = false;
+		s_pairing_window_end_ms = 0;
+		return;
+	}
 
-	/* Set non-connectable scannable advertising (ADTY 2) */
-	ble_comm_tx((const uint8_t *)"AT+ADTY2\r\n", 10);
-	k_msleep(50);
-	/* Enter low-power sleep */
-	ble_comm_tx((const uint8_t *)"AT+SLEEP\r\n", 10);
-	s_ble_module_awake = false;
+	/* If a phone is currently connected, preserve active connection and defer lock until disconnect */
+	if (s_ble_connected) {
+		s_lock_pending_on_disconnect = true;
+		LOG_INF("[BLE] Connection active; deferring pairing lock until disconnect");
+		return;
+	}
 
-	LOG_INF("BLE Access: LOCKED");
+	/* If module is asleep, wake it with AT ping; abort if wake fails */
+	if (ble_comm_wake_module() != 0) {
+		LOG_ERR("BLE wake failed; aborting pairing lock");
+		return;
+	}
+
+	/* Transmit AT+ADTY2\r\n and validate exact OK+Set:2\r\n */
+	int rc = ble_comm_send_cmd_expect("AT+ADTY2\r\n", "OK+Set:2", NULL, 0, 150);
+	if (rc == 0) {
+		s_current_adty = 2;
+		s_pairing_window_active = false;
+		s_pairing_window_end_ms = 0;
+		s_lock_pending_on_disconnect = false;
+		LOG_INF("BLE Access: LOCKED");
+		printk("\nBLE Access: LOCKED\n>");
+
+		/* Enter low-power sleep under Mode 1 */
+		ble_comm_send_cmd_expect("AT+SLEEP\r\n", "OK+SLEEP", NULL, 0, 100);
+		s_ble_module_awake = false;
+	} else {
+		LOG_ERR("BLE lock failed: no OK+Set:2 response (rc=%d)", rc);
+	}
 }
 
 void ble_comm_suspend(void)
 {
-	if (!s_ble_active) return;
+	if (!s_ble_supervisor_online) return;
 
-	/* If disconnected and module is awake, command it to sleep */
+	/* If disconnected and module is awake, command it to sleep under Mode 1 */
 	if (!s_ble_connected && s_ble_module_awake) {
-		ble_comm_tx((const uint8_t *)"AT+SLEEP\r\n", 10);
-		k_msleep(30);
+		ble_comm_send_cmd_expect("AT+SLEEP\r\n", "OK+SLEEP", NULL, 0, 100);
 		s_ble_module_awake = false;
 	}
 
@@ -421,7 +898,7 @@ void ble_comm_suspend(void)
 
 void ble_comm_resume(void)
 {
-	if (!s_ble_active || !s_ble_uart_dev) return;
+	if (!s_ble_supervisor_online || !s_ble_uart_dev || !s_ble_uart_ready) return;
 
 #if defined(CONFIG_SOC_SERIES_STM32L4X)
 	LL_USART_ClearFlag_ORE(USART1);
@@ -438,11 +915,23 @@ void ble_comm_resume(void)
 #if defined(CONFIG_UART_INTERRUPT_DRIVEN)
 	uart_irq_rx_enable(s_ble_uart_dev);
 #endif
+
+	/*
+	 * Stop 2 resume requirement: Do NOT send AT pings or commands to BLE supervisor!
+	 * The supervisor maintains its own Mode 1 low-power connectable advertising.
+	 */
 }
 
 void ble_comm_send_dev_info(void)
 {
+	if (k_mutex_lock(&s_ble_report_mutex, K_MSEC(2000)) != 0) {
+		return;
+	}
+
 	struct wildsonic_config *cfg = console_get_config();
+	struct app_settings *settings = main_get_settings();
+	uint32_t sleep_sec = cfg->sleep_pause_interval ? cfg->sleep_pause_interval : (settings ? settings->sleep_seconds : 60);
+	uint32_t cycles = settings ? settings->cycles : 1;
 
 	ble_comm_printf("SAMF %u\r\n", cfg->sampling_rate);
 	k_msleep(BLE_RESPONSE_PACING_MS);
@@ -458,10 +947,31 @@ void ble_comm_send_dev_info(void)
 	k_msleep(BLE_RESPONSE_PACING_MS);
 	ble_comm_printf("RECT %u\r\n", cfg->recording_length);
 	k_msleep(BLE_RESPONSE_PACING_MS);
-	ble_comm_printf("SLEEP %u\r\n", cfg->sleep_pause_interval);
+	ble_comm_printf("SLEEP %u\r\n", sleep_sec);
 	k_msleep(BLE_RESPONSE_PACING_MS);
-
-	ble_comm_printf("VER 2.1.0-prod, SHA d7a4f91, DT Oct 30 2026\r\n");
+	ble_comm_printf("CYCLE %u\r\n", cycles);
+	k_msleep(BLE_RESPONSE_PACING_MS);
+	ble_comm_printf("NAME %s\r\n", (cfg && cfg->device_name[0]) ? cfg->device_name : "");
+	k_msleep(BLE_RESPONSE_PACING_MS);
+	ble_comm_printf("MODEL WS-STM32L476\r\n");
+	k_msleep(BLE_RESPONSE_PACING_MS);
+	ble_comm_printf("SERIAL %s\r\n", (cfg && cfg->serial_number[0]) ? cfg->serial_number : "0");
+	k_msleep(BLE_RESPONSE_PACING_MS);
+	ble_comm_printf("FWVER 1.2.0-BLE\r\n");
+	k_msleep(BLE_RESPONSE_PACING_MS);
+	ble_comm_printf("MIC ANALOG\r\n");
+	k_msleep(BLE_RESPONSE_PACING_MS);
+	ble_comm_printf("BATTCAP 0\r\n");
+	k_msleep(BLE_RESPONSE_PACING_MS);
+	ble_comm_printf("RECTIME %u\r\n", cfg->recording_length);
+	k_msleep(BLE_RESPONSE_PACING_MS);
+	ble_comm_printf("INTERVAL %u\r\n", sleep_sec);
+	k_msleep(BLE_RESPONSE_PACING_MS);
+	ble_comm_printf("SRATE %u\r\n", cfg->sampling_rate);
+	k_msleep(BLE_RESPONSE_PACING_MS);
+	ble_comm_printf("RECBITS %u\r\n", cfg->audio_sampling_width);
+	k_msleep(BLE_RESPONSE_PACING_MS);
+	ble_comm_printf("NCH %u\r\n", cfg->num_audio_channels);
 	k_msleep(BLE_RESPONSE_PACING_MS);
 
 	uint64_t sd_used = 0, sd_total = 0;
@@ -475,27 +985,21 @@ void ble_comm_send_dev_info(void)
 	                (unsigned long long)sd_used, (unsigned long long)sd_total);
 	k_msleep(BLE_RESPONSE_PACING_MS);
 
-	const char *fldr_str = (cfg->folder_structure == 1) ? "daily" :
-	                       (cfg->folder_structure == 2) ? "hourly" : "flat";
-	ble_comm_printf("FLDR %s\r\n", fldr_str);
+	ble_comm_printf("VBATT N/A, CBATT N/A, REMBATT N/A\r\n");
 	k_msleep(BLE_RESPONSE_PACING_MS);
-
-	/* Battery metrics: unmeasured on Nucleo board, reported as 0 */
-	ble_comm_printf("VBATT 0, CBATT 0, REMBATT 0\r\n");
-	k_msleep(BLE_RESPONSE_PACING_MS);
-	ble_comm_printf("FULLBATT 0, REMTIME 0, AVGPWR 0\r\n");
+	ble_comm_printf("FULLBATT N/A, REMTIME N/A, AVGPWR N/A\r\n");
 	k_msleep(BLE_RESPONSE_PACING_MS);
 	ble_comm_printf("NBAT 0\r\n");
 	k_msleep(BLE_RESPONSE_PACING_MS);
 
 	struct rtc_calendar_time now_cal;
-	if (rtc_calendar_get(&now_cal) != 0 || !rtc_calendar_is_valid()) {
-		now_cal.year = 2026; now_cal.month = 10; now_cal.day = 30;
-		now_cal.hour = 12; now_cal.min = 0; now_cal.sec = 0;
+	if (rtc_calendar_get(&now_cal) == 0 && rtc_calendar_is_valid()) {
+		ble_comm_printf("DATETIME %04d-%02d-%02d %02d:%02d:%02d.000 +00:00\r\n",
+		                now_cal.year, now_cal.month, now_cal.day,
+		                now_cal.hour, now_cal.min, now_cal.sec);
+	} else {
+		ble_comm_printf("DATETIME N/A\r\n");
 	}
-	ble_comm_printf("DATETIME %04d-%02d-%02d %02d:%02d:%02d.000 +00:00\r\n",
-	                now_cal.year, now_cal.month, now_cal.day,
-	                now_cal.hour, now_cal.min, now_cal.sec);
 	k_msleep(BLE_RESPONSE_PACING_MS);
 	ble_comm_printf("TIMEZONE +00:00\r\n");
 	k_msleep(BLE_RESPONSE_PACING_MS);
@@ -505,22 +1009,18 @@ void ble_comm_send_dev_info(void)
 	ble_comm_printf("SUNMODE Disabled\r\n");
 	k_msleep(BLE_RESPONSE_PACING_MS);
 
-	ble_comm_printf("TIMEOFDAY 0 00:00:00-23:59:59\r\n");
-	k_msleep(BLE_RESPONSE_PACING_MS);
-	for (int i = 1; i < 10; i++) {
-		ble_comm_printf("TIMEOFDAY %d 00:00:00-00:00:00\r\n", i);
-		k_msleep(15);
-	}
-
-	ble_comm_printf("DAYSOFWEEK MTWRFSU\r\n");
-	k_msleep(BLE_RESPONSE_PACING_MS);
-
-	/* Environmental status: terminating line that releases mobile app busy lock */
+	/* Critical termination line required to release mobile app lock */
 	ble_comm_printf("TEMP 0.00, HUMID 0.00\r\n");
+
+	k_mutex_unlock(&s_ble_report_mutex);
 }
 
 void ble_comm_send_status_info(void)
 {
+	if (k_mutex_lock(&s_ble_report_mutex, K_MSEC(2000)) != 0) {
+		return;
+	}
+
 	uint64_t sd_used = 0, sd_total = 0;
 	struct fs_statvfs stat;
 	if (fs_statvfs("/SD:", &stat) == 0) {
@@ -532,13 +1032,15 @@ void ble_comm_send_status_info(void)
 	                (unsigned long long)sd_used, (unsigned long long)sd_total);
 	k_msleep(BLE_RESPONSE_PACING_MS);
 
-	ble_comm_printf("VBATT 0, CBATT 0, REMBATT 0\r\n");
+	ble_comm_printf("VBATT N/A, CBATT N/A, REMBATT N/A\r\n");
 	k_msleep(BLE_RESPONSE_PACING_MS);
-	ble_comm_printf("FULLBATT 0, REMTIME 0, AVGPWR 0\r\n");
+	ble_comm_printf("FULLBATT N/A, REMTIME N/A, AVGPWR N/A\r\n");
 	k_msleep(BLE_RESPONSE_PACING_MS);
 
 	/* Terminating line */
 	ble_comm_printf("TEMP 0.00, HUMID 0.00\r\n");
+
+	k_mutex_unlock(&s_ble_report_mutex);
 }
 
 int ble_comm_feed_rx_bytes(const uint8_t *data, size_t len)
@@ -556,14 +1058,28 @@ int ble_comm_drain_tx_bytes(uint8_t *buf, size_t max_len)
 	return (int)ring_buf_get(&s_ble_tx_rb, buf, max_len);
 }
 
+void ble_comm_set_test_capture(bool enabled)
+{
+	s_ble_test_capture_enabled = enabled;
+}
+
 void ble_comm_reset_test_state(void)
 {
 	ring_buf_reset(&s_ble_rx_rb);
 	ring_buf_reset(&s_ble_tx_rb);
+	s_ble_uart_ready = false;
+	s_ble_supervisor_online = false;
 	s_ble_connected = false;
 	s_ble_module_awake = false;
 	s_pairing_window_active = false;
 	s_pairing_window_end_ms = 0;
+	s_lock_pending_on_disconnect = false;
 	s_ble_cmd_len = 0;
 	s_ble_overflow = false;
+	s_expected_ack = NULL;
+	s_ack_matched = false;
+	s_current_slpm = 1;
+	s_current_adty = 0;
+	s_name_update_pending = false;
+	s_ble_test_capture_enabled = false;
 }
