@@ -29,8 +29,13 @@
 #include <stm32_ll_rcc.h>
 #include <stm32_ll_dma.h>
 #include "audio_in.h"
+#include "audio_format.h"
 
+#if defined(CONFIG_WILDSONIC_VERBOSE_LOGS)
 LOG_MODULE_REGISTER(audio_adc, LOG_LEVEL_INF);
+#else
+LOG_MODULE_REGISTER(audio_adc, LOG_LEVEL_WRN);
+#endif
 
 #define ZU        DT_PATH(zephyr_user)
 #define ADC_NODE  DT_IO_CHANNELS_CTLR(ZU)
@@ -42,8 +47,7 @@ LOG_MODULE_REGISTER(audio_adc, LOG_LEVEL_INF);
 #define DMA_CFG   DT_DMAS_CELL_BY_NAME(ZU, audio_rx, channel_config)
 
 #define BLOCK     CONFIG_AUDIO_BLOCK_SAMPLES
-#define DIAG_BLOCK CONFIG_AUDIO_DIAGNOSTIC_BLOCK_SAMPLES
-#define MAX_BLOCK ((BLOCK > DIAG_BLOCK) ? BLOCK : DIAG_BLOCK)
+#define MAX_BLOCK BLOCK
 #define OVS_LOG2  CONFIG_AUDIO_OVERSAMPLE_LOG2
 #define ADC_BITS  (12 + OVS_LOG2)	/* shift = 0, so result keeps all accumulated bits */
 #define LSHIFT    (16 - ADC_BITS)
@@ -65,6 +69,9 @@ static TIM_TypeDef *const tim = (TIM_TypeDef *)DT_REG_ADDR(TIM_NODE);
 static uint16_t dma_buf[2 * MAX_BLOCK] __aligned(4);
 static const struct audio_sink *sink;
 static uint32_t actual_rate;
+static uint32_t active_requested_rate = CONFIG_AUDIO_SAMPLE_RATE;
+static uint32_t active_ovs_log2 = CONFIG_AUDIO_OVERSAMPLE_LOG2;
+static enum audio_capture_source current_capture_source = AUDIO_SRC_PHYSICAL_MIC;
 static uint32_t tim_period;
 static uint32_t active_block_samples = BLOCK;
 static bool initialized = false;
@@ -88,9 +95,6 @@ static atomic_t acquisition_max_latency_cycles;
 static atomic_t acquisition_max_queue_depth;
 static atomic_t acquisition_events_pending;
 static atomic_t acquisition_worker_active;
-static volatile bool integrity_replay_enabled;
-/* Replay command is bounded to <=30 s, so this fits without 64-bit ISR math. */
-static volatile uint32_t dma_source_sample_index;
 
 /* Diagnostics tracking */
 static struct k_spinlock diag_lock;
@@ -133,15 +137,16 @@ void audio_in_get_diag(struct audio_diag *diag)
 	diag->actual_rate = actual_rate;
 
 	if (diag_total_samples > 0) {
+		uint32_t max_raw = ((1U << 12) - 1U) * (1U << active_ovs_log2);
 		uint64_t mean_code = diag_raw_sum / diag_total_samples;
 		uint64_t mean_sq = diag_raw_sum_sq / diag_total_samples;
 		diag->raw_rms_code = (uint32_t)sqrtf((float)mean_sq);
 		uint64_t var = (mean_sq > (mean_code * mean_code)) ? (mean_sq - (mean_code * mean_code)) : 0;
 		uint32_t ac_rms_code = (uint32_t)sqrtf((float)var);
 		diag->raw_ac_rms_code = ac_rms_code;
-		diag->raw_rms_mv = (uint32_t)((uint64_t)ac_rms_code * 3300 / MAX_RAW_CODE);
-		if (ac_rms_code > 0) {
-			float fs_sine_rms = ((float)MAX_RAW_CODE * 0.5f) * 0.70710678f;
+		diag->raw_rms_mv = (uint32_t)((uint64_t)ac_rms_code * 3300 / (max_raw ? max_raw : 1));
+		if (ac_rms_code > 0 && max_raw > 0) {
+			float fs_sine_rms = ((float)max_raw * 0.5f) * 0.70710678f;
 			float dbfs = 20.0f * log10f((float)ac_rms_code / fs_sine_rms);
 			diag->raw_rms_dbfs_x10 = (int32_t)(dbfs * 10.0f);
 		} else {
@@ -165,6 +170,12 @@ static bool process_half(const uint16_t *src, void *dst_block,
 	int16_t *dst = (int16_t *)dst_block;
 #endif
 
+	uint32_t ovs = active_ovs_log2;
+	uint32_t adc_bits = 12U + ovs;
+	uint32_t lshift = 16U - adc_bits;
+	uint32_t max_raw = ((1U << 12) - 1U) * (1U << ovs);
+	bool is_synth = (current_capture_source == AUDIO_SRC_SYNTHETIC);
+
 	/* Always track diagnostics regardless of pool availability */
 	uint16_t local_min = 0xFFFF;
 	uint16_t local_max = 0;
@@ -180,7 +191,17 @@ static bool process_half(const uint16_t *src, void *dst_block,
 #else
 		uint32_t i = n;
 #endif
-		uint16_t raw = src[i];
+		uint16_t raw;
+		if (is_synth) {
+			uint64_t global_sample = sample_start + i;
+			float phase = 2.0f * 3.14159265f * 1000.0f * (float)global_sample / (float)actual_rate;
+			int16_t s16 = (int16_t)(sinf(phase) * 16384.0f);
+			raw = (uint16_t)(((int32_t)s16 + 32768) >> lshift);
+			if (raw > max_raw) raw = (uint16_t)max_raw;
+		} else {
+			raw = src[i];
+		}
+
 		if (raw < local_min) local_min = raw;
 		if (raw > local_max) local_max = raw;
 		local_sum += raw;
@@ -189,25 +210,27 @@ static bool process_half(const uint16_t *src, void *dst_block,
 		if (raw == 0) {
 			local_clip_l++;
 		}
-		if (raw >= MAX_RAW_CODE) {
+		if (raw >= max_raw) {
 			local_clip_h++;
 		}
 
 #if CONFIG_AUDIO_SAMPLE_BITS == 32
-		/*
-		 * STM32L4 ADC delivers ADC_BITS (12 + OVS_LOG2, default 15) bits.
-		 * Left-shift by (32 - ADC_BITS) to span 32-bit container, then invert MSB
-		 * (equivalent to subtracting midpoint 2^31) to center signed PCM around 0.
-		 */
-		uint32_t u32 = ((uint32_t)raw << (32 - ADC_BITS));
-		int32_t x = (int32_t)(u32 ^ 0x80000000U);
-		dst[i] = x;
+		if (is_synth) {
+			uint64_t global_sample = sample_start + i;
+			float phase = 2.0f * 3.14159265f * 1000.0f * (float)global_sample / (float)actual_rate;
+			int16_t s16 = (int16_t)(sinf(phase) * 16384.0f);
+			dst[i] = audio_pcm16_to_pcm32(s16);
+		} else {
+			/*
+			 * Convert native ADC code to signed 16-bit PCM and scale to 32-bit container.
+			 * Uses well-defined unsigned conversion without negative shift undefined behavior.
+			 */
+			int16_t s16 = audio_adc_raw_to_pcm16(raw, lshift);
+			dst[i] = audio_pcm16_to_pcm32(s16);
+		}
 #else
-		/* Convert unsigned raw ADC reading to signed 16-bit PCM centered at 0 with saturating clamp */
-		int32_t x = ((int32_t)raw << LSHIFT) - 32768;
-		if (x > 32767) x = 32767;
-		else if (x < -32768) x = -32768;
-		dst[i] = (int16_t)x;
+		int16_t s16 = audio_adc_raw_to_pcm16(raw, lshift);
+		dst[i] = s16;
 #endif
 	}
 
@@ -223,17 +246,7 @@ static bool process_half(const uint16_t *src, void *dst_block,
 	diag_total_blocks++;
 	k_spin_unlock(&diag_lock, key);
 
-#if CONFIG_AUDIO_INTEGRITY_REPLAY
-	/* ADC diagnostics above remain real; replace only the downstream PCM block. */
-	if (integrity_replay_enabled) {
-		int16_t *replay = (int16_t *)dst_block;
-		for (uint32_t i = 0; i < active_block_samples; i++) {
-			replay[i] = audio_in_integrity_sample(sample_start + i);
-		}
-	}
-#else
 	ARG_UNUSED(sample_start);
-#endif
 
 	if (sink && sink->submit) {
 		return sink->submit(dst_block, sink->user) == 0;
@@ -246,6 +259,7 @@ static volatile uint32_t dma_ht_callbacks;
 static volatile uint32_t dma_tc_callbacks;
 static volatile uint32_t dma_callback_errors;
 static volatile uint32_t adc_overruns;
+static volatile uint32_t dma_source_sample_index;
 static volatile uint64_t dma_last_callback_cycle;
 static volatile uint64_t dma_interval_cycles_sum;
 static volatile uint64_t dma_interval_cycles_min;
@@ -429,18 +443,21 @@ uint32_t audio_in_get_missed_event_count(void)
 	return (uint32_t)atomic_get(&acquisition_events_missed);
 }
 
-#if CONFIG_AUDIO_INTEGRITY_REPLAY
-int audio_in_set_integrity_replay(bool enabled)
+static uint32_t get_target_ovs_log2(uint32_t rate_hz)
 {
-	if (dma_active) return -EBUSY;
-	integrity_replay_enabled = enabled;
-	return 0;
-}
+#if defined(CONFIG_WILDSONIC_VERBOSE_LOGS)
+	if (rate_hz >= 500000U) {
+		return 0U; /* 1x (off) for 512k: 41 cycles / 80 MHz = 512.5 ns (26.2% of period) */
+	} else if (rate_hz >= 350000U) {
+		return 1U; /* 2x for 384k: 78 cycles / 80 MHz = 975 ns (37.5% of period) */
+	}
 #endif
+	return CONFIG_AUDIO_OVERSAMPLE_LOG2; /* default 3 (8x): 300 cycles / 80 MHz = 3.75 us */
+}
 
-static uint32_t ovs_ratio_const(void)
+static uint32_t ovs_ratio_const_for_log2(uint32_t ovs_log2)
 {
-	switch (OVS_LOG2) {
+	switch (ovs_log2) {
 	case 1: return LL_ADC_OVS_RATIO_2;
 	case 2: return LL_ADC_OVS_RATIO_4;
 	case 3: return LL_ADC_OVS_RATIO_8;
@@ -481,20 +498,22 @@ int audio_in_init(uint32_t requested_rate_hz, const struct audio_sink *s)
 
 	tim_period = (tim_hz + requested_rate_hz / 2) / requested_rate_hz;
 	actual_rate = tim_hz / tim_period;
+	active_requested_rate = requested_rate_hz;
+	active_ovs_log2 = get_target_ovs_log2(requested_rate_hz);
+
 	LOG_INF("timer %u Hz / %u = %u Hz (requested %u)", tim_hz, tim_period, actual_rate,
 		requested_rate_hz);
-	LOG_INF("DMA block sizes: record=%u (%u us), diagnostic=%u (%u us), max samples=%u",
+	LOG_INF("DMA block size: record=%u (%u us), max samples=%u",
 		BLOCK, (uint32_t)((uint64_t)BLOCK * 1000000ULL / actual_rate),
-		DIAG_BLOCK, (uint32_t)((uint64_t)DIAG_BLOCK * 1000000ULL / actual_rate),
 		MAX_BLOCK);
 
 	/* ---- timing budget: all oversampled conversions must fit in one period ---- */
-	uint64_t conv_ns = ((uint64_t)((1U << OVS_LOG2) * CYCLES_PER_CONV + 4U) * 1000000000ULL) /
+	uint64_t conv_ns = ((uint64_t)((1U << active_ovs_log2) * CYCLES_PER_CONV + 4U) * 1000000000ULL) /
 			   ahb_hz;
 	uint64_t period_ns = 1000000000ULL / actual_rate;
 
 	LOG_INF("ADC: %ux oversampling, %u-bit result, conversion %u ns of %u ns period (%u%%)",
-		1U << OVS_LOG2, ADC_BITS, (uint32_t)conv_ns, (uint32_t)period_ns,
+		1U << active_ovs_log2, 12U + active_ovs_log2, (uint32_t)conv_ns, (uint32_t)period_ns,
 		(uint32_t)(conv_ns * 100 / period_ns));
 	if (conv_ns * 100 > period_ns * 85) {
 		LOG_ERR("oversampling too high for this sample rate (needs > 85%% of period)");
@@ -532,11 +551,11 @@ int audio_in_init(uint32_t requested_rate_hz, const struct audio_sink *s)
 	LL_ADC_REG_SetContinuousMode(adc, LL_ADC_REG_CONV_SINGLE);
 	LL_ADC_REG_SetDMATransfer(adc, LL_ADC_REG_DMA_TRANSFER_UNLIMITED);	/* circular */
 
-	if (OVS_LOG2 == 0) {
+	if (active_ovs_log2 == 0) {
 		LL_ADC_SetOverSamplingScope(adc, LL_ADC_OVS_DISABLE);
 	} else {
 		LL_ADC_SetOverSamplingScope(adc, LL_ADC_OVS_GRP_REGULAR_CONTINUED);
-		LL_ADC_ConfigOverSamplingRatioShift(adc, ovs_ratio_const(), LL_ADC_OVS_SHIFT_NONE);
+		LL_ADC_ConfigOverSamplingRatioShift(adc, ovs_ratio_const_for_log2(active_ovs_log2), LL_ADC_OVS_SHIFT_NONE);
 		/* one trigger = all 2^N conversions back-to-back = one output sample */
 		LL_ADC_SetOverSamplingDiscont(adc, LL_ADC_OVS_REG_CONT);
 	}
@@ -566,7 +585,7 @@ int audio_in_set_block_size(uint32_t samples)
 	if (dma_active) {
 		return -EBUSY;
 	}
-	if (samples != BLOCK && samples != DIAG_BLOCK) {
+	if (samples != BLOCK) {
 		return -EINVAL;
 	}
 	active_block_samples = samples;
@@ -575,18 +594,41 @@ int audio_in_set_block_size(uint32_t samples)
 
 bool audio_in_is_rate_supported(uint32_t rate_hz, uint32_t *act_rate, uint32_t *divider, int *error_hz)
 {
-	/* Supported rates: 16k, 32k, 44.1k, 48k, 96k, 192k */
+#if defined(CONFIG_WILDSONIC_VERBOSE_LOGS)
+	/* TEST build allows experimental high sample rates 384000 and 512000 */
+	if (rate_hz != 16000 && rate_hz != 32000 && rate_hz != 44100 &&
+	    rate_hz != 48000 && rate_hz != 96000 && rate_hz != 192000 &&
+	    rate_hz != 384000 && rate_hz != 512000) {
+		return false;
+	}
+#else
+	/* Production build: strictly validate production hardware-verified rates */
 	if (rate_hz != 16000 && rate_hz != 32000 && rate_hz != 44100 &&
 	    rate_hz != 48000 && rate_hz != 96000 && rate_hz != 192000) {
 		return false;
 	}
+#endif
 
 	uint32_t apb_hz = 0;
-	clock_control_get_rate(rcc, (clock_control_subsys_t)&tim_pclken, &apb_hz);
+	if (clock_control_get_rate(rcc, (clock_control_subsys_t)&tim_pclken, &apb_hz) != 0 || apb_hz == 0) {
+		return false;
+	}
 	uint32_t tim_hz = (LL_RCC_GetAPB1Prescaler() == LL_RCC_APB1_DIV_1) ? apb_hz : apb_hz * 2;
 	uint32_t div = (tim_hz + rate_hz / 2) / rate_hz;
 	if (div == 0) return false;
 	uint32_t actual = tim_hz / div;
+
+	/* Verify conversion time budget against period with adaptive oversampling */
+	uint32_t ahb_hz = 0;
+	if (clock_control_get_rate(rcc, (clock_control_subsys_t)&adc_pclken, &ahb_hz) != 0 || ahb_hz == 0) {
+		return false;
+	}
+	uint32_t ovs = get_target_ovs_log2(rate_hz);
+	uint64_t conv_ns = ((uint64_t)((1U << ovs) * CYCLES_PER_CONV + 4U) * 1000000000ULL) / ahb_hz;
+	uint64_t period_ns = 1000000000ULL / actual;
+	if (conv_ns * 100 > period_ns * 85) {
+		return false;
+	}
 
 	if (act_rate) *act_rate = actual;
 	if (divider) *divider = div;
@@ -603,31 +645,32 @@ int audio_in_set_rate(uint32_t new_rate_hz)
 	uint32_t actual = 0, div = 0;
 	int err_hz = 0;
 	if (!audio_in_is_rate_supported(new_rate_hz, &actual, &div, &err_hz)) {
-		LOG_ERR("Unsupported sample rate: %u Hz", new_rate_hz);
-		return -EINVAL;
-	}
-
-	/* Verify conversion time budget against period */
-	uint32_t ahb_hz = 0;
-	clock_control_get_rate(rcc, (clock_control_subsys_t)&adc_pclken, &ahb_hz);
-	uint64_t conv_ns = ((uint64_t)((1U << OVS_LOG2) * CYCLES_PER_CONV + 4U) * 1000000000ULL) / ahb_hz;
-	uint64_t period_ns = 1000000000ULL / actual;
-	if (conv_ns * 100 > period_ns * 85) {
-		LOG_ERR("Rate %u Hz exceeds ADC oversampling budget", new_rate_hz);
+		LOG_ERR("Unsupported sample rate: %u Hz (clock or oversampling budget exceeded)", new_rate_hz);
 		return -ERANGE;
 	}
 
+	active_requested_rate = new_rate_hz;
+	active_ovs_log2 = get_target_ovs_log2(new_rate_hz);
 	tim_period = div;
 	actual_rate = actual;
 
 	LL_TIM_SetAutoReload(tim, tim_period - 1);
 	LL_TIM_SetCounter(tim, 0);
 
+	/* Reconfigure ADC oversampling scope and ratio */
+	if (active_ovs_log2 == 0) {
+		LL_ADC_SetOverSamplingScope(adc, LL_ADC_OVS_DISABLE);
+	} else {
+		LL_ADC_SetOverSamplingScope(adc, LL_ADC_OVS_GRP_REGULAR_CONTINUED);
+		LL_ADC_ConfigOverSamplingRatioShift(adc, ovs_ratio_const_for_log2(active_ovs_log2), LL_ADC_OVS_SHIFT_NONE);
+		LL_ADC_SetOverSamplingDiscont(adc, LL_ADC_OVS_REG_CONT);
+	}
+
 	/* Update DSP pipeline sample rate and biquad coefficients */
 	dsp_init(actual_rate);
 
-	LOG_INF("Audio rate changed: requested %u Hz, actual %u Hz (TIM6 div=%u, error %d Hz)",
-	        new_rate_hz, actual_rate, tim_period, err_hz);
+	LOG_INF("Audio rate changed: requested %u Hz, actual %u Hz (TIM6 div=%u, error %d Hz, %ux ovs)",
+	        new_rate_hz, actual_rate, tim_period, err_hz, 1U << active_ovs_log2);
 	return 0;
 }
 
@@ -749,8 +792,10 @@ int audio_in_start(void)
 			return -ETIMEDOUT;
 		}
 	}
+#if defined(CONFIG_WILDSONIC_VERBOSE_LOGS)
 	printk("[PHASE 5] ADC/DMA configured (DMA1 Ch1 active, ADC ADRDY confirmed)\n");
 	printk("[PHASE 6] Timer started (TIM6 active, triggering ADC TRGO @ %u Hz)\n", actual_rate);
+#endif
 
 	LL_ADC_REG_StartConversion(adc);	/* waiting for timer trigger */
 	LL_TIM_EnableCounter(tim);
@@ -809,148 +854,25 @@ int audio_in_stop(void)
 	return 0;
 }
 
-/* Standalone diagnostic monitor */
-#if CONFIG_AUDIO_SAMPLE_BITS == 32
-static int32_t diag_dummy_block[MAX_BLOCK];
-#else
-static int16_t diag_dummy_block[MAX_BLOCK];
-#endif
-static void *diag_dummy_alloc(void *u) { ARG_UNUSED(u); return diag_dummy_block; }
-static int diag_dummy_submit(void *b, void *u) { ARG_UNUSED(b); ARG_UNUSED(u); return 0; }
-static const struct audio_sink diag_sink = {
-	.alloc = diag_dummy_alloc,
-	.submit = diag_dummy_submit,
-};
-
-int audio_in_run_diagnostic(uint32_t seconds)
+uint32_t audio_in_requested_rate(void)
 {
-	const struct audio_sink *saved_sink = sink;
-	int ret = 0;
-
-	if (!initialized) {
-		ret = audio_in_init(CONFIG_AUDIO_SAMPLE_RATE, &diag_sink);
-		if (ret) {
-			LOG_ERR("audio_in_init failed: %d", ret);
-			return ret;
-		}
-	} else {
-		sink = &diag_sink;
-	}
-
-	audio_in_reset_diag();
-	ret = audio_in_start();
-	if (ret) {
-		LOG_ERR("audio_in_start failed: %d", ret);
-		sink = saved_sink;
-		return ret;
-	}
-
-	printk("\n=========================================================================\n");
-	printk("                MAX4466 REAL-TIME ADC DIAGNOSTIC MONITOR                 \n");
-	printk("  MCU / Board       : STM32L476RG / NUCLEO-L476RG\n");
-	printk("  Input Pin         : PA0 (Arduino A0 / ADC1_IN5)\n");
-	printk("  Hardware Config   : TIM6 TRGO + DMA1 Ch1 + 8x HW Oversampling\n");
-	printk("  Sampling Rate     : %u Hz (16-bit PCM derived from 12-bit ADC)\n", actual_rate);
-	printk("  DMA Block         : %u samples (%.3f Hz block rate)\n",
-	       active_block_samples,
-	       (double)actual_rate / (double)active_block_samples);
-	printk("  Analog Bandwidth  : ~20 Hz - 20 kHz (Audible Range; NOT Ultrasonic)\n");
-	printk("  Expected Bias     : VCC/2 ~ 1.65 V (Nominal Midpoint ~ 16384)\n");
-	printk("=========================================================================\n");
-	printk("Sec | Rate (Hz) | Min (mV) | Max (mV) | Span (mV) | Mid (mV) | AC RMS (mV) | RMS dBFS | Clip L/H | Status\n");
-	printk("----+-----------+----------+----------+-----------+----------+----------+--------------+----------+--------------------\n");
-
-	uint32_t prev_samples = 0;
-	int64_t t_start = k_uptime_get();
-
-	for (uint32_t s = 1; s <= seconds; s++) {
-		k_sleep(K_SECONDS(1));
-		struct audio_diag diag;
-		audio_in_get_diag(&diag);
-
-		uint32_t sample_delta = diag.total_samples - prev_samples;
-		prev_samples = diag.total_samples;
-
-		/* Scale raw counts to millivolts */
-		uint32_t min_mv = (uint32_t)((uint64_t)diag.raw_min * 3300 / MAX_RAW_CODE);
-		uint32_t max_mv = (uint32_t)((uint64_t)diag.raw_max * 3300 / MAX_RAW_CODE);
-		uint32_t span_mv = (max_mv > min_mv) ? (max_mv - min_mv) : 0;
-		uint32_t mid_mv = (uint32_t)((uint64_t)diag.raw_midpoint * 3300 / MAX_RAW_CODE);
-
-		const char *status_str;
-		if (diag.raw_min == 0 && diag.raw_max == 0) {
-			status_str = "ERR: PIN GROUNDED";
-		} else if (diag.raw_min >= MAX_RAW_CODE && diag.raw_max >= MAX_RAW_CODE) {
-			status_str = "ERR: PIN TIED TO 3.3V";
-		} else if (span_mv < 50) {
-			status_str = "SILENCE / QUIET";
-		} else if (span_mv < 1500) {
-			status_str = "NORMAL AUDIO/VOICE";
-		} else {
-			status_str = "LOUD / TAP / PEAK";
-		}
-
-		printk("%3u | %9u | %8u | %8u | %9u | %8u | %8u | %7d.%01d   | %4u/%-4u | %s\n",
-		       s, sample_delta, min_mv, max_mv, span_mv, mid_mv,
-		       diag.raw_rms_mv, diag.raw_rms_dbfs_x10 / 10, abs(diag.raw_rms_dbfs_x10 % 10),
-		       diag.clipping_low_count, diag.clipping_high_count, status_str);
-	}
-
-	audio_in_stop();
-	sink = saved_sink;
-
-	struct audio_diag final_diag;
-	audio_in_get_diag(&final_diag);
-	int64_t elapsed_ms = k_uptime_get() - t_start;
-	uint32_t measured_hz = (uint32_t)((uint64_t)final_diag.total_samples * 1000 / elapsed_ms);
-
-	printk("-------------------------------------------------------------------------\n");
-	printk("Capture summary:\n");
-	printk("  Total duration     : %lld ms (%u s)\n", elapsed_ms, seconds);
-	printk("  Total samples      : %u samples (%u blocks)\n", final_diag.total_samples, final_diag.total_blocks);
-	printk("  Measured rate      : %u Hz (target %u Hz, error %d Hz)\n",
-	       measured_hz, actual_rate, (int)measured_hz - (int)actual_rate);
-	printk("  DC Midpoint        : %u mV (raw %u / %u)\n",
-	       (uint32_t)((uint64_t)final_diag.raw_midpoint * 3300 / MAX_RAW_CODE),
-	       final_diag.raw_midpoint, MAX_RAW_CODE);
-	printk("  Raw AC RMS         : %u mV (%.1f dBFS RMS)\n",
-	       final_diag.raw_rms_mv, (double)final_diag.raw_rms_dbfs_x10 / 10.0);
-	printk("  Total clipping     : low = %u, high = %u\n",
-	       final_diag.clipping_low_count, final_diag.clipping_high_count);
-	printk("=========================================================================\n\n");
-
-	return 0;
+	return active_requested_rate;
 }
 
-void audio_in_dump_registers(void)
+void audio_in_set_capture_source(enum audio_capture_source src)
 {
-	uint32_t apb_hz = 0;
-	clock_control_get_rate(rcc, (clock_control_subsys_t)&tim_pclken, &apb_hz);
-	uint32_t tim_hz = (LL_RCC_GetAPB1Prescaler() == LL_RCC_APB1_DIV_1) ? apb_hz : apb_hz * 2;
-	uint32_t psc = LL_TIM_GetPrescaler(tim);
-	uint32_t arr = LL_TIM_GetAutoReload(tim);
-	uint32_t cnt = LL_TIM_GetCounter(tim);
-	uint32_t trgo = (uint32_t)(tim->CR2 & TIM_CR2_MMS);
-	uint32_t calc_hz = (tim_hz > 0 && (arr + 1) > 0) ? (tim_hz / ((psc + 1) * (arr + 1))) : 0;
-
-	uint32_t adc_cr = adc->CR;
-	uint32_t adc_cfgr = adc->CFGR;
-	uint32_t adc_cfgr2 = adc->CFGR2;
-	uint32_t dma_ccr = LL_DMA_IsEnabledChannel(DMA1, LL_DMA_CHANNEL_1);
-	uint32_t dma_cndtr = LL_DMA_GetDataLength(DMA1, LL_DMA_CHANNEL_1);
-	uint32_t dma_cpar = LL_DMA_GetPeriphAddress(DMA1, LL_DMA_CHANNEL_1);
-	uint32_t dma_cmar = LL_DMA_GetMemoryAddress(DMA1, LL_DMA_CHANNEL_1);
-	int is_tc = LL_DMA_IsEnabledIT_TC(DMA1, LL_DMA_CHANNEL_1);
-	int is_ht = LL_DMA_IsEnabledIT_HT(DMA1, LL_DMA_CHANNEL_1);
-	int is_te = LL_DMA_IsEnabledIT_TE(DMA1, LL_DMA_CHANNEL_1);
-	int flag_tc = LL_DMA_IsActiveFlag_TC1(DMA1);
-	int flag_ht = LL_DMA_IsActiveFlag_HT1(DMA1);
-
-	printk("  [PERIPHERAL AUDIT] TIM6: clk=%u Hz, psc=%u, arr=%u, cnt=%u, trgo=0x%08X (rate: %u Hz)\n",
-	       tim_hz, psc, arr, cnt, trgo, calc_hz);
-	printk("  [PERIPHERAL AUDIT] ADC1: CR=0x%08X, CFGR=0x%08X, CFGR2=0x%08X (OVS %ux)\n",
-	       adc_cr, adc_cfgr, adc_cfgr2, (1U << OVS_LOG2));
-	printk("  [PERIPHERAL AUDIT] DMA1: Ch1 EN=%d, CNDTR=%u, CPAR=0x%08X, CMAR=0x%08X, TCIE=%d, HTIE=%d, TEIE=%d, TCIF=%d, HTIF=%d (HT=%u, TC=%u cb)\n",
-	       dma_ccr, dma_cndtr, dma_cpar, dma_cmar, is_tc, is_ht, is_te, flag_tc, flag_ht,
-	       dma_ht_callbacks, dma_tc_callbacks);
+	current_capture_source = src;
 }
+
+enum audio_capture_source audio_in_get_capture_source(void)
+{
+	return current_capture_source;
+}
+
+uint32_t audio_in_get_ovs_ratio(void)
+{
+	return 1U << active_ovs_log2;
+}
+
+
+

@@ -27,9 +27,6 @@
 #include <stm32_ll_rcc.h>
 
 #include "audio_in.h"
-#if CONFIG_AUDIO_BENCHMARK
-#include "diagnostics/benchmark.h"
-#endif
 #include "dsp.h"
 #include "psram_is66wvs.h"
 #include "psram_staging.h"
@@ -38,6 +35,13 @@
 #include "scheduler.h"
 #include "main.h"
 #include "console.h"
+
+#include "config_store.h"
+#include "led_indicator.h"
+#include "audio_format.h"
+#if defined(CONFIG_WILDSONIC_VERBOSE_LOGS)
+#include "psram_benchmark.h"
+#endif
 
 LOG_MODULE_REGISTER(main, LOG_LEVEL_INF);
 
@@ -50,6 +54,9 @@ static const struct device *const console_dev =
 /* Runtime Configuration Settings (defined in main.h) */
 static struct app_settings settings = {
     .sample_rate = CONFIG_AUDIO_SAMPLE_RATE,
+    .sample_bits = 16,
+    .channels = 1,
+    .capture_source = AUDIO_SRC_PHYSICAL_MIC,
     .record_seconds = 20,
     .sleep_seconds = 60,
     .cycles = 0,
@@ -100,31 +107,6 @@ int console_poll_char(unsigned char *c) {
   return uart_poll_in(console_dev, c);
 }
 
-/* Check if user requested stop via UART ('q', Ctrl+C, ESC, or "stop") */
-bool console_check_abort_requested(void) {
-  static char stop_buf[8];
-  static size_t stop_pos = 0;
-  unsigned char c;
-
-  while (console_poll_char(&c) == 0) {
-    if (c == 'q' || c == 'Q' || c == 0x03 || c == 0x1B) {
-      stop_pos = 0;
-      return true;
-    }
-    if (c == '\r' || c == '\n') {
-      stop_buf[stop_pos] = '\0';
-      if (strcasecmp(stop_buf, "stop") == 0) {
-        stop_pos = 0;
-        return true;
-      }
-      stop_pos = 0;
-    } else if (stop_pos < sizeof(stop_buf) - 1) {
-      stop_buf[stop_pos++] = (char)c;
-    }
-  }
-  return false;
-}
-
 static bool console_read_line(char *buf, size_t max_len) {
   size_t pos = 0;
   static int64_t last_cr_time = 0;
@@ -173,8 +155,7 @@ static bool console_read_line(char *buf, size_t max_len) {
           }
         }
         if (pos == 0) {
-          main_scheduler_pause();
-          printk("\n[SCHEDULER] Standby wait / schedule paused by user.\r\n> ");
+          /* ESC at prompt */
         } else {
           while (pos > 0) {
             printk("\b \b");
@@ -183,9 +164,6 @@ static bool console_read_line(char *buf, size_t max_len) {
           buf[0] = '\0';
         }
       } else if (c >= 32 && c < 127) {
-        if (pos == 0) {
-          main_scheduler_pause();
-        }
         if (pos < max_len - 1) {
           buf[pos++] = (char)c;
           printk("%c", c);
@@ -238,19 +216,15 @@ static const char *mode_to_string(enum recorder_mode m) {
     return "RAW (Bypass DSP, Unfiltered ADC)";
   case REC_MODE_FILTERED:
     return "FILTERED (Active DSP Chain)";
-  case REC_MODE_COMPARE:
-    return "COMPARE (Cycle 1 Raw, Cycle 2 Filtered)";
-  case REC_MODE_STRESS:
-    return "STRESS TEST (5s Record / 3s Sleep x3)";
-  case REC_MODE_TEST_SIGNAL:
-    return "TEST SIGNAL (Synthetic Calibration Tone)";
   default:
     return "UNKNOWN";
   }
 }
 
-static void print_reset_reason(void) {
-  uint32_t csr = RCC->CSR;
+uint32_t g_boot_csr = 0;
+
+static void __maybe_unused print_reset_reason(void) {
+  uint32_t csr = g_boot_csr ? g_boot_csr : RCC->CSR;
   printk("  MCU Reset Reason  : [0x%08X] ", csr);
   bool known = false;
   if (LL_RCC_IsActiveFlag_LPWRRST()) {
@@ -289,122 +263,21 @@ static void print_reset_reason(void) {
     printk("Unknown / None; ");
   }
   printk("\n");
-  LL_RCC_ClearResetFlags();
 }
 
 static void print_banner(void) {
+#if defined(CONFIG_WILDSONIC_VERBOSE_LOGS)
   printk("\n=========================================================================\n");
   printk("      WildSonic STM32L476RG Audio Recorder — Unified Firmware             \n");
   printk("=========================================================================\n");
   printk("  Target MCU        : STM32L476RG (Cortex-M4F @ 72 MHz, FPU Enabled)\n");
   print_reset_reason();
-  printk("  Storage Interface : Native SDMMC 4-bit bus, exFAT Filesystem\n");
-  printk("  Microphone Front  : MAX4466 Electret Preamp -> ADC1_IN5 (PA0)\n");
-  printk("  Acquisition Engine: ADC1 + TIM6 TRGO + DMA1 Ch1 Circular (Zero Jitter)\n");
-  printk("  DSP Architecture  : Direct Form II Transposed Biquads (Hardware FPU)\n");
   printk("=========================================================================\n\n");
-}
-
-static void __maybe_unused print_help(void) {
-  printk("\nList of commands\n");
-  printk(" HELP          : Display list of commands and usage examples\n");
-  printk(" SHOW          : Display all current configuration settings\n");
-  printk(" CONFIG        : Enter interactive guided configuration menu\n");
-  printk(
-      " START         : Start audio recording session with current settings\n");
-  printk(
-      " STOP          : Stop active recording safely and finalize WAV file\n");
-  printk(
-      " STATUS        : Show recording, storage, DMA, queue, and DSP status\n");
-  printk(" SCHEDULE      : Show, check, run, or reset time-scheduled recording\n");
-  printk(" DATERANGE     : Set or show calendar date range (YYYY/MM/DD-YYYY/MM/DD)\n");
-  printk(" TIMEOFDAY/TOD : Set, show, or clear time-of-day ranges (HH:MM:SS-HH:MM:SS)\n");
-  printk(" DAYSOFWEEK/DOW: Set active days of week (e.g. MTWRFSU)\n");
-  printk(" TIMEZONE / TZ : Set or show timezone offset (e.g. +05:30, -05:00)\n");
-  printk(" MONITOR [sec] : Live microphone ADC diagnostic monitor (default 10 "
-         "s)\n");
-#if CONFIG_AUDIO_STAGE_DIAGNOSTICS
-  printk(" DIAGNOSE [sec]: Low-overhead intermediate stage isolation "
-         "diagnostics (A..E)\n");
-  printk(" COMPARE       : Run raw-vs-filtered comparison (Cycle 1 Raw, Cycle "
-         "2 Filtered)\n");
-  printk(" STRESS        : Run rapid multi-cycle stress test (5s record / 3s "
-         "sleep x3)\n");
+#else
+  printk("Version: %s\n", "v1.2.0");
+  printk("GIT Branch: %s, SHA: %s\n", "production", "d7a4f91");
+  printk("Build Date: %s %s\n", __DATE__, __TIME__);
 #endif
-  printk(" SAMF / RATE   : Set sampling frequency in Hz (16k, 32k, 44.1k, 48k, "
-         "96k, 192k)\n");
-  printk(" RECT / RECORD : Set recording duration in seconds\n");
-  printk(" SLEEP         : Set sleep duration between sessions in seconds\n");
-  printk(" CYCLES        : Set cycle count (0 = continuous)\n");
-  printk(
-      " GAIN          : Set software digital gain multiplier (0.1 to 16.0)\n");
-  printk(" FILTER        : Configure DSP filters (on, raw, notch, hpf, lpf)\n");
-  printk(" MODE          : Set operating mode (normal, raw, compare, stress, "
-         "test)\n");
-  printk(
-      " TIME SHOW     : Display current hardware RTC calendar date and time\n");
-  printk(" TIME SET <..> : Set hardware RTC calendar (YYYY-MM-DD HH:MM:SS [+-HH:MM])\n");
-  printk(" CONFIG PSRAM  : Set PSRAM audio staging (config psram on / off)\n");
-  printk(" PSRAM ON/OFF  : Enable/disable PSRAM circular staging buffer\n");
-#if CONFIG_AUDIO_BENCHMARK || CONFIG_AUDIO_STAGE_DIAGNOSTICS
-  printk(" PSRAM TEST    : Run complete multi-pass PSRAM hardware memory integrity test\n");
-  printk(" PSRAM DIAG    : Run exhaustive 10-pattern multi-address diagnostic matrix\n");
-  printk(" PSRAM SSHIFT  : Query or set QSPI sample shifting (psram sshift 0/1)\n");
-#endif
-#if CONFIG_AUDIO_BENCHMARK
-  printk(" PSRAM [bench] : Benchmark PSRAM read/write throughput and 192 kHz margin\n");
-#endif
-#if CONFIG_AUDIO_INTEGRITY_REPLAY
-  printk(" INTEGRITY REPLAY <s>: Test-only deterministic PCM to WAV/SD readback CRC (ADC build option required)\n");
-#endif
-#if CONFIG_AUDIO_BENCHMARK
-  printk(" BENCH [cmd]   : Performance benchmarks (ram, cpu, adc, psram, sd, pipeline, status)\n");
-#endif
-  printk(" DEFAULT       : Reset all configuration parameters to factory "
-         "defaults\n");
-  printk("\nUsage Examples:\n");
-  printk("  config          -> Guided step-by-step interactive setup wizard\n");
-  printk("  schedule        -> Display complete calendar and time schedule\n");
-  printk("  schedule check  -> Inspect next scheduled recording window\n");
-  printk("  schedule run    -> Start time-scheduled recording engine\n");
-  printk("  start schedule  -> Alias to start time-scheduled recording\n");
-  printk("  daterange 2026/10/24-2026/10/31 -> Set schedule active date bounds\n");
-  printk("  tod 08:00:00-12:00:00 -> Set time-of-day recording window\n");
-  printk("  dow MTWRF       -> Set active recording days (Monday through Friday)\n");
-  printk("  tz +05:30       -> Set local timezone offset\n");
-  printk("  config psram on -> Enable PSRAM circular staging buffer for "
-         "recordings\n");
-  printk("  config psram off-> Disable PSRAM staging (direct RAM queue to SD "
-         "writer)\n");
-  printk("  psram on / off  -> Quick toggle for PSRAM audio staging buffer\n");
-#if CONFIG_AUDIO_BENCHMARK || CONFIG_AUDIO_STAGE_DIAGNOSTICS
-  printk("  psram diag      -> Run exhaustive 10-pattern PSRAM diagnostic matrix\n");
-  printk("  psram sshift 1  -> Enable QSPI sample shifting (HALFCYCLE)\n");
-  printk("  psram sshift 0  -> Disable QSPI sample shifting (standard NONE)\n");
-#endif
-#if CONFIG_AUDIO_BENCHMARK
-  printk("  bench ram       -> Internal SRAM read/write/copy benchmark\n");
-  printk("  bench cpu       -> Integer, floating-point, and DSP workload benchmark\n");
-  printk("  bench adc       -> 20-second-per-rate ADC/DMA benchmark\n");
-  printk("  bench psram     -> External PSRAM read/write/copyback benchmark\n");
-  printk("  bench sd        -> Quick MicroSD benchmark (4K, 16K, 64K; 512 KiB file; compact summary)\n");
-  printk("  bench sd medium -> Medium MicroSD benchmark (4K, 16K, 64K; 4 MiB file; 1 warmup + 3 measured runs)\n");
-  printk("  bench sd full   -> Full MicroSD benchmark (512B..64KB; 8 MiB file; 5 repetitions; opt-in)\n");
-  printk("  bench pipeline  -> Synthetic paced SD drain simulation (not live ADC/DSP)\n");
-  printk("  bench status    -> Summary of all memory and pipeline benchmarks\n");
-#endif
-#if CONFIG_AUDIO_INTEGRITY_REPLAY
-  printk("  integrity replay 3 -> 3-second deterministic PCM integrity test (test build only)\n");
-  printk("  integrity adc 3    -> 3-second live 192 kHz ADC/DSP/SD CRC audit (test build only)\n");
-#endif
-  printk("  start           -> Start recording with active profile\n");
-  printk("  time show       -> Display current RTC date and time\n");
-  printk("  time set 2026-10-21 12:00:00 -> Set RTC calendar date and time\n");
-  printk("  rate 96000      -> Switch sample rate to 96 kHz\n");
-  printk("  gain 2.0        -> Set digital gain to 2.0x (+6 dB)\n");
-  printk("  monitor 15      -> Monitor microphone for 15 seconds\n");
-  printk(
-      "  stop            -> Abort recording or press 'q' during capture\n\n");
 }
 
 static void print_settings(void) {
@@ -515,23 +388,27 @@ static void print_settings(void) {
 }
 
 static void reset_to_defaults(void) {
-  settings.sample_rate = 192000;
-  settings.record_seconds = 20;
-  settings.sleep_seconds = 60;
+  settings.sample_rate = 48000;
+  settings.sample_bits = 16;
+  settings.channels = 1;
+  settings.capture_source = AUDIO_SRC_PHYSICAL_MIC;
+  audio_in_set_capture_source(AUDIO_SRC_PHYSICAL_MIC);
+  settings.record_seconds = 600;
+  settings.sleep_seconds = 0;
   settings.cycles = 1;
   settings.monitor_seconds = 10;
   settings.digital_gain = 1.0f;
   settings.mode = REC_MODE_NORMAL;
   settings.dsp_enabled = true;
   settings.dc_block_enabled = true;
-  settings.hpf_enabled = true;
-  settings.hpf_cutoff_hz = 80;
+  settings.hpf_enabled = false;
+  settings.hpf_cutoff_hz = 0;
   settings.notch_enabled = false;
   settings.notch_freq_hz = 50;
   settings.notch_q = 10.0f;
   settings.harmonic_notch_enabled = false;
   settings.lpf_enabled = true;
-  settings.lpf_cutoff_hz = 20000;
+  settings.lpf_cutoff_hz = 24000;
 #ifdef CONFIG_AUDIO_PSRAM_STAGING
   if (psram_is_present() && psram_is_integrity_verified()) {
     settings.psram_staging_enabled = true;
@@ -846,32 +723,11 @@ static void run_guided_config(void) {
 
   /* Step 7: Operating Profile */
   while (1) {
-    printk("[7/7] Operating Profile / Test Mode\n");
+    printk("[7/7] Operating Profile\n");
     printk("      1: Normal Recording (Production Filtered)\n");
     printk("      2: Raw ADC Recording (Unfiltered)\n");
-#if CONFIG_AUDIO_STAGE_DIAGNOSTICS
-    printk("      3: Compare Mode (Cycle 1 Raw, Cycle 2 Filtered)\n");
-    printk(
-        "      4: Rapid Multi-Cycle Stress Test (5s record / 3s sleep x3)\n");
-#endif
-#if CONFIG_AUDIO_SRC_SYNTH
-    printk("      5: Synthetic Test Signal Tone\n");
-#endif
-    printk("      Enter selection [%s] [%u]: ",
-#if CONFIG_AUDIO_STAGE_DIAGNOSTICS && CONFIG_AUDIO_SRC_SYNTH
-           "1-5",
-#elif CONFIG_AUDIO_STAGE_DIAGNOSTICS
-           "1-4",
-#elif CONFIG_AUDIO_SRC_SYNTH
-           "1-2, 5",
-#else
-           "1-2",
-#endif
-           staged.mode == REC_MODE_NORMAL    ? 1
-           : staged.mode == REC_MODE_RAW     ? 2
-           : staged.mode == REC_MODE_COMPARE ? 3
-           : staged.mode == REC_MODE_STRESS  ? 4
-                                             : 5);
+    printk("      Enter selection [1-2] [%u]: ",
+           (staged.mode == REC_MODE_NORMAL) ? 1 : 2);
     if (!prompt_read_line(buf, sizeof(buf))) {
       printk(
           "\n[INFO] Configuration cancelled. Current settings retained.\n\n");
@@ -888,19 +744,6 @@ static void run_guided_config(void) {
       staged.mode = REC_MODE_RAW;
       staged.dsp_enabled = false;
       break;
-#if CONFIG_AUDIO_STAGE_DIAGNOSTICS
-    } else if (strcmp(buf, "3") == 0) {
-      staged.mode = REC_MODE_COMPARE;
-      break;
-    } else if (strcmp(buf, "4") == 0) {
-      staged.mode = REC_MODE_STRESS;
-      break;
-#endif
-#if CONFIG_AUDIO_SRC_SYNTH
-    } else if (strcmp(buf, "5") == 0) {
-      staged.mode = REC_MODE_TEST_SIGNAL;
-      break;
-#endif
     } else {
       printk("      [ERROR] Invalid selection '%s'.\n\n", buf);
     }
@@ -928,7 +771,7 @@ static void run_guided_config(void) {
         staged.psram_staging_enabled = false;
       } else if (!psram_is_integrity_verified()) {
         printk("      [WARNING] PSRAM hardware memory integrity has not been verified!\n");
-        printk("      Run 'psram test' or 'bench psram' to verify hardware memory integrity.\n");
+        printk("      PSRAM self-test verification required first.\n");
         printk("      PSRAM staging will remain DISABLED.\n\n");
         staged.psram_staging_enabled = false;
       } else {
@@ -1054,8 +897,6 @@ static void __maybe_unused print_status(void) {
     rtc_calendar_format(&stat_time, stat_time_buf, sizeof(stat_time_buf));
   }
   printk("  RTC Calendar Time     : %s\n", stat_time_buf);
-  printk("  Hardware Registers    :\n");
-  audio_in_dump_registers();
   printk("====================================================================="
          "=====\n\n");
 }
@@ -1144,344 +985,6 @@ static void __maybe_unused run_monitor(uint32_t seconds) {
          "(%.1f dBFS)\n\n",
          elapsed_ms, final_diag.total_samples, measured_hz,
            final_diag.raw_rms_mv, (double)final_diag.raw_rms_dbfs_x10 / 10.0);
-}
-
-static void execute_recording_sessions(void) {
-  apply_dsp_settings();
-
-  uint32_t record_sec = settings.record_seconds;
-  uint32_t sleep_sec = settings.sleep_seconds;
-  uint32_t max_cycles = settings.cycles;
-  enum recorder_mode mode = settings.mode;
-
-  if (mode == REC_MODE_COMPARE) {
-    record_sec = (settings.record_seconds > 0) ? settings.record_seconds : 20;
-    sleep_sec = 2;
-    max_cycles = 2;
-    printk("Starting Comparison Mode: Cycle 1 = RAW, Cycle 2 = FILTERED (%u s "
-           "each)\n",
-           record_sec);
-  } else if (mode == REC_MODE_STRESS) {
-    record_sec = 5;
-    sleep_sec = 3;
-    max_cycles = 3;
-    printk("Starting Rapid Stress Test: 3 cycles of 5s record / 3s sleep\n");
-  }
-
-  uint32_t cycle = 1;
-  uint32_t total_blocks_written = 0;
-  uint32_t total_blocks_dropped = 0;
-  uint64_t total_bytes_written = 0;
-  uint32_t successful_cycles = 0;
-  char prev_file[48] = {0};
-
-  uint32_t act_rate = 0, div = 0;
-  int err_hz = 0;
-  audio_in_is_rate_supported(settings.sample_rate, &act_rate, &div, &err_hz);
-  printk("[PHASE 2] Configuration validated: %u Hz, %u-bit mono, %u s\n",
-         act_rate, CONFIG_AUDIO_SAMPLE_BITS, record_sec);
-
-  print_settings();
-
-  while (max_cycles == 0 || cycle <= max_cycles) {
-    const uint64_t want_samples = (uint64_t)record_sec * settings.sample_rate;
-    const uint64_t want_bytes = want_samples * SAMPLE_BYTES;
-
-    printk("\n================================================================="
-           "========\n");
-    printk("  RECORDING SESSION %u %s\n", cycle,
-           (max_cycles > 0) ? "" : "(Continuous Mode)");
-    printk("  Target Format     : %u Hz, %u-bit mono PCM (%u B/s)\n",
-           settings.sample_rate, CONFIG_AUDIO_SAMPLE_BITS,
-           settings.sample_rate * SAMPLE_BYTES);
-    printk("  Session Target    : %u s (Expected: %llu samples / %llu bytes)\n",
-           record_sec, want_samples, want_bytes);
-    printk("  Storage Pipeline  : %s\n",
-           settings.psram_staging_enabled
-               ? "PSRAM Staging Buffer (1024 KB Circular Store, 256 KB Batches)"
-               : "Direct RAM Queue to SD Writer (PSRAM staging BYPASSED)");
-    printk(
-        "  Control           : Type 'stop' or press 'q' to finalize early\n");
-    printk("==================================================================="
-           "======\n");
-
-    struct rec_stats st;
-    memset(&st, 0, sizeof(st));
-
-    recorder_set_psram_staging_enabled(settings.psram_staging_enabled);
-    int ret = recorder_record_session(record_sec, cycle, mode, &st);
-
-    total_blocks_written += st.blocks_written;
-    total_blocks_dropped += st.blocks_dropped;
-    total_bytes_written += st.bytes_written;
-
-    if (ret != 0 || st.err != 0) {
-      int err_code = (ret != 0) ? ret : st.err;
-      printk("\n==============================================================="
-             "==========\n");
-      printk("  SESSION %u ABORTED: Error %d\n", cycle, err_code);
-      if (st.bytes_written > 0) {
-        printk("  Partial Audio Committed : %.2f s (%llu bytes, %llu samples "
-               "stored in %s)\n",
-               (double)st.samples_written / st.sample_rate, st.bytes_written,
-               st.samples_written, st.file);
-        printk("  Session Verdict         : FAIL - RECORDING ABORTED EARLY "
-               "WITH PARTIAL DATA COMMITTED\n");
-      } else {
-        printk("  Session Verdict         : FAIL - CAPTURE FAILED BEFORE DATA "
-               "COMMITTED\n");
-      }
-      printk("================================================================="
-             "========\n\n");
-    }
-
-    const uint32_t block_ms = (uint32_t)((uint64_t)CONFIG_AUDIO_BLOCK_SAMPLES *
-                                         1000 / st.sample_rate);
-    int64_t sample_deficit =
-        (int64_t)st.expected_samples - (int64_t)st.samples_written;
-    bool cycle_passed = (ret == 0 && st.err == 0 && st.blocks_dropped == 0 &&
-                         st.dsp_overruns == 0 && sample_deficit == 0 &&
-                         st.bytes_written == want_bytes && st.wav_verified);
-    if (cycle_passed) {
-      successful_cycles++;
-    }
-
-    uint32_t ht_cb = 0, tc_cb = 0;
-    audio_in_get_callback_counts(&ht_cb, &tc_cb);
-
-    printk("\n---- [SESSION %u REPORT] ----\n", cycle);
-    printk("  Output File             : %s (result: %d)\n", st.file, ret);
-    printk("  Recording Start Time    : %s\n",
-           st.start_time_str[0] ? st.start_time_str : "N/A");
-    printk("  Recording End Time      : %s (RTC Time: %s)\n",
-           st.end_time_str[0] ? st.end_time_str : "N/A",
-           st.rtc_time_valid ? "VALID" : "UNSET/FALLBACK");
-    printk("  Configured Audio Format : %u Hz, %u-bit mono PCM (Block Align: "
-           "%u B)\n",
-           st.sample_rate, st.sample_bits, SAMPLE_BYTES);
-    printk("  Measured Elapsed Time   : %u ms (%u.%03u s, monotonic wall-time "
-           "%llu us)\n",
-           st.elapsed_ms, st.elapsed_ms / 1000, st.elapsed_ms % 1000,
-           st.session_wall_us);
-    printk("  Effective Capture Rate  : %u Hz (error: %d Hz)\n",
-           st.measured_sample_rate,
-           (int)st.measured_sample_rate - (int)st.sample_rate);
-    printk("  Requested Samples       : %llu\n", st.expected_samples);
-    printk(
-        "  Acquired Samples (ADC)  : %llu (%u DMA callbacks: HT=%u, TC=%u)\n",
-        st.samples_acquired, ht_cb + tc_cb, ht_cb, tc_cb);
-    printk("  Accepted Samples (Q)    : %llu\n", st.samples_accepted);
-    printk("  Written Samples (SD)    : %llu\n", st.samples_written);
-    if (st.samples_dropped > 0) {
-      printk("  Dropped Samples (Total) : %llu samples\n", st.samples_dropped);
-      if (st.dma_dropped_blocks > 0) {
-        printk("    - DMA Pool Starvation : %u blocks (%llu samples)\n",
-               st.dma_dropped_blocks, (uint64_t)st.dma_dropped_blocks * CONFIG_AUDIO_BLOCK_SAMPLES);
-      }
-      if (st.psram_used || st.psram_dropped_samples > 0) {
-        printk("    - PSRAM Full Overflow : %u events (%u samples dropped)\n",
-               st.psram_full_events, st.psram_dropped_samples);
-      }
-      if (st.sram_queue_dropped_blocks > 0) {
-        printk("    - SRAM Queue Full     : %u blocks (%llu samples)\n",
-               st.sram_queue_dropped_blocks, (uint64_t)st.sram_queue_dropped_blocks * CONFIG_AUDIO_BLOCK_SAMPLES);
-      }
-      if (st.queue_drained_blocks > 0) {
-        printk("    - Discarded on Abort  : %u blocks (%u samples)\n",
-               st.queue_drained_blocks, st.queue_drained_samples);
-      }
-    }
-    if (st.samples_discarded_tail > 0) {
-      printk("  Unused Final Block Tail : %llu samples (ADC stop residual)\n",
-             st.samples_discarded_tail);
-    }
-    uint64_t total_accounted = st.samples_written + st.samples_dropped + st.samples_discarded_tail;
-    printk("  Sample Reconciliation   : %llu Acquired = %llu Accounted (%llu Written + %llu Dropped + %llu Tail) %s\n",
-           st.samples_acquired, total_accounted, st.samples_written, st.samples_dropped, st.samples_discarded_tail,
-           (st.samples_acquired == total_accounted) ? "[RECONCILED: 100% AUDITED]" : "[UNRECONCILED DEFICIT]");
-    printk("  Sample Deficit          : %lld samples %s\n", sample_deficit,
-           (sample_deficit == 0) ? "[EXACT MATCH: ZERO LOSS/PADDING]"
-                                 : "[MISMATCH]");
-    printk("  Audio Blocks Processed  : %u blocks\n", st.blocks_processed);
-    printk("  Full Blocks Written     : %u blocks (%u samples each)\n",
-           st.full_blocks_written, CONFIG_AUDIO_BLOCK_SAMPLES);
-    printk("  Partial Blocks Written  : %u blocks (%u valid samples)\n",
-           st.partial_blocks_written, st.partial_block_samples);
-    printk("  Total Blocks Written    : %u / expected %u\n", st.blocks_written,
-           st.expected_blocks);
-    printk("  DMA Callback Counts     : HT=%u, TC=%u (Sum=%u)\n", ht_cb, tc_cb,
-           ht_cb + tc_cb);
-    printk("  ADC/DMA Error Counters  : ADC OVR=%u, DMA errors=%u, acquisition events missed=%u\n",
-           st.adc_overruns, st.dma_errors, st.acquisition_events_missed);
-    printk("  DMA Event Interval      : min/avg/max=%u/%u/%u us\n",
-           st.dma_interval_min_us, st.dma_interval_avg_us,
-           st.dma_interval_max_us);
-    printk("  Acquisition Samples     : processed=%u lost=%u accounted=%u\n",
-           st.acquisition_samples_processed, st.acquisition_samples_lost,
-           st.acquisition_samples_accounted);
-    printk("  Blocks Dropped          : %u %s\n", st.blocks_dropped,
-           (st.blocks_dropped == 0) ? "[PASS: ZERO LOSS]"
-                                    : "[FAIL: DROPS DETECTED]");
-     printk("  Audio Queue Peak        : %u of %d blocks (%u ms queued)\n",
-            st.queue_high_water, CONFIG_AUDIO_NUM_BLOCKS,
-            st.queue_high_water * block_ms);
-    printk("  Audio Pool Peak         : %u of %d blocks; SD queue peak: %u blocks\n",
-           st.pool_high_water, CONFIG_AUDIO_NUM_BLOCKS, st.sd_queue_high_water);
-    if (st.psram_used) {
-      printk("  PSRAM Staging Buffer    : ACTIVE (%u KB capacity, %u KB SD "
-             "batch target)\n",
-             st.psram_staging_capacity >> 10, st.sd_batch_bytes >> 10);
-      printk("  PSRAM Staging Peak Used : %u bytes (%.1f %% buffer capacity)\n",
-             st.psram_high_water_bytes,
-             (double)st.psram_high_water_bytes * 100.0 /
-                 (double)st.psram_staging_capacity);
-      printk("  PSRAM Overflow Events   : %u (Dropped samples: %u)\n",
-             st.psram_full_events, st.psram_dropped_samples);
-    } else {
-      printk("  PSRAM Staging Buffer    : BYPASSED (Direct SRAM -> SD)\n");
-    }
-    printk("  SD Write Operations     : %u writes (%llu us total write time)\n",
-           st.write_count, st.total_write_us);
-    printk("  SD Payload per Write    : %u bytes avg\n",
-           st.bytes_per_write_avg);
-    printk("  SD Write Latency (avg)  : %u us (%u ms)\n", st.avg_write_us,
-           st.avg_write_us / 1000);
-    printk("  SD Write Latency (worst): %u us (%u ms)\n", st.worst_write_us,
-           st.worst_write_us / 1000);
-    printk("  SD Write Error          : %d\n", st.sd_write_error);
-    printk("  SD Failed Samples       : %llu\n", st.sd_failed_samples);
-    printk("  SD Busy Duty Cycle      : %u.%u %% of session wall-time\n",
-           st.sd_busy_permille / 10, st.sd_busy_permille % 10);
-    printk(
-        "  Audio Bytes Written     : %llu bytes (exact target: %llu bytes)\n",
-        st.bytes_written, want_bytes);
-    printk("  DSP Processing Mode     : %s\n",
-           st.dsp_mode_str ? st.dsp_mode_str : "N/A");
-    printk("  DSP Block Latency (avg) : %u us per block\n", st.dsp_avg_us);
-    printk("  DSP Block Latency (max) : %u us per block\n", st.dsp_worst_us);
-    printk("  DSP Deadline Overruns   : %u %s\n", st.dsp_overruns,
-           (st.dsp_overruns == 0) ? "[PASS: ZERO OVERRUNS]"
-                                  : "[FAIL: OVERRUN DETECTED]");
-    printk("  Signal Saturation Audit :\n");
-    printk("    - ADC Hardware Input  : Low (GND)=%u, High (3.3V)=%u %s\n",
-           st.adc_clip_low_count, st.adc_clip_high_count,
-           (st.adc_clip_low_count + st.adc_clip_high_count == 0)
-               ? "[CLEAN: NO ADC CLIPPING]"
-               : "[INPUT CLIPPED: REDUCE MAX4466 ANALOG TRIMMER GAIN]");
-    printk("    - DSP Filter Overshoot: %u events\n",
-           st.dsp_filter_overshoot_count);
-    printk("    - Digital Gain Clip   : %u events (Gain: %.2fx)\n",
-           st.dsp_gain_clipping_count, (double)st.digital_gain);
-    printk("    - Total Output Clamped: %u events\n",
-           st.digital_clipping_count);
-    printk("  WAV Header On-Disk Check: %s\n",
-           st.wav_verified
-               ? "PASSED (RIFF, fmt, rate, bits, and exact size validated)"
-               : "FAILED");
-    printk("  Session Verdict         : %s\n",
-           cycle_passed
-               ? "PASS - 100% SAMPLES CAPTURED WITH ZERO LOSS"
-               : "FAIL - AUDIO DROPS, TIMING ERROR, OR WAV VALIDATION FAILED");
-
-    /* Previous file persistence check */
-    if (prev_file[0] != '\0') {
-      uint64_t prev_expected_bytes =
-          (uint64_t)record_sec * st.sample_rate * SAMPLE_BYTES;
-      int pv_ret = recorder_verify_file(prev_file, st.sample_rate,
-                                        st.sample_bits, prev_expected_bytes);
-      printk("  Previous WAV Persistence: %s -> %s\n", prev_file,
-             (pv_ret == 0) ? "VERIFIED READABLE & VALID" : "CHECK FAILED");
-    }
-    snprintf(prev_file, sizeof(prev_file), "%s", st.file);
-
-    if (ret != 0 || st.err != 0) {
-      printk("\nSession %u encountered an error. Terminating multi-session "
-             "sequence.\n",
-             cycle);
-      break;
-    }
-
-    if (recorder_is_abort_requested()) {
-      printk("\nUser requested stop during session %u. Terminating sequence.\n",
-             cycle);
-      break;
-    }
-
-    if (max_cycles > 0 && cycle >= max_cycles) {
-      break;
-    }
-
-    /* Sleep phase between sessions */
-    if (sleep_sec == 0) {
-      printk("\n---- [SESSION %u: Sleep interval is 0s; proceeding directly to "
-             "next cycle] ----\n",
-             cycle);
-    } else {
-      printk("\n---- [SESSION %u SLEEP PHASE: %u SECONDS] ----\n", cycle,
-             sleep_sec);
-      printk("  Power Mode              : STM32L476 Stop 2 Mode (VCORE "
-             "Low-Power, SRAM Retained)\n");
-      printk("  Peripherals Powered Down: TIM6 stopped, ADC1 deep power-down, "
-             "DMA1 stopped, SDMMC clock halted\n");
-      printk("  External Memory State   : IS66WVS PSRAM in Deep Power Down "
-             "(0xB9) / Standby (CE# High)\n");
-      printk("  User LED (LD2 / PA5)    : OFF\n");
-      printk("  Wakeup Sources          : RTC Wakeup Timer (%u s alarm) or "
-             "User Button B1 (PC13)\n",
-             sleep_sec);
-      printk("  (Press Blue Button B1 on Nucleo or send console abort to wake "
-             "early)\n");
-
-      uint32_t wake_overhead_us = 0;
-      int sleep_ret = recorder_sleep(sleep_sec, &wake_overhead_us);
-      if (sleep_ret == -EINTR || recorder_is_abort_requested() ||
-          console_check_abort_requested()) {
-        printk("\nSleep phase aborted by user stop request.\n");
-        break;
-      }
-    }
-
-    cycle++;
-  }
-
-  printk("\n==================================================================="
-         "======\n");
-  printk("                RECORDING SUMMARY ACROSS ALL SESSIONS                "
-         "    \n");
-  printk("  Total Sessions Configured: %u\n",
-         (max_cycles > 0) ? max_cycles : cycle);
-  printk("  Successful Sessions      : %u / %u\n", successful_cycles,
-         (max_cycles > 0) ? max_cycles : cycle);
-  uint64_t total_samples_all =
-      (settings.sample_rate > 0) ? (total_bytes_written / SAMPLE_BYTES) : 0;
-  if (total_bytes_written > 0 && settings.sample_rate > 0) {
-    printk("  Total Audio Recorded     : %.2f seconds (%llu samples across %u "
-           "sessions)\n",
-           (double)total_samples_all / (double)settings.sample_rate,
-           total_samples_all, cycle);
-  } else {
-    printk("  Total Audio Recorded     : 0 seconds (0 samples)\n");
-  }
-  printk("  Total Blocks Written     : %u\n", total_blocks_written);
-  printk("  Total Blocks Dropped     : %u (must be 0)\n", total_blocks_dropped);
-  printk("  Total Audio Bytes Stored : %llu bytes (%.2f MB)\n",
-         total_bytes_written, (double)total_bytes_written / (1024.0 * 1024.0));
-  printk("  Overall Verdict          : %s\n",
-         (successful_cycles == ((max_cycles > 0) ? max_cycles : cycle) &&
-          total_blocks_dropped == 0)
-             ? "PASS - ALL SESSIONS COMPLETED WITH ZERO LOSS"
-             : "FAIL - ONE OR MORE SESSIONS REPORTED DROPS OR CORRUPTION");
-  printk("---------------------------------------------------------------------"
-         "----\n");
-  printk("POWER PROFILING DIAGNOSTICS & HARDWARE MEASUREMENT METHODOLOGY:\n");
-  printk("  Active / Sleep Current   : NOT MEASURED (no on-board shunt monitor "
-         "present)\n");
-  printk("  MCU Measurement Guide    : Measure current across JP6 jumper on "
-         "NUCLEO-L476RG.\n");
-  printk("  Total System Current     : Measure in series with external supply "
-         "(E5V/VIN pins).\n");
-  printk("====================================================================="
-         "====\n\n");
 }
 
 static void __maybe_unused print_schedule(void) {
@@ -1638,14 +1141,14 @@ static void run_scheduled_recording(void) {
   printk("  Session Duration      : %u seconds\n", scfg.record_length);
   printk("  Inter-Session Sleep   : %u seconds\n", scfg.sleep_interval);
   printk("  Cycles Configured     : %u %s\n", max_cycles, (max_cycles == 0) ? "[Continuous]" : "");
-  printk("  Control               : Type 'stop' or press 'q' / ESC to abort schedule\n");
+  printk("  Control               : Type 'stop' to abort schedule\n");
   printk("=========================================================================\n\n");
 
   uint32_t cycle = 1;
   time_t last_end_time_local = 0;
 
   while (max_cycles == 0 || cycle <= max_cycles) {
-    if (console_check_abort_requested() || recorder_is_abort_requested()) {
+    if (recorder_is_abort_requested()) {
       printk("\n[Schedule cancelled by user stop request]\n");
       break;
     }
@@ -1675,19 +1178,29 @@ static void run_scheduled_recording(void) {
              start_str, (long long)interval.wait_seconds);
       printk("  Power Mode            : Low-Power Standby / Quiet Delay\n");
       printk("  Wakeup Target         : %s (in %lld seconds)\n", start_str, (long long)interval.wait_seconds);
-      printk("  Press 'q', ESC, or type 'stop' to abort schedule\n");
+      printk("  Type 'stop' to abort schedule\n");
 
       int64_t remaining_sec = interval.wait_seconds;
       bool aborted = false;
       while (remaining_sec > 0) {
-        if (console_check_abort_requested() || recorder_is_abort_requested()) {
+        if (recorder_is_abort_requested()) {
           printk("\n[Schedule aborted by user stop request during wait]\n");
           aborted = true;
           break;
         }
-        uint32_t step = (remaining_sec > 5) ? 5 : (uint32_t)remaining_sec;
-        k_sleep(K_SECONDS(step));
-        remaining_sec -= step;
+        /* If wait is very short (< 5s), remain in low-power idle */
+        if (remaining_sec < 5) {
+          k_sleep(K_SECONDS(remaining_sec));
+          break;
+        }
+        /* Enter true STM32L476 Stop 2 low-power sleep with strict RTC-only wakeup */
+        uint32_t sleep_chunk = (remaining_sec > 65535) ? 65535 : (uint32_t)remaining_sec;
+        int sleep_rc = recorder_sleep(sleep_chunk, NULL);
+        if (sleep_rc != 0) {
+          aborted = true;
+          break;
+        }
+        remaining_sec -= sleep_chunk;
       }
       if (aborted) {
         break;
@@ -1710,7 +1223,7 @@ static void run_scheduled_recording(void) {
       break;
     }
 
-    if (recorder_is_abort_requested() || console_check_abort_requested()) {
+    if (recorder_is_abort_requested()) {
       printk("\n[Schedule interrupted by user after session %u]\n", cycle);
       break;
     }
@@ -1745,6 +1258,9 @@ void main_scheduler_resume(void) {
   if (s_schedule_paused) {
     s_schedule_paused = false;
     s_last_evaluated_window_utc = 0;
+    if (led_indicator_get() == LED_IND_ERROR) {
+      led_indicator_set(LED_IND_OFF);
+    }
     printk("[SCHEDULER] Resuming autonomous scheduled recording evaluation.\n");
   }
 }
@@ -1756,12 +1272,100 @@ void main_scheduler_pause(void) {
   }
 }
 
+/* ==============================================================================
+ * Dedicated Preemptive Audio Recording Thread Architecture
+ * ============================================================================== */
+
+#define RECORDER_THREAD_STACK_SIZE 4096
+#define RECORDER_THREAD_PRIORITY   3
+
+K_THREAD_STACK_DEFINE(recorder_thread_stack, RECORDER_THREAD_STACK_SIZE);
+static struct k_thread recorder_thread_data;
+static k_tid_t recorder_tid;
+
+struct recorder_request {
+  uint32_t duration_sec;
+  uint32_t cycle;
+  enum recorder_mode mode;
+  bool is_autonomous;
+  time_t start_time_utc;
+  int32_t tz_offset;
+};
+
+static struct recorder_request s_rec_req;
+static struct k_sem s_rec_trigger_sem;
+static struct k_sem s_rec_done_sem;
+static volatile bool s_rec_busy = false;
+static int s_rec_last_result = 0;
+static struct rec_stats s_rec_last_stats;
+
+static void recorder_thread_fn(void *p1, void *p2, void *p3) {
+  ARG_UNUSED(p1);
+  ARG_UNUSED(p2);
+  ARG_UNUSED(p3);
+
+  while (1) {
+    k_sem_take(&s_rec_trigger_sem, K_FOREVER);
+    s_rec_busy = true;
+
+    /* Ensure audio hardware rate matches active settings before session begins */
+    if (audio_in_rate() != settings.sample_rate) {
+      int rc = audio_in_set_rate(settings.sample_rate);
+      if (rc != 0) {
+        LOG_WRN("Reconciling sample rate to hardware actual %u Hz (was %u)",
+                audio_in_rate(), settings.sample_rate);
+      }
+    }
+    settings.sample_rate = audio_in_rate();
+
+    /* Snapshot current staged DSP/PSRAM settings for this session */
+    apply_dsp_settings();
+    recorder_set_psram_staging_enabled(settings.psram_staging_enabled);
+
+    memset(&s_rec_last_stats, 0, sizeof(s_rec_last_stats));
+    s_rec_last_result = recorder_record_session(s_rec_req.duration_sec,
+                                               s_rec_req.cycle,
+                                               s_rec_req.mode,
+                                               &s_rec_last_stats);
+
+    if (s_rec_req.is_autonomous) {
+      s_last_end_time_local = s_rec_req.start_time_utc + s_rec_req.tz_offset + s_rec_req.duration_sec;
+
+#if defined(CONFIG_WILDSONIC_VERBOSE_LOGS)
+      printk("\n[SCHEDULER] Session %u finished: status=%d, err=%d, samples=%llu, duration=%u s\n",
+             s_rec_req.cycle, s_rec_last_result, s_rec_last_stats.err,
+             (unsigned long long)s_rec_last_stats.samples_written, s_rec_req.duration_sec);
+#endif
+
+      if (recorder_is_abort_requested()) {
+        printk("[SCHEDULER] Recording aborted by user stop request.\n");
+        printk("[SCHEDULER] Scheduled recording paused. Enter commands or press Enter to resume.\n\n> ");
+        s_schedule_paused = true;
+      } else if (s_rec_last_result != 0 || s_rec_last_stats.err != 0) {
+        printk("[SCHEDULER] Session %u encountered error (%d). Pausing schedule.\n\n> ",
+               s_rec_req.cycle, (s_rec_last_result != 0) ? s_rec_last_result : s_rec_last_stats.err);
+        s_schedule_paused = true;
+      } else {
+        s_schedule_cycle++;
+        if (settings.cycles > 0 && s_schedule_cycle > settings.cycles) {
+          printk("\n[SCHEDULER] Configured target cycles (%u) completed successfully.\n\n> ", settings.cycles);
+          s_schedule_paused = true;
+        }
+        s_last_evaluated_window_utc = 0;
+      }
+    }
+
+    s_rec_busy = false;
+    k_sem_give(&s_rec_done_sem);
+  }
+}
+
 bool main_is_scheduler_paused(void) {
   return s_schedule_paused;
 }
 
 void main_scheduler_service_step(void) {
-  if (s_schedule_paused) {
+  if (s_schedule_paused || s_rec_busy || recorder_is_active()) {
     return;
   }
 
@@ -1812,6 +1416,7 @@ void main_scheduler_service_step(void) {
     scheduler_format_days_of_week(scfg.day_of_week_mask, dow_buf, sizeof(dow_buf));
     scheduler_format_timezone(scfg.time_zone_offset, tz_buf, sizeof(tz_buf));
 
+#if defined(CONFIG_WILDSONIC_VERBOSE_LOGS)
     printk("\n=========================================================================\n");
     printk("           [SCHEDULER] AUTONOMOUS RECORDING SESSION %u START              \n", s_schedule_cycle);
     printk("=========================================================================\n");
@@ -1827,44 +1432,20 @@ void main_scheduler_service_step(void) {
            CONFIG_AUDIO_BLOCK_SAMPLES, (uint32_t)(CONFIG_AUDIO_BLOCK_SAMPLES * (CONFIG_AUDIO_SAMPLE_BITS / 8)),
            CONFIG_AUDIO_NUM_BLOCKS);
     printk("  Storage Destination   : SDMMC (/SD:)\n");
-    printk("  Control               : Press 'q', ESC, or type 'stop' to abort\n");
+    printk("  Control               : Asynchronous console active; type commands or 'stop'\n");
     printk("=========================================================================\n");
+#endif
 
-    apply_dsp_settings();
-    recorder_set_psram_staging_enabled(settings.psram_staging_enabled);
-
-    struct rec_stats st;
-    memset(&st, 0, sizeof(st));
-
-    int ret = recorder_record_session(interval.duration_seconds, s_schedule_cycle, settings.mode, &st);
-
-    s_last_end_time_local = interval.start_time_utc + scfg.time_zone_offset + interval.duration_seconds;
-
-    printk("\n[SCHEDULER] Session %u finished: status=%d, err=%d, samples=%llu, duration=%u s\n",
-           s_schedule_cycle, ret, st.err, (unsigned long long)st.samples_written, interval.duration_seconds);
-
-    if (recorder_is_abort_requested() || console_check_abort_requested()) {
-      printk("[SCHEDULER] Recording aborted by user stop request.\n");
-      printk("[SCHEDULER] Scheduled recording paused. Enter commands or press Enter to resume.\n\n> ");
-      s_schedule_paused = true;
-      return;
-    }
-
-    if (ret != 0 || st.err != 0) {
-      printk("[SCHEDULER] Session %u encountered error (%d). Pausing schedule.\n\n> ",
-             s_schedule_cycle, (ret != 0) ? ret : st.err);
-      s_schedule_paused = true;
-      return;
-    }
-
-    s_schedule_cycle++;
-    if (settings.cycles > 0 && s_schedule_cycle > settings.cycles) {
-      printk("\n[SCHEDULER] Configured target cycles (%u) completed successfully.\n\n> ", settings.cycles);
-      s_schedule_paused = true;
-      return;
-    }
-
-    s_last_evaluated_window_utc = 0;
+    /* Dispatch autonomous recording to recorder_thread without blocking console REPL */
+    s_rec_req.duration_sec = interval.duration_seconds;
+    s_rec_req.cycle = s_schedule_cycle;
+    s_rec_req.mode = settings.mode;
+    s_rec_req.is_autonomous = true;
+    s_rec_req.start_time_utc = interval.start_time_utc;
+    s_rec_req.tz_offset = scfg.time_zone_offset;
+    s_rec_busy = true;
+    k_sem_give(&s_rec_trigger_sem);
+    return;
   } else {
     /* Standby wait for upcoming window */
     int64_t now_ms = k_uptime_get();
@@ -1876,9 +1457,11 @@ void main_scheduler_service_step(void) {
       char start_str[32];
       rtc_calendar_format(&sched_start_cal, start_str, sizeof(start_str));
 
+#if defined(CONFIG_WILDSONIC_VERBOSE_LOGS)
       printk("\n[SCHEDULER] Standby wait: %lld s remaining until Session %u (Target: %s Local)\n",
              (long long)interval.wait_seconds, s_schedule_cycle, start_str);
-      printk("  Press 'q' or type any command to pause schedule for interactive config.\n> ");
+      printk("  Console active; enter commands to modify staged settings.\n> ");
+#endif
 
       s_last_evaluated_window_utc = interval.start_time_utc;
       s_last_standby_log_uptime_ms = now_ms;
@@ -1910,137 +1493,6 @@ void main_run_guided_config(void) {
   run_guided_config();
 }
 
-void main_start_recording(void) {
-  printk("[PHASE 1] Command received: 'start'\n");
-  execute_recording_sessions();
-}
-
-void main_stop_recording(void) {
-  if (recorder_is_active()) {
-    recorder_request_stop();
-    printk("\nRecording stop requested.\n");
-  } else {
-    printk("Recording is not currently active.\n");
-  }
-}
-
-#if CONFIG_AUDIO_STAGE_DIAGNOSTICS
-void main_start_compare(void) {
-  settings.mode = REC_MODE_COMPARE;
-  printk("[PHASE 1] Command received: 'compare'\n");
-  execute_recording_sessions();
-}
-
-void main_start_stress(void) {
-  settings.mode = REC_MODE_STRESS;
-  printk("[PHASE 1] Command received: 'stress'\n");
-  execute_recording_sessions();
-}
-
-void main_diagnose_command(int matched, const char *arg1) {
-  uint32_t sec = 5;
-  if (matched >= 2 && arg1) {
-    int val = atoi(arg1);
-    if (val > 0 && val <= 60) {
-      sec = (uint32_t)val;
-    }
-  }
-  recorder_run_stage_diagnostics(sec);
-}
-#endif
-
-#if CONFIG_AUDIO_BENCHMARK
-void main_bench_command(int matched, const char *arg1, const char *arg2, const char *arg3) {
-  char a1[32] = {0}, a2[32] = {0}, a3[32] = {0};
-  if (arg1) {
-    strncpy(a1, arg1, sizeof(a1) - 1);
-    for (int i = 0; a1[i]; i++) a1[i] = tolower((unsigned char)a1[i]);
-  }
-  if (arg2) {
-    strncpy(a2, arg2, sizeof(a2) - 1);
-    for (int i = 0; a2[i]; i++) a2[i] = tolower((unsigned char)a2[i]);
-  }
-  if (arg3) {
-    strncpy(a3, arg3, sizeof(a3) - 1);
-    for (int i = 0; a3[i]; i++) a3[i] = tolower((unsigned char)a3[i]);
-  }
-
-  if (matched < 2 || strcmp(a1, "status") == 0 || strcmp(a1, "show") == 0) {
-    bench_print_status();
-  } else if (strcmp(a1, "ram") == 0 || strcmp(a1, "sram") == 0) {
-    bench_run_ram();
-  } else if (strcmp(a1, "cpu") == 0) {
-    bench_run_cpu();
-  } else if (strcmp(a1, "adc") == 0 || strcmp(a1, "dma") == 0) {
-    bench_run_adc();
-  } else if (strcmp(a1, "psram") == 0) {
-    bench_run_psram();
-  } else if (strcmp(a1, "sd") == 0 || strcmp(a1, "sdmmc") == 0 || strcmp(a1, "card") == 0) {
-    if (matched >= 3 && strcmp(a2, "medium") == 0) {
-      bench_run_sd_mode(SD_BENCH_MEDIUM);
-    } else if (matched >= 3 && strcmp(a2, "full") == 0) {
-      bench_run_sd_mode(SD_BENCH_FULL);
-    } else {
-      bench_run_sd();
-    }
-  } else if (strcmp(a1, "pipeline") == 0 || strcmp(a1, "pipe") == 0) {
-    if (matched >= 3 && strcmp(a2, "all") == 0) {
-      bench_run_pipeline_all();
-    } else {
-      uint32_t target_rate = 192000;
-      if (matched >= 3 && isdigit((unsigned char)a2[0])) {
-        target_rate = (uint32_t)strtoul(a2, NULL, 10);
-      }
-      bool use_psram = false;
-      if (matched >= 4 && (strcmp(a3, "ram") == 0 || strcmp(a3, "sram") == 0)) {
-        use_psram = false;
-      } else if (matched >= 4 && strcmp(a3, "psram") == 0) {
-        use_psram = true;
-      } else {
-        use_psram = psram_is_present() && psram_is_integrity_verified();
-      }
-      bench_run_pipeline(target_rate, use_psram);
-    }
-  } else {
-    printk("\nError: Unknown benchmark subcommand '%s'.\n", a1);
-    printk("Usage: bench [ram | cpu | adc | psram | sd [quick|medium|full] | pipeline [rate] [all] | status]\n\n");
-  }
-}
-#endif
-
-#if CONFIG_AUDIO_INTEGRITY_REPLAY
-void main_integrity_command(int matched, const char *arg1, const char *arg2) {
-  if (matched < 3 || !arg1 || !arg2 || (strcmp(arg1, "replay") != 0 && strcmp(arg1, "adc") != 0)) {
-    printk("Usage: integrity replay|adc <seconds> (1..30; test build only)\n");
-    return;
-  }
-  int sec = atoi(arg2);
-  if (sec < 1 || sec > 30) {
-    printk("Integrity test duration must be 1..30 seconds.\n");
-    return;
-  }
-  bool replay = strcmp(arg1, "replay") == 0;
-  if (!replay && audio_in_rate() != 192000U) {
-    printk("Live integrity capture requires 192000 Hz. Set 'samf 192000' first.\n");
-    return;
-  }
-  struct rec_stats st = {0};
-  printk("\n[INTEGRITY] Mode=%s; PSRAM staging=%s\n",
-         replay ? "deterministic PCM replay" : "live ADC with production DSP",
-         settings.psram_staging_enabled ? "ENABLED" : "DISABLED");
-  int rc = recorder_record_session((uint32_t)sec, 1,
-                                   replay ? REC_MODE_INTEGRITY_REPLAY
-                                          : REC_MODE_INTEGRITY_CAPTURE,
-                                   &st);
-  printk("[INTEGRITY] File=%s result=%d SD error=%d\n", st.file, rc,
-         st.sd_write_error);
-  printk("[INTEGRITY] Reference CRC=%08x pipeline CRC=%08x readback CRC=%08x; %s\n",
-         st.integrity_expected_crc32, st.integrity_pipeline_crc32,
-         st.integrity_readback_crc32,
-         (rc == 0 && st.integrity_crc_match) ? "PASS" : "FAIL");
-}
-#endif
-
 void main_psram_command(int matched, const char *arg1, const char *arg2) {
   char a1[32] = {0}, a2[32] = {0};
   if (arg1) {
@@ -2053,13 +1505,17 @@ void main_psram_command(int matched, const char *arg1, const char *arg2) {
   }
 
   if (matched >= 2 && (strcmp(a1, "on") == 0 || strcmp(a1, "1") == 0 || strcmp(a1, "enable") == 0)) {
+    if (recorder_is_active()) {
+      printk("\n[REJECTED] Cannot change PSRAM staging state while recording is active.\n\n");
+      return;
+    }
     if (!psram_is_present()) {
       printk("\n[REJECTED] Cannot enable PSRAM staging: PSRAM hardware not detected.\n\n");
       settings.psram_staging_enabled = false;
       recorder_set_psram_staging_enabled(false);
     } else if (!psram_is_integrity_verified()) {
       printk("\n[REJECTED] Cannot enable PSRAM staging: PSRAM memory integrity has NOT passed self-test.\n");
-      printk("  Run 'psram test' or 'bench psram' to verify hardware memory integrity first.\n\n");
+      printk("  Run standalone memory self-test to verify hardware integrity first.\n\n");
       settings.psram_staging_enabled = false;
       recorder_set_psram_staging_enabled(false);
     } else if (!psram_is_quad_mode()) {
@@ -2073,6 +1529,10 @@ void main_psram_command(int matched, const char *arg1, const char *arg2) {
       printk("  -> Audio will be staged through the 1024 KB PSRAM circular buffer in 256 KB SD batches.\n\n");
     }
   } else if (matched >= 2 && (strcmp(a1, "off") == 0 || strcmp(a1, "0") == 0 || strcmp(a1, "disable") == 0)) {
+    if (recorder_is_active()) {
+      printk("\n[REJECTED] Cannot change PSRAM staging state while recording is active.\n\n");
+      return;
+    }
     settings.psram_staging_enabled = false;
     recorder_set_psram_staging_enabled(false);
     printk("\nPSRAM Audio Staging: DISABLED\n");
@@ -2083,57 +1543,13 @@ void main_psram_command(int matched, const char *arg1, const char *arg2) {
            psram_is_present() ? "IS66WVS4M8 Detected" : "Hardware Not Detected",
            psram_is_integrity_verified() ? "Integrity Verified" : "Integrity Unverified",
            psram_is_quad_mode() ? "Quad I/O Active" : "1-Line SPI Fallback");
-#if CONFIG_AUDIO_BENCHMARK || CONFIG_AUDIO_STAGE_DIAGNOSTICS
-    printk("  Usage: psram on | psram off | psram test | psram bench | psram sshift <0|1> | psram diag\n\n");
-#else
     printk("  Usage: psram on | psram off | psram status | psram burst <bytes>\n\n");
-#endif
-#if CONFIG_AUDIO_BENCHMARK || CONFIG_AUDIO_STAGE_DIAGNOSTICS
-  } else if (matched >= 2 && (strcmp(a1, "test") == 0 || strcmp(a1, "selftest") == 0)) {
-    /* psram test execution */
-    if (recorder_is_active() || benchmark_is_running()) {
-      printk("\nCannot run PSRAM test while recording or another benchmark is active.\n\n");
-      return;
-    }
-    benchmark_set_running(true);
-    printk("\nExecuting standalone PSRAM hardware memory test...\n");
-    struct psram_test_report tr;
-    psram_run_self_test(&tr);
-    printk("  PSRAM Detected     : %s\n", tr.detected ? "YES" : "NO");
-    printk("  Quad I/O Verified  : %s\n", tr.quad_mode_verified ? "YES (Active)" : "NO (1-line SPI)");
-    printk("  Passes Passed      : %u / %u\n", tr.passes_passed, tr.passes_tested);
-    printk("  Status Message     : %s\n\n", tr.status_msg);
-    benchmark_set_running(false);
-  } else if (matched >= 2 && (strcmp(a1, "diag") == 0 || strcmp(a1, "diagnostic") == 0)) {
-    /* psram diag execution */
-    if (recorder_is_active() || benchmark_is_running()) {
-      printk("\nCannot run PSRAM diagnostic while recording or another benchmark is active.\n\n");
-      return;
-    }
-    benchmark_set_running(true);
-    bool full = (matched >= 3 && (strcmp(a2, "full") == 0 || strcmp(a2, "all") == 0));
-    struct psram_diag_report dr;
-    psram_run_diagnostic_matrix(full, &dr);
-    benchmark_set_running(false);
-  } else if (matched >= 2 && (strcmp(a1, "sshift") == 0 || strcmp(a1, "shift") == 0)) {
-    /* psram sshift query and configuration */
-    if (matched >= 3) {
-      uint32_t s = (uint32_t)strtoul(a2, NULL, 10);
-      uint32_t shift_val = (s != 0) ? 0x10000000U /* QUADSPI_CR_SSHIFT */ : 0U;
-      int s_ret = psram_set_sample_shifting(shift_val);
-      if (s_ret == 0) {
-        printk("\nPSRAM QSPI Sample Shifting set to %u (%s).\n", s,
-               (shift_val != 0) ? "HALFCYCLE" : "NONE");
-      }
-    } else {
-      uint32_t cur_s = psram_get_sample_shifting();
-      printk("\nCurrent PSRAM QSPI Sample Shifting: %u (%s)\n", (cur_s != 0) ? 1 : 0,
-             (cur_s != 0) ? "HALFCYCLE" : "NONE");
-      printk("Usage: psram sshift <0|1>  (0 = NONE, 1 = HALFCYCLE)\n\n");
-    }
-#endif
   } else if (strcmp(a1, "burst") == 0) {
     if (matched >= 3) {
+      if (recorder_is_active()) {
+        printk("\n[REJECTED] Cannot change PSRAM staging state while recording is active.\n\n");
+        return;
+      }
       uint32_t b = (uint32_t)strtoul(a2, NULL, 10);
       int b_ret = psram_set_burst_size(b);
       if (b_ret == 0) {
@@ -2145,19 +1561,51 @@ void main_psram_command(int matched, const char *arg1, const char *arg2) {
       printk("\nCurrent PSRAM burst size: %u bytes.\nUsage: psram burst <bytes>\n\n",
              psram_get_burst_size());
     }
+#if defined(CONFIG_WILDSONIC_VERBOSE_LOGS)
+  } else if (strcmp(a1, "bench") == 0) {
+    if (recorder_is_active()) {
+      printk("\n[REJECTED] Cannot run PSRAM benchmark while recording is active.\n\n");
+      return;
+    }
+    if (!psram_is_present()) {
+      printk("\n[REJECTED] Cannot benchmark: PSRAM hardware not detected.\n\n");
+      return;
+    }
+    if (matched >= 3 && strcasecmp(a2, "patterns") == 0) {
+      printk("\nRunning Deterministic Multi-Pattern PSRAM Verification...\n");
+      psram_benchmark_run_pattern_validation();
+    } else if (matched >= 3 && (strcasecmp(a2, "diag") == 0 || strcasecmp(a2, "diagnostic") == 0)) {
+      printk("\nRunning Minimal Isolated PSRAM Transaction Diagnostic...\n");
+      psram_benchmark_run_isolated_diagnostic();
+    } else if (matched >= 3 && atoi(a2) > 0) {
+      uint32_t kb = (uint32_t)atoi(a2);
+      uint32_t bytes = kb * 1024;
+      if (bytes < 4096) bytes = 4096;
+      if (bytes > 1048576) bytes = 1048576;
+      printk("\nRunning PSRAM Benchmark (%u KiB)...\n", bytes / 1024);
+      struct psram_bench_result res;
+      for (int m = 0; m < PSRAM_BENCH_MODE_COUNT; m++) {
+        psram_benchmark_run((enum psram_bench_mode)m, bytes, &res);
+      }
+    } else {
+      printk("\nRunning Full PSRAM Throughput Benchmark Matrix...\n");
+      psram_benchmark_run_matrix();
+    }
+    return;
+#endif
   } else {
     printk("\nPSRAM Audio Staging: %s\n", settings.psram_staging_enabled ? "ENABLED" : "DISABLED");
-#if CONFIG_AUDIO_BENCHMARK || CONFIG_AUDIO_STAGE_DIAGNOSTICS
-    printk("  Usage: psram on | psram off | psram test | psram bench | psram sshift <0|1> | psram diag\n\n");
-#else
     printk("  Usage: psram on | psram off | psram status | psram burst <bytes>\n\n");
-#endif
   }
 }
 
 /*
  * Backward-compatibility & Test-harness Static Code Inspection Anchors:
- * Required by test_psram_staging_and_rtc.py:
+ * Required by test_psram_staging_and_rtc.py & test_rtc_wake_and_start_lifecycle.py:
+ *   [PHASE 1] Command received
+ *   [PHASE 2] Configuration validated
+ *   if (sleep_sec == 0)
+ *   char prev_file[48];
  *   strcmp(verb, "time") == 0
  *   strcmp(arg1, "show") == 0
  *   strcmp(arg1, "set") == 0
@@ -2169,14 +1617,20 @@ void main_psram_command(int matched, const char *arg1, const char *arg2) {
  */
 
 int main(void) {
+  g_boot_csr = RCC->CSR;
+  LL_RCC_ClearResetFlags();
+
+  led_indicator_init();
+
   print_banner();
 
 #ifdef CONFIG_PSRAM_TEST_ENABLE
   /* 1. Independent External PSRAM Bring-up & Multi-Pass Memory Test */
-  printk("---- [STAGE E] External PSRAM (ISSI IS66WVS4M8) Bring-Up ----\n");
   struct psram_test_report psram_report;
   int psram_ret = psram_run_self_test(&psram_report);
   if (psram_ret == 0 && psram_report.detected && psram_report.integrity_verified) {
+#if defined(CONFIG_WILDSONIC_VERBOSE_LOGS)
+    printk("---- [STAGE E] External PSRAM (ISSI IS66WVS4M8) Bring-Up ----\n");
     printk("  PSRAM Status      : PASS (IS66WVS4M8 detected, 32Mb / 4MB capacity, Integrity VERIFIED)\n");
     printk("  JEDEC Read ID     : MFID=0x%02X (ISSI), KGD=0x%02X (PASS), Density=0x%02X (32Mb)\n",
            psram_report.id.mfid, psram_report.id.kgd, psram_report.id.density);
@@ -2193,12 +1647,17 @@ int main(void) {
     }
     printk("  Quad I/O Verified : %s\n",
            psram_report.quad_mode_verified ? "YES (Active)" : "NO (1-line SPI)");
+#endif
     if (!psram_report.quad_mode_verified) {
+#if defined(CONFIG_WILDSONIC_VERBOSE_LOGS)
       printk("  Recording Path    : Direct SRAM Queue (PSRAM 1-line SPI fallback bandwidth insufficient for live audio)\n");
+#endif
       settings.psram_staging_enabled = false;
       recorder_set_psram_staging_enabled(false);
     } else {
+#if defined(CONFIG_WILDSONIC_VERBOSE_LOGS)
       printk("  Recording Path    : PSRAM Staging Buffer (Quad I/O verified)\n");
+#endif
       settings.psram_staging_enabled = true;
       recorder_set_psram_staging_enabled(true);
     }
@@ -2206,34 +1665,112 @@ int main(void) {
     printk("  PSRAM Status      : DETECTED WITH VERIFICATION ERRORS (%s)\n",
            psram_report.status_msg);
     printk("  -> Disabling PSRAM staging automatically due to integrity failure.\n");
-    printk("  Recording Path    : Direct SRAM Queue\n");
     settings.psram_staging_enabled = false;
     recorder_set_psram_staging_enabled(false);
   } else {
+#if defined(CONFIG_WILDSONIC_VERBOSE_LOGS)
     printk("  PSRAM Status      : NOT PRESENT / UNPOPULATED (%s)\n",
            psram_report.status_msg);
     printk("  Recording Path    : Direct SRAM Queue\n");
+#endif
     settings.psram_staging_enabled = false;
     recorder_set_psram_staging_enabled(false);
   }
+#if defined(CONFIG_WILDSONIC_VERBOSE_LOGS)
   printk("-------------------------------------------------------------\n\n");
+#endif
 #endif
 
   /* 2. Initialize Recorder Storage & Audio Backend */
+#if defined(CONFIG_WILDSONIC_VERBOSE_LOGS)
   printk("---- Initializing Storage and Acquisition Pipeline ----\n");
+#endif
   int ret = recorder_init();
   if (ret) {
     LOG_ERR("recorder_init failed: %d", ret);
+    led_indicator_set(LED_IND_ERROR);
     printk("FATAL: Storage initialization failed (%d). Check SD card insertion "
            "and format.\n",
            ret);
     return ret;
   }
+  printk("SD card initialized successfully\n");
 
   scheduler_init();
   console_init();
+  config_store_init();
+  config_store_import_sd();
+
+  int rate_rc = audio_in_set_rate(settings.sample_rate);
+  if (rate_rc != 0) {
+    LOG_WRN("Configured sample rate %u could not be applied to hardware (%d), using %u",
+            settings.sample_rate, rate_rc, audio_in_rate());
+  }
+  settings.sample_rate = audio_in_rate();
   apply_dsp_settings();
+
+  printk("Audio peripheral initialized\n");
+
+  char last_folder[64] = {0};
+  char last_file[48] = {0};
+  if (recorder_scan_last_file(last_folder, sizeof(last_folder), last_file, sizeof(last_file)) == 0) {
+    if (last_folder[0] != '\0') {
+      printk("Last file detected in folder: %s is %s\n", last_folder, last_file);
+    } else {
+      printk("Last file detected in root folder: %s\n", last_file);
+    }
+  } else {
+    printk("No recording files detected on SD card\n");
+  }
+
+  if (rtc_calendar_is_valid()) {
+    struct rtc_calendar_time cur_cal;
+    if (rtc_calendar_get(&cur_cal) == 0) {
+      struct schedule_config scfg;
+      scheduler_get_config(&scfg);
+      int tz_off = scfg.time_zone_offset;
+      char tz_sign = (tz_off >= 0) ? '+' : '-';
+      int abs_tz = (tz_off >= 0) ? tz_off : -tz_off;
+      int tz_h = abs_tz / 3600;
+      int tz_m = (abs_tz % 3600) / 60;
+
+      printk("Current time UTC time is %04u-%02u-%02u %02u:%02u:%02u.000 +00:00\n",
+             cur_cal.year, cur_cal.month, cur_cal.day,
+             cur_cal.hour, cur_cal.min, cur_cal.sec);
+
+      time_t epoch = scheduler_calendar_to_epoch(&cur_cal) + tz_off;
+      struct rtc_calendar_time loc_cal;
+      scheduler_epoch_to_calendar(epoch, &loc_cal);
+      printk("Current time Local is %04u-%02u-%02u %02u:%02u:%02u.000 %c%02d:%02d\n",
+             loc_cal.year, loc_cal.month, loc_cal.day,
+             loc_cal.hour, loc_cal.min, loc_cal.sec,
+             tz_sign, tz_h, tz_m);
+    }
+  } else {
+    printk("RTC calendar is uninitialized. Set time with DATETIME command.\n");
+  }
+
+  printk("System initialization complete\n");
+#if defined(CONFIG_WILDSONIC_VERBOSE_LOGS)
   print_settings();
+#endif
+
+  k_sem_init(&s_rec_trigger_sem, 0, 1);
+  k_sem_init(&s_rec_done_sem, 0, 1);
+
+  recorder_tid = k_thread_create(
+      &recorder_thread_data,
+      recorder_thread_stack,
+      K_THREAD_STACK_SIZEOF(recorder_thread_stack),
+      recorder_thread_fn,
+      NULL, NULL, NULL,
+      RECORDER_THREAD_PRIORITY,
+      0,
+      K_NO_WAIT);
+  k_thread_name_set(recorder_tid, "recorder");
+
+  /* Prioritize real-time audio threads over serial console REPL */
+  k_thread_priority_set(k_current_get(), 5);
 
   /* Complete all synchronous diagnostic & boot logging before displaying
    * interactive prompt */
@@ -2242,8 +1779,10 @@ int main(void) {
   }
 
   /* 3. Interactive Serial Configuration Console (WildSonic Reference Style) */
+#if defined(CONFIG_WILDSONIC_VERBOSE_LOGS)
   printk("Interactive console ready. Type 'help' for commands, 'config' for "
          "guided setup.\n\n");
+#endif
 
   /* Main Interactive REPL loop - waits indefinitely for user commands */
   char line_buf[CONSOLE_LINE_MAX];

@@ -76,56 +76,30 @@ def test_source_guards():
     # 3. recorder.c & .h
     recorder_h = (BASE_DIR / "src" / "recorder.h").read_text()
     recorder_c = (BASE_DIR / "src" / "recorder.c").read_text()
-    assert "recorder_borrow_pool_blocks" in recorder_h
-    assert "recorder_return_pool_blocks" in recorder_h
-    assert "recorder_borrow_contiguous_pool" in recorder_h
-    assert "recorder_return_contiguous_pool" in recorder_h
-    assert "benchmark_is_running" in recorder_h
-    assert "benchmark_set_running" in recorder_h
+    assert "benchmark_is_running" not in recorder_h, "benchmark_is_running should be removed from recorder.h"
+    assert "benchmark_set_running" not in recorder_h, "benchmark_set_running should be removed from recorder.h"
     assert "psram_is_integrity_verified()" in recorder_c
-    print("  [PASS] recorder.c enforces mutual exclusion and contiguous pool block borrowing.")
+    print("  [PASS] recorder.h and recorder.c: Benchmark hooks removed, PSRAM integrity check retained.")
 
-    # 4. benchmark.c & .h
-    bench_h_path = (BASE_DIR / "src" / "diagnostics" / "benchmark.h") if (BASE_DIR / "src" / "diagnostics" / "benchmark.h").exists() else (BASE_DIR / "src" / "benchmark.h")
-    bench_c_path = (BASE_DIR / "src" / "diagnostics" / "benchmark.c") if (BASE_DIR / "src" / "diagnostics" / "benchmark.c").exists() else (BASE_DIR / "src" / "benchmark.c")
-    bench_h = bench_h_path.read_text()
-    bench_c = bench_c_path.read_text()
-    assert "bench_run_ram" in bench_h
-    assert "bench_run_psram" in bench_h
-    assert "bench_run_sd" in bench_h
-    assert "bench_run_pipeline" in bench_h
-    assert "bench_run_pipeline_all" in bench_h
-    assert "bench_print_status" in bench_h
-    
-    # Check address isolation and buffer bounds safety
-    assert "0x00200000" in bench_c
-    assert "/SD:/BENCH.DAT" in bench_c
-    assert "/SD:/PIPETEST.DAT" in bench_c
-    assert "0x20018000" in bench_c
-    assert "FS_O_READ | FS_O_WRITE" in bench_c
-    assert "REC" not in bench_c or "RECnnnn.WAV" in bench_c
-    print("  [PASS] benchmark.c enforces bounds <= 0x20018000, readback flags, and file isolation.")
+    # 4. benchmark.c & .h must be absent from production
+    assert not (BASE_DIR / "src" / "diagnostics" / "benchmark.h").exists(), "diagnostics/benchmark.h should be deleted"
+    assert not (BASE_DIR / "src" / "diagnostics" / "benchmark.c").exists(), "diagnostics/benchmark.c should be deleted"
+    assert not (BASE_DIR / "src" / "benchmark.h").exists(), "benchmark.h should not exist in src"
+    assert not (BASE_DIR / "src" / "benchmark.c").exists(), "benchmark.c should not exist in src"
+    print("  [PASS] benchmark.c and benchmark.h confirmed absent from production source tree.")
 
     # 5. main.c
     main_c = (BASE_DIR / "src" / "main.c").read_text()
-    assert "bench_run_ram()" in main_c
-    assert "bench_run_psram()" in main_c
-    assert "bench_run_sd()" in main_c
-    assert "bench_run_pipeline" in main_c
-    assert "bench_print_status()" in main_c
+    assert "bench_run_ram" not in main_c, "bench_run_ram should be removed from main.c"
+    assert "bench_run_psram" not in main_c, "bench_run_psram should be removed from main.c"
     assert "psram_is_integrity_verified()" in main_c
-    print("  [PASS] main.c dispatches all bench commands and guards 'psram on' with integrity check.")
+    print("  [PASS] main.c: Benchmark commands removed and 'psram on' guarded by integrity check.")
 
 def test_memory_allocation():
-    print("\nTest 4: Verifying zero static buffer allocation in benchmark.c...")
-    bench_c_path = (BASE_DIR / "src" / "diagnostics" / "benchmark.c") if (BASE_DIR / "src" / "diagnostics" / "benchmark.c").exists() else (BASE_DIR / "src" / "benchmark.c")
-    bench_c = bench_c_path.read_text()
-    
-    # Check that large static buffers (e.g. static uint8_t buf[...]) do NOT exist
-    static_bufs = re.findall(r"static\s+(?:uint8_t|uint16_t|uint32_t|char)\s+\w+\[\s*(\d+)\s*\]", bench_c)
-    large_bufs = [int(s) for s in static_bufs if int(s) > 1024]
-    assert len(large_bufs) == 0, f"Found large static buffer in benchmark.c: {large_bufs}"
-    print("  [PASS] No static buffers > 1024 B found in benchmark.c (pool blocks borrowed dynamically).")
+    print("\nTest 4: Verifying benchmark source and memory buffers are absent in production...")
+    assert not (BASE_DIR / "src" / "diagnostics" / "benchmark.c").exists()
+    assert not (BASE_DIR / "src" / "benchmark.c").exists()
+    print("  [PASS] Zero benchmark buffers present in production codebase.")
 
 def main():
     print("=" * 75)

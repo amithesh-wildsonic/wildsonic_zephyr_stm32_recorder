@@ -1,0 +1,19 @@
+{
+	"folders": [
+		{
+			"path": "../.."
+		},
+		{
+			"name": "zephyrproject",
+			"path": "../../../../zephyrproject"
+		},
+		{
+			"name": "app",
+			"path": ".."
+		}
+	],
+	"settings": {
+		"terminal.integrated.stickyScroll.enabled": false,
+		"stm32cube-ide-clangd.path": "cube"
+	}
+}

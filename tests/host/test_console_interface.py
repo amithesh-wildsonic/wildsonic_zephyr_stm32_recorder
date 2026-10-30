@@ -100,18 +100,10 @@ def test_deferred_hardware_commands_explicitly_handled():
 # ==============================================================================
 
 def test_production_excludes_test_commands():
-    """Verify test commands are guarded by Kconfig in console.c and absent from production."""
+    """Verify test commands are completely absent from production console lookup table."""
     c_text = CONSOLE_C.read_text(encoding="utf-8")
-
-    # In console_cmd_type enum and console_cmd_lookup_table, test commands MUST be wrapped in #if
-    guard = "#if CONFIG_AUDIO_BENCHMARK || CONFIG_AUDIO_STAGE_DIAGNOSTICS || CONFIG_AUDIO_INTEGRITY_REPLAY"
-    assert guard in c_text, "Kconfig guard for test commands missing in console.c"
-
-    # Verify that without test configs, the test commands are not in the production table
-    # Check that each test command is inside guarded blocks
-    for cmd in TEST_ONLY_COMMANDS:
-        occurrences = [m.start() for m in re.finditer(f'"{cmd}"', c_text)]
-        assert len(occurrences) > 0, f"Test command {cmd} should be registered in test mode"
+    for cmd in ["BENCH", "DIAGNOSE", "COMPARE", "STRESS", "INTEGRITY", "START", "STOP", "SCHEDULE"]:
+        assert f'"{cmd}"' not in c_text, f"Test command {cmd} must not be registered in production firmware"
 
 
 def test_production_unknown_command_response():
@@ -136,9 +128,9 @@ def test_canonical_response_formatting():
     assert "\\nList of commands\\n" in c_text
     assert " %s : %s\\n" in c_text
 
-    # Reboot & persistence deferred notices
+    # Reboot & persistence confirmation
     assert "\\nRebooting device.\\n" in c_text
-    assert "Flash persistence not implemented" in c_text
+    assert "\\nDevice configuration is applied after reboot.\\n" in c_text
 
 
 # ==============================================================================
@@ -149,6 +141,7 @@ class ConsoleValidatorModel:
     """Python simulation of the C console parser & validator functions."""
 
     SUPPORTED_SAMPLE_RATES = (192000, 96000, 48000)
+
 
     @staticmethod
     def validate_samf(rate: int):
@@ -244,3 +237,72 @@ def test_validator_gain_and_cutoffs():
     assert val.validate_cutoff(80) == (True, 80)
     assert val.validate_cutoff(20000) == (True, 20000)
     assert val.validate_cutoff(100000) == (False, None)
+
+
+# ==============================================================================
+# 6. ASYNCHRONOUS CONSOLE & ORDERLY RECORDING LIFECYCLE (PRIORITY 1)
+# ==============================================================================
+
+def test_asynchronous_console_and_q_prompt_removal():
+    """Verify that console_check_abort_requested() and 'q'-to-exit prompts
+    have been completely removed to preserve asynchronous console operation.
+    """
+    files_to_check = [
+        MAIN_C,
+        SRC_DIR / "recorder.c",
+        SRC_DIR / "recorder.h",
+        SRC_DIR / "rtc_sleep.c",
+        CONSOLE_C
+    ]
+    for f in files_to_check:
+        text = f.read_text(encoding="utf-8")
+        assert "console_check_abort_requested" not in text, (
+            f"console_check_abort_requested still present in {f.name}"
+        )
+
+    main_text = MAIN_C.read_text(encoding="utf-8")
+    assert "press 'q'" not in main_text.lower(), "Found prompt telling user to press 'q' in main.c"
+    assert "press q" not in main_text.lower(), "Found prompt telling user to press q in main.c"
+
+
+def test_staged_ram_configuration_during_recording():
+    """Verify that configuration setters stage values in RAM without
+    unexpectedly mutating active ADC/DMA or DSP filter state while recording is active.
+    """
+    c_text = CONSOLE_C.read_text(encoding="utf-8")
+
+    # SAMF: audio_in_set_rate must be guarded by !recorder_is_active()
+    assert re.search(r"if\s*\(!recorder_is_active\(\)\)\s*\{[^}]*audio_in_set_rate\(val\)", c_text), (
+        "handle_samf does not guard audio_in_set_rate with recorder_is_active()"
+    )
+
+    # GAIN: main_apply_dsp_settings must be guarded by !recorder_is_active()
+    assert "!recorder_is_active()" in c_text, "recorder_is_active guard missing in console.c"
+
+
+def test_orderly_shutdown_contract():
+    """Verify handle_rbt and handle_arbt safely stop active recordings,
+    wait for idle file finalization, and commit configuration before reboot.
+    """
+    c_text = CONSOLE_C.read_text(encoding="utf-8")
+
+    # RBT must check recorder_is_active, call recorder_request_stop, and wait for recorder_wait_idle
+    assert "recorder_is_active()" in c_text
+    assert "recorder_request_stop()" in c_text
+    assert "recorder_wait_idle" in c_text
+    assert "sys_reboot(SYS_REBOOT_COLD)" in c_text
+
+    # ARBT must set save_config_flag and delegate to handle_rbt
+    assert "g_cfg.save_config_flag = true;" in c_text
+    assert "handle_rbt();" in c_text
+
+
+def test_recorder_thread_and_idle_wait_architecture():
+    """Verify dedicated recorder thread architecture and safe idle wait function."""
+    main_text = MAIN_C.read_text(encoding="utf-8")
+    rec_h = (SRC_DIR / "recorder.h").read_text(encoding="utf-8")
+    rec_c = (SRC_DIR / "recorder.c").read_text(encoding="utf-8")
+
+    assert "recorder_thread" in main_text, "recorder_thread definition missing in main.c"
+    assert "recorder_wait_idle" in rec_h, "recorder_wait_idle declaration missing in recorder.h"
+    assert "int recorder_wait_idle(" in rec_c, "recorder_wait_idle definition missing in recorder.c"

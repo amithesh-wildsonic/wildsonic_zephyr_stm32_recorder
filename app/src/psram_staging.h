@@ -13,6 +13,34 @@ extern "C" {
 #define PSRAM_STAGING_DEFAULT_CAPACITY_BYTES   (1024U * 1024U)  /* 1 MiB staging allocation */
 #define PSRAM_STAGING_DEFAULT_BATCH_BYTES      (256U * 1024U)   /* 256 KiB SD batch write */
 
+/**
+ * @brief Explicit ownership states for PSRAM ping-pong batch buffers.
+ *
+ * State transitions:
+ *   FREE -> FILLING (producer claims buffer)
+ *   FILLING -> READY (buffer is full or flushed; published to writer)
+ *   READY -> WRITING (writer consumes buffer)
+ *   WRITING -> FREE (writer completes SD write successfully)
+ *   WRITING -> [retained on error] (uncommitted data preserved)
+ */
+enum psram_batch_state {
+	BATCH_STATE_FREE = 0,
+	BATCH_STATE_FILLING = 1,
+	BATCH_STATE_READY = 2,
+	BATCH_STATE_WRITING = 3,
+};
+
+struct psram_batch_buf_info {
+	uint32_t base_addr;
+	uint32_t capacity_bytes;
+	uint32_t filled_bytes;
+	uint32_t committed_bytes;
+	enum psram_batch_state state;
+	uint32_t batch_id;
+};
+
+#define PSRAM_MAX_BATCH_BUFFERS 4U
+
 struct psram_staging_stats {
 	bool active;
 	uint32_t capacity_bytes;
@@ -128,6 +156,30 @@ uint32_t psram_staging_batch_size(void);
  * @brief Retrieve snapshot of staging metrics and high-water mark.
  */
 void psram_staging_get_stats(struct psram_staging_stats *stats);
+
+/**
+ * @brief Get total number of active ping-pong / batch buffers.
+ */
+uint32_t psram_staging_get_buffer_count(void);
+
+/**
+ * @brief Get current ownership state and metrics for a specific batch buffer.
+ *
+ * @param buffer_idx Buffer index (0 or 1 for ping-pong).
+ * @param info Pointer to struct to populate.
+ * @return 0 on success, -EINVAL if buffer_idx out of range.
+ */
+int psram_staging_get_batch_info(uint32_t buffer_idx, struct psram_batch_buf_info *info);
+
+/**
+ * @brief Publish any partially filled active buffer as READY for final session draining.
+ *
+ * Called during recording session shutdown to transition an active FILLING buffer
+ * with data into READY so the writer thread can drain it cleanly.
+ *
+ * @return 0 on success, or 1 if no partially filled buffer needed publishing.
+ */
+int psram_staging_flush_publish(void);
 
 #ifdef __cplusplus
 }

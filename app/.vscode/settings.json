@@ -7,7 +7,7 @@
         "SD_BUS=sdmmc"
       ],
       "env.EXTRA_CONF_FILE": [
-        "${workspaceFolder}/configs/test_benchmark.conf;C:/Users/amith/Downloads/wildsonic_zephyr_stm32_recorder/app/configs/test_diagnostics.conf;C:/Users/amith/Downloads/wildsonic_zephyr_stm32_recorder/app/configs/test_integrity_replay.conf;C:/Users/amith/Downloads/wildsonic_zephyr_stm32_recorder/app/configs/test_synth.conf;C:/Users/amith/Downloads/wildsonic_zephyr_stm32_recorder/app/configs/diagnostic_2048.conf"
+        "${workspaceFolder}/test.conf"
       ],
       "default-runner": "stm32cubeprogrammer"
     },

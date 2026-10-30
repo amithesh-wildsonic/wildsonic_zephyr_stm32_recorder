@@ -20,31 +20,29 @@ def test_replay_crc_golden_vectors_are_deterministic_little_endian():
 
 def test_replay_is_opt_in_and_preserves_existing_adc_sink_flow():
     kconfig = (ROOT / "Kconfig").read_text()
-    assert "config AUDIO_INTEGRITY_REPLAY" in kconfig
-    assert "default n" in kconfig.split("config AUDIO_INTEGRITY_REPLAY", 1)[1].split("config AUDIO_SAMPLE_RATE", 1)[0]
+    assert "config AUDIO_INTEGRITY_REPLAY" not in kconfig, "CONFIG_AUDIO_INTEGRITY_REPLAY should be removed from Kconfig"
 
     adc = (ROOT / "src" / "audio_in_stm32l4.c").read_text()
-    process = adc.split("static bool process_half", 1)[1].split("static volatile uint32_t dma_ht_callbacks", 1)[0]
-    assert process.index("diag_raw_sum += local_sum") < process.index("audio_in_integrity_sample")
-    assert process.index("audio_in_integrity_sample") < process.index("sink->submit")
-    callback = adc.split("static void dma_cb", 1)[1].split("void audio_in_get_callback_counts", 1)[0]
-    assert "fs_read" not in callback and "crc32" not in callback.lower()
+    assert "audio_in_integrity_sample" not in adc, "audio_in_integrity_sample should be removed from audio_in_stm32l4.c"
+    assert "audio_in_set_integrity_replay" not in adc, "audio_in_set_integrity_replay should be removed from audio_in_stm32l4.c"
+
+    adc_h = (ROOT / "src" / "audio_in.h").read_text()
+    assert "audio_in_integrity_sample" not in adc_h, "audio_in_integrity_sample should be removed from audio_in.h"
 
 
 def test_readback_parser_walks_riff_chunks_and_checks_pipeline_crc():
     recorder = (ROOT / "src" / "recorder.c").read_text()
-    parser = recorder.split("static int integrity_readback_crc", 1)[1].split("K_MEM_SLAB_DEFINE_STATIC", 1)[0]
-    assert 'memcmp(chunk_hdr, "data", 4)' in parser
-    assert "chunk_end > riff_end" in parser
-    assert "fs_read(&file, buf, amount)" in parser
-    assert "fs_read_exact(&file, chunk_hdr" in parser
-    assert "pipeline_crc_bytes == exact_bytes" in recorder
-    assert "integrity_expected_crc32 == st.integrity_readback_crc32" in recorder
+    recorder_h = (ROOT / "src" / "recorder.h").read_text()
+
+    assert "integrity_readback_crc" not in recorder, "integrity_readback_crc should be removed from recorder.c"
+    assert "integrity_expected_crc32" not in recorder_h, "integrity_expected_crc32 should be removed from recorder.h"
+    assert "integrity_pipeline_crc32" not in recorder_h, "integrity_pipeline_crc32 should be removed from recorder.h"
+    assert "integrity_readback_crc32" not in recorder_h, "integrity_readback_crc32 should be removed from recorder.h"
 
 
 def test_test_build_fragment_enables_replay_explicitly():
-    conf = (ROOT / "configs" / "integrity_replay.conf").read_text()
-    assert re.search(r"^CONFIG_AUDIO_INTEGRITY_REPLAY=y$", conf, re.MULTILINE)
+    assert not (ROOT / "configs" / "integrity_replay.conf").exists(), "integrity_replay.conf should be deleted"
+    assert not (ROOT / "configs" / "test_integrity_replay.conf").exists(), "test_integrity_replay.conf should be deleted"
 
 
 if __name__ == "__main__":

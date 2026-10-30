@@ -30,6 +30,8 @@ else()
     src/main.c
     src/recorder.c
     src/wav.c
+    src/audio_in_stm32l4.c
+    src/audio_format.c
     src/psram_is66wvs.c
     src/psram_staging.c
     src/dsp.c
@@ -37,10 +39,9 @@ else()
     src/rtc_calendar.c
     src/scheduler.c
     src/console.c
+    src/config_store.c
+    src/led_indicator.c
   )
-  target_sources_ifdef(CONFIG_AUDIO_SRC_SYNTH app PRIVATE src/audio_in_synth.c)
-  target_sources_ifdef(CONFIG_AUDIO_SRC_ADC_STM32L4 app PRIVATE src/audio_in_stm32l4.c)
-  target_sources_ifdef(CONFIG_AUDIO_BENCHMARK app PRIVATE src/diagnostics/benchmark.c)
+  target_sources_ifdef(CONFIG_WILDSONIC_VERBOSE_LOGS app PRIVATE src/psram_benchmark.c)
   zephyr_include_directories(src)
-  zephyr_include_directories_ifdef(CONFIG_AUDIO_BENCHMARK src/diagnostics)
 endif()

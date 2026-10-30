@@ -3,23 +3,14 @@ mainmenu "WildSonic STM32 mono recorder"
 
 menu "Audio recorder"
 
-choice AUDIO_SRC
-	prompt "Audio input backend"
-	default AUDIO_SRC_ADC_STM32L4 if SOC_SERIES_STM32L4X
-	default AUDIO_SRC_SYNTH
-
-config AUDIO_SRC_SYNTH
-	bool "Synthetic sine source (tests SD pipeline without any analog hardware)"
-
 config AUDIO_SRC_ADC_STM32L4
 	bool "STM32L4 internal ADC: TIM6 trigger + hardware oversampling + DMA"
+	default y
 	depends on SOC_SERIES_STM32L4X
 	select DMA
 	select PINCTRL
 	select USE_STM32_LL_ADC
 	select USE_STM32_LL_TIM
-
-endchoice
 
 choice AUDIO_SAMPLE_FORMAT
 	prompt "Audio sample format"
@@ -45,35 +36,9 @@ config AUDIO_SAMPLE_BITS
 	default 16 if AUDIO_SAMPLE_BITS_16
 	default 32 if AUDIO_SAMPLE_BITS_32
 
-config AUDIO_INTEGRITY_REPLAY
-	bool "Enable test-only deterministic PCM integrity replay command"
-	depends on AUDIO_SRC_ADC_STM32L4 && AUDIO_SAMPLE_BITS_16
-	default n
-	help
-	  Enables explicit `integrity replay <seconds>` and `integrity adc <seconds>`
-	  commands. Replay keeps ADC/DMA running but replaces acquired PCM with
-	  deterministic samples; it does not validate analog values. The ADC command
-	  retains live samples and production DSP/gain, comparing finalized PCM before
-	  writer handoff with WAV payload readback. Keep disabled in production.
-
-config AUDIO_BENCHMARK
-	bool "Enable memory, peripheral, and throughput benchmarks"
-	default n
-	help
-	  Compiles benchmark.c and exposes the `bench` command suite in the UART
-	  console (RAM, PSRAM, SDMMC throughput sweeps, pipeline load testing).
-	  Keep disabled in production to save ~14 KB of Flash memory.
-
-config AUDIO_STAGE_DIAGNOSTICS
-	bool "Enable real-time signal stage isolation diagnostics and test modes"
-	default n
-	help
-	  Enables real-time DSP stage tapping (`diagnose` CLI command), intermediate
-	  excursion tracking, and comparison/stress modes. Keep disabled in production.
-
 config AUDIO_SAMPLE_RATE
 	int "Requested sample rate (Hz)"
-	default 192000
+	default 48000
 	help
 	  Requested audio sample rate in Hz.
 	  Default is 192,000 samples/s as required for stress testing the STM32L476
@@ -91,30 +56,6 @@ config AUDIO_BLOCK_SAMPLES
 	  For 16-bit mono: 4096 samples * 2 bytes = 8192 bytes (16 SD sectors).
 	  For 32-bit mono: 4096 samples * 4 bytes = 16384 bytes (32 SD sectors).
 	  At 192 kHz, 11,520,000 samples / 4096 = exactly 2812.5 blocks for a 60-second file.
-
-choice AUDIO_DIAGNOSTIC_BLOCK_SIZE
-	prompt "ADC block size for stage diagnostics"
-	default AUDIO_DIAGNOSTIC_BLOCK_2048
-	help
-	  Selects the DMA half-buffer size only while running the stage isolation
-	  diagnostic. Normal recording continues to use AUDIO_BLOCK_SAMPLES.
-
-config AUDIO_DIAGNOSTIC_BLOCK_1024
-	bool "1024 samples"
-
-config AUDIO_DIAGNOSTIC_BLOCK_2048
-	bool "2048 samples"
-
-config AUDIO_DIAGNOSTIC_BLOCK_4096
-	bool "4096 samples"
-
-endchoice
-
-config AUDIO_DIAGNOSTIC_BLOCK_SAMPLES
-	int
-	default 1024 if AUDIO_DIAGNOSTIC_BLOCK_1024
-	default 2048 if AUDIO_DIAGNOSTIC_BLOCK_2048
-	default 4096 if AUDIO_DIAGNOSTIC_BLOCK_4096
 
 config AUDIO_NUM_BLOCKS
 	int "Number of blocks in the RAM pool (the SD-stall buffer)"
@@ -163,17 +104,6 @@ config AUDIO_DSP_MODE_FILTERED
 	  Enables the configurable low-noise DSP processing chain (DC blocker,
 	  high-pass filter, mains notch filter, and ultrasonic low-pass filter).
 
-config AUDIO_DSP_MODE_TEST_SIGNAL
-	bool "Diagnostic Test Signals (synthetic tone / impulse response)"
-	help
-	  Generates a calibrated synthetic signal (1 kHz test tone + DC + 50 Hz hum + 40 kHz ultrasound)
-	  to verify filter attenuation, passband flatness, and numerical stability in hardware.
-
-config AUDIO_DSP_MODE_COMPARISON
-	bool "Sequential Comparison Mode (Cycle 1 Raw, Cycle 2 Filtered)"
-	help
-	  Records odd cycles in raw mode and even cycles in filtered mode to produce
-	  direct on-disk comparative WAV pairs for objective host-side noise analysis.
 endchoice
 
 config AUDIO_DSP_DC_BLOCK
@@ -245,11 +175,6 @@ config AUDIO_DSP_LPF_CUTOFF_HZ
 
 endmenu
 
-config AUDIO_SYNTH_TONE_HZ
-	int "Synthetic tone frequency"
-	default 1000
-	depends on AUDIO_SRC_SYNTH
-
 config AUDIO_RECORD_SECONDS
 	int "Seconds to record per session"
 	default 20
@@ -262,35 +187,6 @@ config AUDIO_RECORD_CYCLES
 	int "Number of record/sleep cycles (0 = continuous until stopped)"
 	default 1
 
-config AUDIO_QUICK_STRESS_TEST
-	bool "Enable rapid multi-cycle stress test mode"
-	default n
-	help
-	  When enabled, executes a rapid multi-cycle stress test (e.g. 3 cycles
-	  of 5s record / 3s sleep) to quickly validate recording integrity,
-	  queue behavior, SD write latency, file finalization, and sleep transitions.
-
-config AUDIO_STRESS_RECORD_SECONDS
-	int "Quick stress test recording duration per cycle (s)"
-	default 5
-	depends on AUDIO_QUICK_STRESS_TEST
-	help
-	  Number of seconds to record in each stress test cycle.
-
-config AUDIO_STRESS_SLEEP_SECONDS
-	int "Quick stress test sleep duration per cycle (s)"
-	default 3
-	depends on AUDIO_QUICK_STRESS_TEST
-	help
-	  Number of seconds to sleep in each stress test cycle.
-
-config AUDIO_STRESS_CYCLES
-	int "Quick stress test cycle count"
-	default 3
-	depends on AUDIO_QUICK_STRESS_TEST
-	help
-	  Total number of record/sleep cycles to execute in stress test mode.
-
 config AUDIO_PREALLOCATE_FILE
 	bool "Pre-allocate audio file clusters prior to recording"
 	default n
@@ -299,14 +195,6 @@ config AUDIO_PREALLOCATE_FILE
 	  calls FatFs f_expand() to pre-allocate contiguous clusters on exFAT.
 	  Disabled by default because standard streaming writes operate reliably
 	  without pre-allocation and avoid fragmentation errors.
-
-config AUDIO_DIAGNOSTIC_MODE
-	bool "Run microphone ADC diagnostic monitor on boot"
-	default n
-	help
-	  When enabled, prints real-time signal diagnostics (min/max/average/midpoint
-	  voltage, peak-to-peak amplitude, clipping count, and measured sample rate)
-	  every second to the serial console without writing to SD card.
 
 config PSRAM_TEST_ENABLE
     bool "Run external ISSI IS66WVS4M8 PSRAM detection and memory test on boot"
@@ -389,6 +277,15 @@ config FORMAT_EXPECTED_SECTOR_SIZE
 	default 512
 
 endmenu
+
+config WILDSONIC_VERBOSE_LOGS
+	bool "Enable verbose development and diagnostic console logs"
+	default n
+	help
+	  When disabled (default for production firmware), console output is kept
+	  minimal and quiet, suppressing startup banners, detailed PSRAM bring-up
+	  matrices, per-session banners, and standby countdown messages.
+	  Enable this symbol for test and engineering builds.
 
 # SD over SPI must use DMA (see sd/spi_*.overlay). Only takes effect when SPI is in use.
 config SPI_STM32_DMA

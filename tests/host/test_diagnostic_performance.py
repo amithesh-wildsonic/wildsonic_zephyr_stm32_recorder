@@ -197,59 +197,35 @@ def test_source_code_inspections():
     assert "dma_half_is_stable(event.half, block)" in src_adc, "Acquisition worker does not verify DMA half ownership before/after copying"
     print("  [PASS] audio_in_stm32l4.c: DMA buffer initialized, bulk processing deferred, ISR event publication nonblocking.")
 
-    # Check dsp.h
+    # Check dsp.h - verify diagnostic overhead and stage metrics structures removed
     path_dsph = os.path.join(APP_ROOT, "src", "dsp.h")
     with open(path_dsph, "r", encoding="utf-8") as f:
         src_dsph = f.read()
 
-    assert "dsp_process_stage_diagnostics_realtime" in src_dsph, "Real-time processing prototype missing in dsp.h"
-    assert "dsp_run_post_capture_spectral_analysis" in src_dsph, "Post-capture spectral prototype missing in dsp.h"
-    assert "dsp_get_stage_filters" in src_dsph, "Filter state snapshot prototype missing in dsp.h"
-    assert "uint32_t boundary_count;" in src_dsph, "Contiguous boundary counter missing in stage_metrics"
-    assert "bool spectral_valid;" in src_dsph, "spectral_valid flag missing in stage_metrics"
-    print("  [PASS] dsp.h: Decoupled real-time processing, post-capture spectral, and boundary counters declared.")
+    assert "dsp_process_stage_diagnostics_realtime" not in src_dsph, "Diagnostic processing prototype should be removed from dsp.h"
+    assert "dsp_run_post_capture_spectral_analysis" not in src_dsph, "Post-capture spectral prototype should be removed from dsp.h"
+    assert "struct stage_metrics" not in src_dsph, "stage_metrics struct should be removed from dsp.h"
+    print("  [PASS] dsp.h: Diagnostic test-signal generators, stage metrics, and spectral prototypes confirmed removed.")
 
-    # Check dsp.c
+    # Check dsp.c - verify zero Goertzel or stage metric overhead in streaming path
     path_dsp = os.path.join(APP_ROOT, "src", "dsp.c")
     with open(path_dsp, "r", encoding="utf-8") as f:
         src_dsp = f.read()
 
-    assert "Pass 1: Stage A Metrics" in src_dsp, "Optimized Pass 1 missing in dsp.c"
-    assert "Pass 2: Stages B, C, D, E Filters" in src_dsp, "Optimized Pass 2 missing in dsp.c"
-    assert "void dsp_process_stage_diagnostics_realtime" in src_dsp, "dsp_process_stage_diagnostics_realtime missing in dsp.c"
-    assert "void dsp_run_post_capture_spectral_analysis" in src_dsp, "dsp_run_post_capture_spectral_analysis missing in dsp.c"
-    assert "void dsp_get_stage_filters" in src_dsp, "dsp_get_stage_filters missing in dsp.c"
-    # Ensure zero Goertzel updates in Pass 1 or Pass 2 of real-time processing
-    realtime_start = src_dsp.find("void dsp_process_stage_diagnostics_realtime")
-    realtime_end = src_dsp.find("void dsp_process_stage_diagnostics(", realtime_start)
-    realtime_code = src_dsp[realtime_start:realtime_end]
-    assert "g_mag" not in realtime_code, "Goertzel magnitude found in real-time streaming path!"
-    assert "gA_s1_0" not in realtime_code, "Heavy Goertzel filter state iterations found in real-time streaming path!"
-    print("  [PASS] dsp.c: Zero Goertzel in streaming path; spectral analysis isolated to post-capture.")
+    assert "dsp_process_stage_diagnostics_realtime" not in src_dsp, "dsp_process_stage_diagnostics_realtime should be removed from dsp.c"
+    assert "dsp_run_post_capture_spectral_analysis" not in src_dsp, "dsp_run_post_capture_spectral_analysis should be removed from dsp.c"
+    assert "g_mag" not in src_dsp, "Goertzel magnitude calculation should be removed from dsp.c"
+    assert "gA_s1_0" not in src_dsp, "Goertzel filter iterations should be removed from dsp.c"
+    print("  [PASS] dsp.c: Zero Goertzel in streaming path; test diagnostics completely removed.")
 
-    # Check recorder.c
+    # Check recorder.c - verify diagnostic scan routines removed
     path_rec = os.path.join(APP_ROOT, "src", "recorder.c")
     with open(path_rec, "r", encoding="utf-8") as f:
         src_rec = f.read()
 
-    assert "act_drops = drops;" in src_rec, "Drop tracking missing in recorder_run_stage_diagnostics"
-    assert "Diagnostic Blocks : %u DSP processed, %u producer block drops" in src_rec, "Drop reporting missing in diagnostic output"
-    assert "Producer Blocks   : %u HT/TC callbacks" in src_rec, "Producer callback reporting missing in diagnostic output"
-    assert "Real-time Latency : Min:" in src_rec, "Latency profiling missing in recorder_run_stage_diagnostics"
-    assert "Deadline:" in src_rec, "Block deadline comparison missing in recorder_run_stage_diagnostics"
-    assert "deadline_violated" in src_rec, "Deadline violation check missing in recorder_run_stage_diagnostics"
-    assert "PCM NEAR-FULL-SCALE OR SATURATION DETECTED IN STAGE A" in src_rec, "Stage A PCM saturation warning missing in recorder.c"
-    assert "Raw ADC Codes" in src_rec, "Raw ADC-code measurements are not reported separately"
-    assert "Long Stage A Spectrum" in src_rec, "Long-window Stage A spectrum is missing"
-    assert "Broad Stage A Scan" in src_rec and "DIAG_SCAN_SAMPLES 8192U" in src_rec, "Bounded-memory broad spectral scan is missing"
-    assert "uint64_t requested_samples = (uint64_t)seconds * rate" in src_rec, "Diagnostic sample-count multiplication is not widened"
-    assert "total_blocks_64 * DIAG_BLOCK_SAMPLES > UINT32_MAX" in src_rec, "Diagnostic block rounding can overflow stage counters"
-    assert all(f"{frequency}f" in src_rec for frequency in ("50.0", "60.0", "93.75", "100.0", "120.0", "150.0", "187.5", "200.0")), "Required target frequencies missing"
-    assert "dsp_run_post_capture_spectral_analysis" in src_rec, "Post-capture spectral call missing in recorder.c"
-    assert "is_contiguous" in src_rec, "Contiguity tracking missing in recorder_run_stage_diagnostics"
-    assert "Spectral analysis REJECTED (spectral_valid = false)" in src_rec, "Rejection on overflow missing in recorder.c"
-    assert "Excursions*" in src_rec, "Excursions footnote clarification missing"
-    print("  [PASS] recorder.c: Drop tracking, producer/consumer counters, deadline guard, accurate PCM labeling, and spectral targets verified.")
+    assert "recorder_run_stage_diagnostics" not in src_rec, "recorder_run_stage_diagnostics should be removed from recorder.c"
+    assert "DIAG_SCAN_SAMPLES" not in src_rec, "DIAG_SCAN_SAMPLES should be removed from recorder.c"
+    print("  [PASS] recorder.c: Diagnostic test scans and stage overhead confirmed removed from production firmware.")
 
 
 def test_adc_conversion_scaling_and_overdrive():

@@ -430,7 +430,7 @@ def run_tests():
     psram_h = os.path.join(proj_dir, "src", "psram_is66wvs.h")
     with open(psram_h, "r", encoding="utf-8") as f:
         psram_h_content = f.read()
-    assert "psram_run_benchmark" in psram_h_content, "psram_run_benchmark missing from psram_is66wvs.h"
+    assert "psram_run_self_test" in psram_h_content, "psram_run_self_test missing from psram_is66wvs.h"
     assert "psram_is_quad_mode" in psram_h_content, "psram_is_quad_mode missing from psram_is66wvs.h"
     assert "psram_get_burst_size" in psram_h_content, "psram_get_burst_size missing from psram_is66wvs.h"
 

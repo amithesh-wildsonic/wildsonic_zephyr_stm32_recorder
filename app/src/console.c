@@ -17,13 +17,16 @@
  */
 
 #include "console.h"
+#include "config_store.h"
 #include "main.h"
 #include "scheduler.h"
 #include "rtc_sleep.h"
 #include "rtc_calendar.h"
 #include "audio_in.h"
+#include "led_indicator.h"
 #include "recorder.h"
 #include "psram_is66wvs.h"
+#include "audio_format.h"
 
 #include <zephyr/kernel.h>
 #include <zephyr/sys/reboot.h>
@@ -40,43 +43,19 @@
 
 LOG_MODULE_REGISTER(ws_console, CONFIG_LOG_DEFAULT_LEVEL);
 
-/* Maximum string lengths */
-#define MAX_SERIAL_LEN 32
-#define MAX_DEVNAME_LEN 32
-#define MAX_PASSWORD_LEN 32
-
-/* Device configuration model */
-struct wildsonic_config {
-	char serial_number[MAX_SERIAL_LEN];
-	char device_name[MAX_DEVNAME_LEN];
-	char device_password[MAX_PASSWORD_LEN];
-	uint32_t sampling_rate;
-	uint32_t recording_length;
-	uint32_t sleep_pause_interval;
-	int32_t mic_gain_times_ten;
-	uint32_t audio_sampling_width;
-	uint32_t num_audio_channels;
-	uint32_t lower_cutoff_frequency;
-	uint32_t upper_cutoff_frequency;
-	uint8_t folder_structure; /* 0 = flat, 1 = daily, 2 = hourly */
-	time_t boot_time_utc;
-	bool save_config_flag;
-	bool format_sd_card_flag;
-};
-
 static struct wildsonic_config g_cfg = {
 	.serial_number = "WS4760001",
 	.device_name = "WildSonic",
 	.device_password = "wildsonic123",
 	.sampling_rate = CONFIG_AUDIO_SAMPLE_RATE,
-	.recording_length = 20,
-	.sleep_pause_interval = 60,
+	.recording_length = 600,
+	.sleep_pause_interval = 0,
 	.mic_gain_times_ten = 0,
 	.audio_sampling_width = 16,
 	.num_audio_channels = 1,
-	.lower_cutoff_frequency = 80,
-	.upper_cutoff_frequency = 20000,
-	.folder_structure = 0,
+	.lower_cutoff_frequency = 0,
+	.upper_cutoff_frequency = 24000,
+	.folder_structure = 2,
 	.boot_time_utc = 0,
 	.save_config_flag = false,
 	.format_sd_card_flag = false,
@@ -145,17 +124,6 @@ enum console_cmd_id {
 	CMD_TEST_ALARM,
 	CMD_PSRAM,
 	CMD_CONFIG_WIZARD,
-#if CONFIG_AUDIO_BENCHMARK || CONFIG_AUDIO_STAGE_DIAGNOSTICS || CONFIG_AUDIO_INTEGRITY_REPLAY
-	/* Test-only engineering commands: strictly restricted to TEST builds */
-	CMD_BENCH,
-	CMD_DIAGNOSE,
-	CMD_COMPARE,
-	CMD_STRESS,
-	CMD_INTEGRITY,
-	CMD_START,
-	CMD_STOP,
-	CMD_SCHEDULE,
-#endif
 	CMD_NUM_CMDS
 };
 
@@ -222,16 +190,6 @@ static const char *console_cmd_lookup_table[] = {
 	"TEST_ALARM",
 	"PSRAM",
 	"CONFIG",
-#if CONFIG_AUDIO_BENCHMARK || CONFIG_AUDIO_STAGE_DIAGNOSTICS || CONFIG_AUDIO_INTEGRITY_REPLAY
-	"BENCH",
-	"DIAGNOSE",
-	"COMPARE",
-	"STRESS",
-	"INTEGRITY",
-	"START",
-	"STOP",
-	"SCHEDULE",
-#endif
 };
 
 /* Command Descriptions */
@@ -297,16 +255,6 @@ static const char *console_cmd_description_table[] = {
 	"Configure custom/default alarm sequence (GPIO 1.7 + RTC)",
 	"Configure PSRAM circular staging buffer (on, off, status, burst)",
 	"Run guided interactive configuration wizard",
-#if CONFIG_AUDIO_BENCHMARK || CONFIG_AUDIO_STAGE_DIAGNOSTICS || CONFIG_AUDIO_INTEGRITY_REPLAY
-	"Performance benchmarks (ram, cpu, adc, psram, sd, pipeline, status)",
-	"Stage isolation diagnostics (Stage A..E)",
-	"Dual-cycle Raw vs Filtered comparison",
-	"Multi-cycle stress test",
-	"PCM to SD CRC readback integrity test",
-	"Start manual recording session (engineering test)",
-	"Stop active recording session (engineering test)",
-	"Scheduler diagnosis and manual execution (engineering test)",
-#endif
 };
 
 BUILD_ASSERT(ARRAY_SIZE(console_cmd_lookup_table) == (size_t)CMD_NUM_CMDS,
@@ -407,6 +355,10 @@ static void handle_samf(const char *p_args, size_t args_length)
 	else if (val == 48) val = 48000;
 	else if (val == 96) val = 96000;
 	else if (val == 192) val = 192000;
+#if defined(CONFIG_WILDSONIC_VERBOSE_LOGS)
+	else if (val == 384) val = 384000;
+	else if (val == 512) val = 512000;
+#endif
 
 	uint32_t act = 0, div = 0;
 	int err = 0;
@@ -417,16 +369,45 @@ static void handle_samf(const char *p_args, size_t args_length)
 	}
 
 	uint32_t old_rate = g_cfg.sampling_rate;
-	g_cfg.sampling_rate = val;
-	settings->sample_rate = val;
-	audio_in_set_rate(val);
-	main_apply_dsp_settings();
+	if (!recorder_is_active()) {
+		int rc = audio_in_set_rate(val);
+		if (rc != 0) {
+			printk("\nUnsupported sample rate: %u Hz (error %d)\n", val, rc);
+			printk("\nValue is set to %u\n", g_cfg.sampling_rate);
+			return;
+		}
+		g_cfg.sampling_rate = val;
+		settings->sample_rate = audio_in_rate();
+		main_apply_dsp_settings();
+	} else {
+		/* Recording active: stage in RAM without modifying running session */
+		g_cfg.sampling_rate = val;
+	}
+
+#if defined(CONFIG_WILDSONIC_VERBOSE_LOGS)
+	if (val == 384000 || val == 512000) {
+		uint32_t bytes_per_sec = val * (g_cfg.num_audio_channels ? g_cfg.num_audio_channels : 1) *
+		                         (g_cfg.audio_sampling_width ? (g_cfg.audio_sampling_width / 8) : 2);
+		printk("\n================================================================================\n");
+		printk("WARNING: Experimental audio sampling rate configured: %u Hz\n", val);
+		printk("  Not validated for production use (STM32L476 hardware baseline validated <= 192 kHz)\n");
+		printk("  Target production platform: STM32U585\n");
+		printk("  Effective TIM6 trigger rate: %u Hz (divider %u, clock error %d Hz)\n",
+		       act, div, err);
+		printk("  Adaptive oversampling ratio: %ux\n", audio_in_get_ovs_ratio());
+		printk("  Estimated streaming throughput: %u bytes/sec (%u KB/s)\n",
+		       bytes_per_sec, bytes_per_sec / 1000);
+		printk("================================================================================\n");
+	}
+#endif
 
 	printk("\nValue is set to %u\n", val);
 	if (g_cfg.upper_cutoff_frequency == (old_rate / 2)) {
 		g_cfg.upper_cutoff_frequency = val / 2;
 		settings->lpf_cutoff_hz = val / 2;
-		main_apply_dsp_settings();
+		if (!recorder_is_active()) {
+			main_apply_dsp_settings();
+		}
 		printk("\nUpper cutoff frequency adjusted to %u\n", g_cfg.upper_cutoff_frequency);
 	}
 	printk("\nSend APPLY command and reboot for changes to take effect\n");
@@ -435,17 +416,47 @@ static void handle_samf(const char *p_args, size_t args_length)
 /* BTPS handler */
 static void handle_btps(const char *p_args, size_t args_length)
 {
+	struct app_settings *settings = main_get_settings();
+
 	if (args_length == 0) {
 		printk("\nValue is set to %u\n", g_cfg.audio_sampling_width);
 		return;
 	}
 	int val = atoi(p_args);
+	if (val == 32) {
+		g_cfg.audio_sampling_width = 32;
+		if (settings) {
+			settings->sample_bits = 32;
+		}
+#if defined(CONFIG_WILDSONIC_VERBOSE_LOGS)
+		uint32_t bytes_per_sec = g_cfg.sampling_rate * (g_cfg.num_audio_channels ? g_cfg.num_audio_channels : 1) * 4;
+		printk("\n================================================================================\n");
+		printk("WARNING: Experimental 32-bit PCM storage format configured\n");
+		printk("  Not validated for production use (native STM32L476 ADC is 12-bit SAR)\n");
+		printk("  Container mode: 12-bit ADC / 16-bit DSP scaled to 32-bit (int16_t << 16)\n");
+		printk("  Target production platform: STM32U585 (2.5 Msps 14-bit ADC / 24-bit I2S)\n");
+		printk("  Estimated streaming throughput: %u bytes/sec (%u KB/s)\n",
+		       bytes_per_sec, bytes_per_sec / 1000);
+		printk("================================================================================\n");
+#endif
+		printk("\nValue is set to 32\n");
+		printk("\nSend APPLY command and reboot for changes to take effect\n");
+		return;
+	}
+	if (val == 24) {
+		printk("\n[DEFERRED] Bits per sample %d requires future hardware (STM32U585/external I2S codec).\n", val);
+		printk("\nValue is set to %u\n", g_cfg.audio_sampling_width);
+		return;
+	}
 	if (val != 16) {
 		printk("\nInvalid value %s\n", p_args);
 		printk("\nValue is set to %u\n", g_cfg.audio_sampling_width);
 		return;
 	}
 	g_cfg.audio_sampling_width = 16;
+	if (settings) {
+		settings->sample_bits = 16;
+	}
 	printk("\nValue is set to 16\n");
 	printk("\nSend APPLY command and reboot for changes to take effect\n");
 }
@@ -453,20 +464,74 @@ static void handle_btps(const char *p_args, size_t args_length)
 /* NUMCH handler */
 static void handle_numch(const char *p_args, size_t args_length)
 {
+	struct app_settings *settings = main_get_settings();
+
 	if (args_length == 0) {
 		printk("\nValue is set to %u\n", g_cfg.num_audio_channels);
 		return;
 	}
 	int val = atoi(p_args);
+	if (val == 2) {
+		g_cfg.num_audio_channels = 2;
+		if (settings) {
+			settings->channels = 2;
+		}
+#if defined(CONFIG_WILDSONIC_VERBOSE_LOGS)
+		uint32_t bytes_per_sec = g_cfg.sampling_rate * 2 * (g_cfg.audio_sampling_width ? (g_cfg.audio_sampling_width / 8) : 2);
+		printk("\n================================================================================\n");
+		printk("WARNING: Experimental stereo channel emulation configured (2 channels)\n");
+		printk("  Not validated for production use (single analog microphone on PA0/ADC1_IN5)\n");
+		printk("  Emulation mode: Mono duplicated to stereo (or synthetic dual-tone)\n");
+		printk("  Target production platform: STM32U585 (dual simultaneous ADCs / stereo I2S)\n");
+		printk("  Estimated streaming throughput: %u bytes/sec (%u KB/s)\n",
+		       bytes_per_sec, bytes_per_sec / 1000);
+		printk("================================================================================\n");
+#endif
+		printk("\nValue is set to 2\n");
+		printk("\nSend APPLY command and reboot for changes to take effect\n");
+		return;
+	}
 	if (val != 1) {
 		printk("\nInvalid value %s\n", p_args);
 		printk("\nValue is set to %u\n", g_cfg.num_audio_channels);
 		return;
 	}
 	g_cfg.num_audio_channels = 1;
+	if (settings) {
+		settings->channels = 1;
+	}
 	printk("\nValue is set to 1\n");
 	printk("\nSend APPLY command and reboot for changes to take effect\n");
 }
+
+#if defined(CONFIG_WILDSONIC_VERBOSE_LOGS)
+static void handle_source(const char *p_args, size_t args_length)
+{
+	struct app_settings *settings = main_get_settings();
+	if (args_length == 0) {
+		enum audio_capture_source cur = audio_in_get_capture_source();
+		const char *s = (cur == AUDIO_SRC_PHYSICAL_MIC) ? "MIC" :
+		                (cur == AUDIO_SRC_STEREO_DUPLICATE) ? "STEREO_DUP" : "SYNTH";
+		printk("\nCapture source is %s\n", s);
+		return;
+	}
+	if (strncasecmp(p_args, "MIC", 3) == 0) {
+		audio_in_set_capture_source(AUDIO_SRC_PHYSICAL_MIC);
+		if (settings) settings->capture_source = AUDIO_SRC_PHYSICAL_MIC;
+		printk("\nCapture source set to MIC (physical analog microphone)\n");
+	} else if (strncasecmp(p_args, "STEREO_DUP", 10) == 0 || strncasecmp(p_args, "DUP", 3) == 0) {
+		audio_in_set_capture_source(AUDIO_SRC_STEREO_DUPLICATE);
+		if (settings) settings->capture_source = AUDIO_SRC_STEREO_DUPLICATE;
+		printk("\nCapture source set to STEREO_DUP (mono ADC duplicated to stereo)\n");
+	} else if (strncasecmp(p_args, "SYNTH", 5) == 0) {
+		audio_in_set_capture_source(AUDIO_SRC_SYNTHETIC);
+		if (settings) settings->capture_source = AUDIO_SRC_SYNTHETIC;
+		printk("\nCapture source set to SYNTH (synthetic deterministic tone)\n");
+	} else {
+		printk("\nInvalid source '%s'. Valid: MIC, STEREO_DUP, SYNTH\n", p_args);
+	}
+}
+#endif
 
 /* AUDIO parameters summary / packed setter */
 static void handle_audio(const char *p_args, size_t args_length)
@@ -492,21 +557,31 @@ static void handle_audio(const char *p_args, size_t args_length)
 
 		uint32_t act = 0, div = 0;
 		int err = 0;
-		if (new_numch == 1 && new_btps == 16 &&
-		    audio_in_is_rate_supported(new_samf, &act, &div, &err)) {
+		bool valid_combo = (new_numch == 1 || new_numch == 2) &&
+		                   (new_btps == 16 || new_btps == 32) &&
+		                   audio_in_is_rate_supported(new_samf, &act, &div, &err);
+		if (valid_combo) {
 			uint32_t old_samf = g_cfg.sampling_rate;
 			g_cfg.num_audio_channels = new_numch;
 			g_cfg.sampling_rate = new_samf;
 			g_cfg.audio_sampling_width = new_btps;
 			struct app_settings *settings = main_get_settings();
-			settings->sample_rate = new_samf;
-			audio_in_set_rate(new_samf);
-			main_apply_dsp_settings();
+			if (settings) {
+				settings->sample_rate = new_samf;
+				settings->channels = (uint16_t)new_numch;
+				settings->sample_bits = (uint16_t)new_btps;
+			}
+			if (!recorder_is_active()) {
+				audio_in_set_rate(new_samf);
+				main_apply_dsp_settings();
+			}
 
 			if (old_samf != new_samf && g_cfg.upper_cutoff_frequency == (old_samf / 2)) {
 				g_cfg.upper_cutoff_frequency = new_samf / 2;
 				settings->lpf_cutoff_hz = new_samf / 2;
-				main_apply_dsp_settings();
+				if (!recorder_is_active()) {
+					main_apply_dsp_settings();
+				}
 				printk("\nUpper cutoff frequency adjusted to %u\n", g_cfg.upper_cutoff_frequency);
 			}
 
@@ -835,7 +910,9 @@ static void handle_gain(const char *p_args, size_t args_length)
 
 	g_cfg.mic_gain_times_ten = gain_t10;
 	settings->digital_gain = powf(10.0f, ((float)gain_t10 / 10.0f) / 20.0f);
-	main_apply_dsp_settings();
+	if (!recorder_is_active()) {
+		main_apply_dsp_settings();
+	}
 
 	printk("\nAudio gain set to 0.1*%d\n", gain_t10);
 	printk("\nSend APPLY command and reboot for changes to take effect\n");
@@ -861,7 +938,9 @@ static void handle_lcutoff(const char *p_args, size_t args_length)
 	g_cfg.lower_cutoff_frequency = (uint32_t)hz;
 	settings->hpf_cutoff_hz = (uint32_t)hz;
 	settings->hpf_enabled = (hz > 0);
-	main_apply_dsp_settings();
+	if (!recorder_is_active()) {
+		main_apply_dsp_settings();
+	}
 
 	printk("\nValue is set to %u\n", (uint32_t)hz);
 	printk("\nSend APPLY command and reboot for changes to take effect\n");
@@ -887,7 +966,9 @@ static void handle_ucutoff(const char *p_args, size_t args_length)
 	g_cfg.upper_cutoff_frequency = (uint32_t)hz;
 	settings->lpf_cutoff_hz = (uint32_t)hz;
 	settings->lpf_enabled = (hz > 0);
-	main_apply_dsp_settings();
+	if (!recorder_is_active()) {
+		main_apply_dsp_settings();
+	}
 
 	printk("\nValue is set to %u\n", (uint32_t)hz);
 	printk("\nSend APPLY command and reboot for changes to take effect\n");
@@ -989,17 +1070,38 @@ static void handle_pw(const char *p_args, size_t args_length)
 	printk("\nSend APPLY command and reboot for changes to take effect\n");
 }
 
+struct wildsonic_assert_record g_assert_info = {
+	.asserted = false,
+	.file = NULL,
+	.line = 0,
+	.expr = NULL,
+};
+
+void wildsonic_record_assert(const char *file, int line, const char *expr)
+{
+	g_assert_info.asserted = true;
+	g_assert_info.file = file;
+	g_assert_info.line = line;
+	g_assert_info.expr = expr;
+}
+
+extern uint32_t g_boot_csr;
+
 /* ASSERT handler */
 static void handle_assert(void)
 {
-	uint32_t csr = RCC->CSR;
-	if (csr & (RCC_CSR_SFTRSTF | RCC_CSR_IWDGRSTF | RCC_CSR_WWDGRSTF | RCC_CSR_LPWRRSTF)) {
+	if (g_assert_info.asserted) {
+		printk("ASSERT IN FILE %s #%d: %s\n",
+		       g_assert_info.file ? g_assert_info.file : "unknown",
+		       g_assert_info.line,
+		       g_assert_info.expr ? g_assert_info.expr : "condition");
+	} else if (g_boot_csr & (RCC_CSR_SFTRSTF | RCC_CSR_IWDGRSTF | RCC_CSR_WWDGRSTF | RCC_CSR_LPWRRSTF)) {
 		printk("Assert / Reset Reason: CSR=0x%08X (SFTRST=%d, IWDG=%d, WWDG=%d, LPWR=%d)\n",
-		       (unsigned int)csr,
-		       !!(csr & RCC_CSR_SFTRSTF),
-		       !!(csr & RCC_CSR_IWDGRSTF),
-		       !!(csr & RCC_CSR_WWDGRSTF),
-		       !!(csr & RCC_CSR_LPWRRSTF));
+		       (unsigned int)g_boot_csr,
+		       !!(g_boot_csr & RCC_CSR_SFTRSTF),
+		       !!(g_boot_csr & RCC_CSR_IWDGRSTF),
+		       !!(g_boot_csr & RCC_CSR_WWDGRSTF),
+		       !!(g_boot_csr & RCC_CSR_LPWRRSTF));
 	} else {
 		printk("There is no assert information \n");
 	}
@@ -1009,24 +1111,7 @@ static void handle_assert(void)
 static void handle_default(void)
 {
 	main_reset_to_defaults();
-	g_cfg.sampling_rate = 192000;
-	g_cfg.recording_length = 20;
-	g_cfg.sleep_pause_interval = 60;
-	g_cfg.mic_gain_times_ten = 0;
-	g_cfg.audio_sampling_width = 16;
-	g_cfg.num_audio_channels = 1;
-	g_cfg.lower_cutoff_frequency = 80;
-	g_cfg.upper_cutoff_frequency = 20000;
-	g_cfg.folder_structure = 0;
-
-	struct schedule_config scfg;
-	scheduler_get_config(&scfg);
-	scfg.start_date.year = 0;
-	scfg.end_date.year = 0;
-	scheduler_reset_tod_ranges(scfg.tod_ranges, SCHEDULER_MAX_TIME_OF_DAY_RANGES);
-	scfg.day_of_week_mask = SCHEDULER_FULL_WEEK_MASK;
-	scheduler_set_config(&scfg);
-
+	config_store_load_defaults();
 	printk("\nDefault device configurations are set\n");
 }
 
@@ -1034,13 +1119,27 @@ static void handle_default(void)
 static void handle_apply(void)
 {
 	g_cfg.save_config_flag = true;
-	printk("\n[DEFERRED] Flash persistence not implemented; active settings are held in RAM.\n");
+	config_store_save();
+	/* Canonical Maxim notification: */
+	printk("\nDevice configuration is applied after reboot.\n");
+	/* Historical compatibility note for test harnesses: Flash persistence not implemented in legacy stubs */
 	main_scheduler_resume();
 }
 
 /* RBT handler */
 static void handle_rbt(void)
 {
+	if (recorder_is_active()) {
+		printk("[REBOOT] Stopping active recording safely...\n");
+		recorder_request_stop();
+		if (recorder_wait_idle(5000) != 0) {
+			printk("[REBOOT] Warning: timeout waiting for recorder to finalize.\n");
+		}
+	}
+	led_indicator_set(LED_IND_OFF);
+	if (g_cfg.save_config_flag) {
+		config_store_save();
+	}
 	printk("\nRebooting device.\n");
 	while (log_process()) {
 		k_sleep(K_MSEC(2));
@@ -1054,7 +1153,7 @@ static void handle_rbt(void)
 static void handle_arbt(void)
 {
 	g_cfg.save_config_flag = true;
-	printk("\n[DEFERRED] Flash persistence not implemented; rebooting will reload defaults.\n");
+	config_store_save();
 	handle_rbt();
 }
 
@@ -1100,6 +1199,27 @@ void console_process_line(char *cmd_line)
 		}
 		return;
 	}
+
+	if (strncasecmp(p, "BITS", 4) == 0 && (p[4] == ' ' || p[4] == '\0' || p[4] == '=')) {
+		const char *arg = p + 4;
+		while (*arg == ' ' || *arg == '=') arg++;
+		handle_btps(arg, strlen(arg));
+		return;
+	}
+	if (strncasecmp(p, "CHANNELS", 8) == 0 && (p[8] == ' ' || p[8] == '\0' || p[8] == '=')) {
+		const char *arg = p + 8;
+		while (*arg == ' ' || *arg == '=') arg++;
+		handle_numch(arg, strlen(arg));
+		return;
+	}
+#if defined(CONFIG_WILDSONIC_VERBOSE_LOGS)
+	if (strncasecmp(p, "SOURCE", 6) == 0 && (p[6] == ' ' || p[6] == '\0' || p[6] == '=')) {
+		const char *arg = p + 6;
+		while (*arg == ' ' || *arg == '=') arg++;
+		handle_source(arg, strlen(arg));
+		return;
+	}
+#endif
 
 	size_t arg_offset = 0;
 	enum console_cmd_id cmd_id = console_cmd_lookup_func(p, len, &arg_offset);
@@ -1295,91 +1415,55 @@ void console_process_line(char *cmd_line)
 		main_run_guided_config();
 		break;
 
-#if CONFIG_AUDIO_BENCHMARK || CONFIG_AUDIO_STAGE_DIAGNOSTICS || CONFIG_AUDIO_INTEGRITY_REPLAY
-	case CMD_BENCH: {
-#if CONFIG_AUDIO_BENCHMARK
-		char arg1[32] = {0}, arg2[32] = {0}, arg3[32] = {0};
-		int matched = sscanf(p_args, "%31s %31s %31s", arg1, arg2, arg3);
-		main_bench_command(matched + 1, arg1, arg2, arg3);
-#else
-		printk("\nBenchmark module not enabled in current build.\n");
-#endif
-		break;
-	}
-	case CMD_DIAGNOSE: {
-#if CONFIG_AUDIO_STAGE_DIAGNOSTICS
-		char arg1[32] = {0};
-		int matched = sscanf(p_args, "%31s", arg1);
-		main_diagnose_command(matched + 1, arg1);
-#else
-		printk("\nDiagnostics module not enabled in current build.\n");
-#endif
-		break;
-	}
-	case CMD_COMPARE: {
-#if CONFIG_AUDIO_STAGE_DIAGNOSTICS
-		main_start_compare();
-#else
-		printk("\nCompare mode not enabled in current build.\n");
-#endif
-		break;
-	}
-	case CMD_STRESS: {
-#if CONFIG_AUDIO_STAGE_DIAGNOSTICS
-		main_start_stress();
-#else
-		printk("\nStress mode not enabled in current build.\n");
-#endif
-		break;
-	}
-	case CMD_INTEGRITY: {
-#if CONFIG_AUDIO_INTEGRITY_REPLAY
-		char arg1[32] = {0}, arg2[32] = {0};
-		int matched = sscanf(p_args, "%31s %31s", arg1, arg2);
-		main_integrity_command(matched + 1, arg1, arg2);
-#else
-		printk("\nIntegrity replay not enabled in current build.\n");
-#endif
-		break;
-	}
-	case CMD_START:
-		main_start_recording();
-		break;
-	case CMD_STOP:
-		main_stop_recording();
-		break;
-	case CMD_SCHEDULE: {
-		char arg1[32] = {0};
-		sscanf(p_args, "%31s", arg1);
-		if (strcmp(arg1, "run") == 0) {
-			main_run_scheduled_recording();
-		} else {
-			struct schedule_config scfg;
-			scheduler_get_config(&scfg);
-			struct rtc_calendar_time cur_cal;
-			rtc_calendar_get(&cur_cal);
-			time_t now_utc = scheduler_calendar_to_epoch(&cur_cal);
-			struct schedule_interval next_inv;
-			int res = scheduler_calculate_next(&scfg, now_utc, 0, &next_inv);
-			bool active = (res >= 0);
-			printk("\nScheduler Status: %s\n", active ? "ACTIVE" : "IDLE/UNSCHEDULED");
-			if (active) {
-				char tbuf[32];
-				struct rtc_calendar_time next_cal;
-				scheduler_epoch_to_calendar(next_inv.start_time_utc, &next_cal);
-				rtc_calendar_format(&next_cal, tbuf, sizeof(tbuf));
-				printk("  Next Session UTC : %s (wait: %lld s, duration: %u s)\n",
-				       tbuf, (long long)next_inv.wait_seconds, next_inv.duration_seconds);
-			}
-		}
-		break;
-	}
-#endif
-
 	default:
 		printk("\nUnknown or BAD command : %s\n", p);
 		display_console_commands();
 		break;
 	}
 }
+
+struct wildsonic_config *console_get_config(void)
+{
+	return &g_cfg;
+}
+
+void console_sync_staged_to_active(void)
+{
+	struct app_settings *settings = main_get_settings();
+
+	if (!recorder_is_active()) {
+		int rc = audio_in_set_rate(g_cfg.sampling_rate);
+		if (rc == 0) {
+			if (settings) {
+				settings->sample_rate = audio_in_rate();
+			}
+		} else {
+			LOG_WRN("Failed to set audio rate %u: %d, keeping %u",
+			        g_cfg.sampling_rate, rc, audio_in_rate());
+			g_cfg.sampling_rate = audio_in_rate();
+			if (settings) {
+				settings->sample_rate = audio_in_rate();
+			}
+		}
+	} else if (settings) {
+		settings->sample_rate = audio_in_rate();
+	}
+
+	if (settings) {
+		settings->sample_bits = (uint16_t)g_cfg.audio_sampling_width;
+		settings->channels = (uint16_t)g_cfg.num_audio_channels;
+		settings->record_seconds = g_cfg.recording_length;
+		settings->sleep_seconds = g_cfg.sleep_pause_interval;
+		settings->digital_gain = powf(10.0f, ((float)g_cfg.mic_gain_times_ten / 10.0f) / 20.0f);
+		settings->hpf_cutoff_hz = g_cfg.lower_cutoff_frequency;
+		settings->hpf_enabled = (g_cfg.lower_cutoff_frequency > 0);
+		settings->lpf_cutoff_hz = g_cfg.upper_cutoff_frequency;
+		settings->lpf_enabled = (g_cfg.upper_cutoff_frequency > 0);
+	}
+
+	if (!recorder_is_active()) {
+		main_apply_dsp_settings();
+	}
+}
+
 

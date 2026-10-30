@@ -105,37 +105,6 @@ struct psram_test_report {
   uint32_t sshift_c_errors;   /* Diagnostic re-probe of Test C with HALFCYCLE */
 };
 
-struct psram_bench_report {
-  bool success;
-  bool quad_mode;
-  uint32_t burst_size;
-  uint32_t write_4k_us;
-  uint32_t read_4k_us;
-  uint32_t write_throughput_kb_s;
-  uint32_t read_throughput_kb_s;
-  uint32_t chunk_sizes[4];
-  uint32_t chunk_write_us[4];
-  uint32_t chunk_read_us[4];
-  bool integrity_verified;
-  uint32_t audio_period_192k_us;
-  int32_t write_margin_us;
-  char status_msg[160];
-};
-
-struct psram_diag_report {
-  uint32_t total_probes;
-  uint32_t passed_probes;
-  uint32_t failed_probes;
-  uint32_t total_bytes_checked;
-  uint32_t total_mismatches;
-  uint32_t sample_shifting;
-  bool mode_a_ok;
-  bool mode_b_ok;
-  bool mode_c_ok;
-  bool mode_d_ok;
-  char status_msg[160];
-};
-
 /* Initialize QUADSPI peripheral and GPIOs for IS66WVS PSRAM */
 int psram_init(void);
 
@@ -148,16 +117,6 @@ int psram_read(uint32_t address, uint8_t *data, uint32_t length);
 
 /* Run complete standalone hardware bring-up and memory integrity test */
 int psram_run_self_test(struct psram_test_report *report);
-
-/* Run exhaustive multi-pattern multi-address diagnostic matrix */
-int psram_run_diagnostic_matrix(bool full_matrix, struct psram_diag_report *report);
-
-/* Benchmark PSRAM write/read latency, throughput, and staging chunks */
-int psram_run_benchmark(struct psram_bench_report *report);
-
-/* Configure / query QSPI sample shifting (0 = NONE, 1 = HALFCYCLE) */
-int psram_set_sample_shifting(uint32_t sample_shifting);
-uint32_t psram_get_sample_shifting(void);
 
 /* Query whether Quad I/O mode is verified and active */
 bool psram_is_quad_mode(void);

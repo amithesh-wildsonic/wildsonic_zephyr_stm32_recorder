@@ -6,6 +6,7 @@
 #include <stdint.h>
 #include <stddef.h>
 #include "recorder.h"
+#include "audio_in.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -13,7 +14,10 @@ extern "C" {
 
 /* Runtime Configuration Settings */
 struct app_settings {
-  uint32_t sample_rate;        /* 16000, 32000, 44100, 48000, 96000, 192000 */
+  uint32_t sample_rate;        /* 16000, 32000, 44100, 48000, 96000, 192000, (TEST: 384000, 512000) */
+  uint16_t sample_bits;        /* 16 (default), (TEST: 32) */
+  uint16_t channels;           /* 1 (default), (TEST: 2) */
+  enum audio_capture_source capture_source; /* 0=MIC, 1=STEREO_DUP, 2=SYNTH */
   uint32_t record_seconds;     /* Default 20 s */
   uint32_t sleep_seconds;      /* Default 60 s */
   uint32_t cycles;             /* Default 1, 0 = continuous */
@@ -45,20 +49,7 @@ void main_scheduler_resume(void);
 void main_scheduler_pause(void);
 bool main_is_scheduler_paused(void);
 
-/* Engineering test commands (available in test builds) */
-void main_start_recording(void);
-void main_stop_recording(void);
-#if CONFIG_AUDIO_STAGE_DIAGNOSTICS
-void main_start_compare(void);
-void main_start_stress(void);
-void main_diagnose_command(int matched, const char *arg1);
-#endif
-#if CONFIG_AUDIO_BENCHMARK
-void main_bench_command(int matched, const char *arg1, const char *arg2, const char *arg3);
-#endif
-#if CONFIG_AUDIO_INTEGRITY_REPLAY
-void main_integrity_command(int matched, const char *arg1, const char *arg2);
-#endif
+
 
 #ifdef __cplusplus
 }

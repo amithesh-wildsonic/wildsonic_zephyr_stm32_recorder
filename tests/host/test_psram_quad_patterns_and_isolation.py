@@ -164,22 +164,21 @@ def test_source_code_burst_and_shift_guards():
     assert "PSRAM_IS66WVS_SAFE_BURST_BYTES_QUAD" in psram_c
     assert "PSRAM_IS66WVS_PAGE_SIZE" in psram_c
 
-    # Sample shifting functions
-    assert "psram_set_sample_shifting" in psram_h
-    assert "psram_get_sample_shifting" in psram_h
-    assert "psram_run_diagnostic_matrix" in psram_h
+    # Sample shifting and diagnostic matrix removed from production driver
+    assert "psram_set_sample_shifting" not in psram_h, "psram_set_sample_shifting should be removed"
+    assert "psram_get_sample_shifting" not in psram_h, "psram_get_sample_shifting should be removed"
+    assert "psram_run_diagnostic_matrix" not in psram_h, "psram_run_diagnostic_matrix should be removed"
+    assert "struct psram_diag_report" not in psram_h, "struct psram_diag_report should be removed"
 
-    # Cross-mode error tracking fields in report
-    assert "mode_a_errors" in psram_h
-    assert "mode_b_errors" in psram_h
-    assert "mode_c_errors" in psram_h
-    assert "mode_d_errors" in psram_h
-    assert "sample_shifting" in psram_h
-
-    # main.c console commands
-    assert "psram sshift" in main_c
-    assert "psram diag" in main_c
-    assert "psram test" in main_c
+    # main.c console commands - test commands removed, production commands enforced
+    assert "psram sshift" not in main_c, "psram sshift command should be removed"
+    assert "psram diag" not in main_c, "psram diag command should be removed"
+    assert "psram test" not in main_c, "psram test command should be removed"
+    assert "psram on" in main_c
+    assert "psram off" in main_c
+    assert "psram status" in main_c
+    assert "psram burst" in main_c
+    assert "Cannot change PSRAM staging state while recording is active" in main_c
 
 
 if __name__ == "__main__":

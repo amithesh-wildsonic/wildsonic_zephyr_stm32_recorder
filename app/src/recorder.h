@@ -4,6 +4,7 @@
 
 #include <stdbool.h>
 #include <stdint.h>
+#include <stddef.h>
 
 struct rec_stats {
   uint32_t sample_rate;
@@ -40,17 +41,6 @@ struct rec_stats {
   uint32_t dma_interval_min_us;
   uint32_t dma_interval_avg_us;
   uint32_t dma_interval_max_us;
-#if CONFIG_AUDIO_INTEGRITY_REPLAY
-  bool integrity_replay;
-  bool integrity_audit;
-  uint32_t integrity_expected_crc32;
-  uint32_t integrity_pipeline_crc32;
-  uint32_t integrity_readback_crc32;
-  uint64_t integrity_readback_bytes;
-  uint64_t integrity_readback_samples;
-  uint32_t integrity_readback_blocks;
-  bool integrity_crc_match;
-#endif
   uint32_t worst_write_us;   /* slowest single SD write */
   uint32_t avg_write_us;
   uint32_t write_count;      /* total number of SD write operations */
@@ -64,7 +54,7 @@ struct rec_stats {
   bool wav_verified; /* read-back header and file size validation */
   uint64_t file_size_bytes;
   int err;           /* first negative errno seen, 0 if none */
-  char file[48];     /* expanded to hold /SD:/WS_YYYYMMDD_HHMMSS_NN.WAV */
+  char file[80];     /* expanded to hold /SD:/YYYYMMDD/YYYYMMDD_HH/YYYYMMDD_HHMMSS_NNN.wav */
 
   /* PSRAM Staging Buffer & SD Batch Write Metrics */
   bool psram_used; /* true if PSRAM circular staging was active */
@@ -100,13 +90,6 @@ enum recorder_mode {
   REC_MODE_NORMAL = 0,
   REC_MODE_RAW,
   REC_MODE_FILTERED,
-  REC_MODE_COMPARE,
-  REC_MODE_STRESS,
-  REC_MODE_TEST_SIGNAL,
-#if CONFIG_AUDIO_INTEGRITY_REPLAY
-  REC_MODE_INTEGRITY_REPLAY,
-  REC_MODE_INTEGRITY_CAPTURE
-#endif
 };
 
 /* Initialise audio input + mount the SD card. */
@@ -128,40 +111,23 @@ int recorder_record_session(uint32_t seconds, uint32_t cycle,
 void recorder_request_stop(void);
 bool recorder_is_active(void);
 bool recorder_is_abort_requested(void);
+int recorder_wait_idle(uint32_t timeout_ms);
 
 /* Runtime configuration for PSRAM audio staging buffer (ON/OFF) */
 void recorder_set_psram_staging_enabled(bool enabled);
 bool recorder_is_psram_staging_enabled(void);
 
-/* Check if user requested stop via UART ('q', Ctrl+C, ESC, or "stop") */
-bool console_check_abort_requested(void);
-
 /* Validate WAV file on disk after recording */
 int recorder_verify_file(const char *path, uint32_t expected_rate,
                          uint16_t expected_bits, uint64_t expected_data_bytes);
+int recorder_verify_file_format(const char *path, uint32_t expected_rate,
+                                uint16_t expected_channels, uint16_t expected_bits,
+                                uint64_t expected_data_bytes);
+
+/* Scan SD card for the most recently recorded WAV file based on folder structure */
+int recorder_scan_last_file(char *out_folder, size_t folder_len, char *out_file, size_t file_len);
 
 /* Low-power sleep transition between sessions, with measured wakeup recovery */
 int recorder_sleep(uint32_t seconds, uint32_t *wake_recovery_us);
-
-#if CONFIG_AUDIO_STAGE_DIAGNOSTICS
-/* Run low-overhead intermediate stage isolation diagnostics (A:Raw, B:DC,
- * C:HPF, D:LPF, E:PCM) */
-int recorder_run_stage_diagnostics(uint32_t seconds);
-#endif
-
-/* Unit test for timing and duty cycle calculations */
-void recorder_timing_unit_test(void);
-
-/* Borrow and return blocks from the internal SRAM pool for non-overlapping benchmarks */
-int recorder_borrow_pool_blocks(void **blocks, uint32_t count);
-void recorder_return_pool_blocks(void **blocks, uint32_t count);
-
-/* Borrow the full contiguous underlying SRAM slab buffer (64 KiB) when recorder is idle */
-int recorder_borrow_contiguous_pool(void **buf, uint32_t *max_bytes);
-void recorder_return_contiguous_pool(void);
-
-/* Mutual exclusion state for benchmarks vs live recording */
-bool benchmark_is_running(void);
-void benchmark_set_running(bool running);
 
 #endif

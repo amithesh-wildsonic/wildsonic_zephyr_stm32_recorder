@@ -30,16 +30,6 @@ struct audio_sink {
 	void *user;
 };
 
-#if CONFIG_AUDIO_INTEGRITY_REPLAY
-/* Shared deterministic replay pattern; serialized as little-endian PCM16. */
-static inline int16_t audio_in_integrity_sample(uint64_t index)
-{
-	uint32_t x = (uint32_t)index;
-	uint16_t bits = (uint16_t)((x * 40503U + 17389U) ^ (x >> 3));
-	return (int16_t)bits;
-}
-#endif
-
 /* Diagnostics reported by acquisition backend */
 struct audio_diag {
 	uint32_t total_samples;
@@ -88,19 +78,24 @@ uint32_t audio_in_rate(void);
 int audio_in_set_rate(uint32_t new_rate_hz);
 bool audio_in_is_rate_supported(uint32_t rate_hz, uint32_t *act_rate, uint32_t *divider, int *error_hz);
 
-/* Select the production or diagnostic block size while capture is stopped. */
-int audio_in_set_block_size(uint32_t samples);
+/* Requested rate before hardware timer truncation / rounding */
+uint32_t audio_in_requested_rate(void);
 
-#if CONFIG_AUDIO_INTEGRITY_REPLAY
-/* Test-only deterministic PCM substitution; production builds return -ENOTSUP. */
-int audio_in_set_integrity_replay(bool enabled);
-#else
-static inline int audio_in_set_integrity_replay(bool enabled)
-{
-	(void)enabled;
-	return -ENOTSUP;
-}
-#endif
+/**
+ * @brief Capture source mode selection.
+ */
+enum audio_capture_source {
+	AUDIO_SRC_PHYSICAL_MIC = 0,     /* Physical analog microphone input (MAX4466) */
+	AUDIO_SRC_STEREO_DUPLICATE = 1, /* Real mono ADC capture duplicated to stereo channels */
+	AUDIO_SRC_SYNTHETIC = 2         /* TEST synthetic deterministic sample source */
+};
+
+void audio_in_set_capture_source(enum audio_capture_source src);
+enum audio_capture_source audio_in_get_capture_source(void);
+uint32_t audio_in_get_ovs_ratio(void);
+
+/* Select block size while capture is stopped. */
+int audio_in_set_block_size(uint32_t samples);
 
 int audio_in_start(void);
 int audio_in_stop(void);
@@ -110,12 +105,6 @@ void audio_in_get_diag(struct audio_diag *diag);
 
 /* Reset diagnostics accumulators */
 void audio_in_reset_diag(void);
-
-/* Run standalone diagnostic monitor for the given duration (in seconds) */
-int audio_in_run_diagnostic(uint32_t seconds);
-
-/* Dump hardware register states for TIM6, ADC1, and DMA1 for diagnostic auditing */
-void audio_in_dump_registers(void);
 
 /* Get callback counts for DMA HT and TC interrupts */
 void audio_in_get_callback_counts(uint32_t *ht_count, uint32_t *tc_count);

@@ -88,19 +88,24 @@ int rtc_sleep_init(void)
 	IRQ_CONNECT(RTC_WKUP_IRQn, 1, rtc_wkup_isr, NULL, 0);
 	irq_enable(RTC_WKUP_IRQn);
 
-	/* Configure User Button B1 (PC13) as hardware wakeup source via EXTI Line 13 Event */
+	/* Configure User Button B1 (PC13) as GPIO input, but STRICTLY DISABLE it as a wake source */
 	LL_AHB2_GRP1_EnableClock(LL_AHB2_GRP1_PERIPH_GPIOC);
 	LL_GPIO_SetPinMode(GPIOC, LL_GPIO_PIN_13, LL_GPIO_MODE_INPUT);
 	LL_GPIO_SetPinPull(GPIOC, LL_GPIO_PIN_13, LL_GPIO_PULL_UP);
 
 	LL_APB2_GRP1_EnableClock(LL_APB2_GRP1_PERIPH_SYSCFG);
 	LL_SYSCFG_SetEXTISource(LL_SYSCFG_EXTI_PORTC, LL_SYSCFG_EXTI_LINE13);
-	LL_EXTI_EnableEvent_0_31(LL_EXTI_LINE_13);
-	LL_EXTI_EnableFallingTrig_0_31(LL_EXTI_LINE_13);
+	LL_EXTI_DisableEvent_0_31(LL_EXTI_LINE_13);
+	LL_EXTI_DisableIT_0_31(LL_EXTI_LINE_13);
 	LL_EXTI_ClearFlag_0_31(LL_EXTI_LINE_13);
 
+	/* Disable all STM32 PWR wakeup pins (WKUP1..WKUP5) */
+	LL_PWR_DisableWakeUpPin(LL_PWR_WAKEUP_PIN1 | LL_PWR_WAKEUP_PIN2 | LL_PWR_WAKEUP_PIN3 |
+	                        LL_PWR_WAKEUP_PIN4 | LL_PWR_WAKEUP_PIN5);
+	LL_PWR_ClearFlag_WU();
+
 	rtc_initialized = true;
-	LOG_INF("RTC Wakeup Timer initialized (EXTI Line 20, IRQ %d; B1 Wakeup EXTI Line 13)",
+	LOG_INF("RTC Wakeup Timer initialized (EXTI Line 20, IRQ %d; Strict RTC-only wake enforced)",
 	        RTC_WKUP_IRQn);
 	return 0;
 }
@@ -186,7 +191,7 @@ int rtc_sleep_enter_stop2(uint32_t seconds)
 		}
 	}
 
-	if (recorder_is_abort_requested() || console_check_abort_requested()) {
+	if (recorder_is_abort_requested()) {
 		last_wake_source = RTC_WAKE_CONSOLE_ABORT;
 		return -EINTR;
 	}
@@ -199,7 +204,6 @@ int rtc_sleep_enter_stop2(uint32_t seconds)
 
 	user_button_pressed = false;
 	last_wake_source = RTC_WAKE_NONE;
-	LL_EXTI_ClearFlag_0_31(LL_EXTI_LINE_13);
 
 	/* Ensure User LED (LD2 / PA5) is completely OFF */
 	LL_AHB2_GRP1_EnableClock(LL_AHB2_GRP1_PERIPH_GPIOA);
@@ -217,6 +221,64 @@ int rtc_sleep_enter_stop2(uint32_t seconds)
 		k_busy_wait(10);
 	}
 
+	/*
+	 * =========================================================================
+	 * STRICT RTC-ONLY WAKE SOURCE ENFORCEMENT
+	 * =========================================================================
+	 * 1. Disable USART2 wake-from-stop and interrupts so UART RX cannot wake MCU.
+	 * 2. Disable all STM32 PWR wakeup pins (WKUP1..WKUP5).
+	 * 3. Mask all EXTI lines except EXTI Line 20 (RTC Wakeup Timer).
+	 * 4. Mask all NVIC interrupts except RTC_WKUP_IRQn.
+	 * 5. Suspend SysTick.
+	 * =========================================================================
+	 */
+	LL_USART_DisableInStopMode(USART2);
+	LL_USART_DisableIT_WKUP(USART2);
+	LL_USART_ClearFlag_WKUP(USART2);
+	(void)USART2->RDR;
+	USART2->ICR = 0xFFFFFFFF;
+
+	LL_PWR_DisableWakeUpPin(LL_PWR_WAKEUP_PIN1 | LL_PWR_WAKEUP_PIN2 | LL_PWR_WAKEUP_PIN3 |
+	                        LL_PWR_WAKEUP_PIN4 | LL_PWR_WAKEUP_PIN5);
+	LL_PWR_ClearFlag_WU();
+
+	/* Save active EXTI configuration */
+	uint32_t saved_exti_imr1 = EXTI->IMR1;
+	uint32_t saved_exti_emr1 = EXTI->EMR1;
+	uint32_t saved_exti_imr2 = EXTI->IMR2;
+	uint32_t saved_exti_emr2 = EXTI->EMR2;
+
+	/* Strictly mask all EXTI lines except Line 20 (RTC Wakeup) */
+	EXTI->IMR1 = LL_EXTI_LINE_20;
+	EXTI->EMR1 = 0;
+	EXTI->IMR2 = 0;
+	EXTI->EMR2 = 0;
+	EXTI->PR1 = 0xFFFFFFFF;
+	EXTI->PR2 = 0xFFFFFFFF;
+
+	/* Save active NVIC interrupt enable configuration */
+	uint32_t saved_nvic_iser[3];
+	saved_nvic_iser[0] = NVIC->ISER[0];
+	saved_nvic_iser[1] = NVIC->ISER[1];
+	saved_nvic_iser[2] = NVIC->ISER[2];
+
+	/* Disable all NVIC interrupts except RTC_WKUP_IRQn (IRQ 3) */
+	NVIC->ICER[0] = 0xFFFFFFFF & ~(1UL << (RTC_WKUP_IRQn & 0x1F));
+	NVIC->ICER[1] = 0xFFFFFFFF;
+	NVIC->ICER[2] = 0xFFFFFFFF;
+
+	NVIC->ISER[0] = (1UL << (RTC_WKUP_IRQn & 0x1F));
+
+	/* Clear all pending NVIC flags */
+	NVIC->ICPR[0] = 0xFFFFFFFF;
+	NVIC->ICPR[1] = 0xFFFFFFFF;
+	NVIC->ICPR[2] = 0xFFFFFFFF;
+
+	/* Suspend SysTick to prevent kernel tick interrupts during Stop 2 */
+	uint32_t saved_systick_ctrl = SysTick->CTRL;
+	SysTick->CTRL &= ~(SysTick_CTRL_ENABLE_Msk | SysTick_CTRL_TICKINT_Msk);
+	SCB->ICSR |= SCB_ICSR_PENDSTCLR_Msk;
+
 	/* Configure STM32L4 Power controller for Stop 2 Mode */
 	LL_PWR_EnableBkUpAccess();
 	LL_PWR_ClearFlag_WU();
@@ -233,11 +295,6 @@ int rtc_sleep_enter_stop2(uint32_t seconds)
 	/* Enable Cortex-M4 Deep Sleep (sets SCB->SCR SLEEPDEEP bit) */
 	LL_LPM_EnableDeepSleep();
 
-	/* Suspend SysTick to prevent kernel tick interrupts during Stop 2 */
-	uint32_t saved_systick_ctrl = SysTick->CTRL;
-	SysTick->CTRL &= ~(SysTick_CTRL_ENABLE_Msk | SysTick_CTRL_TICKINT_Msk);
-	SCB->ICSR |= SCB_ICSR_PENDSTCLR_Msk;
-
 	/* Clear pending flags immediately prior to entering Stop 2 */
 	LL_RTC_DisableWriteProtection(RTC);
 	LL_RTC_ClearFlag_WUT(RTC);
@@ -245,14 +302,13 @@ int rtc_sleep_enter_stop2(uint32_t seconds)
 	LL_EXTI_ClearFlag_0_31(LL_EXTI_LINE_20);
 	LL_EXTI_ClearFlag_0_31(LL_EXTI_LINE_13);
 	NVIC_ClearPendingIRQ(RTC_WKUP_IRQn);
-	NVIC_ClearPendingIRQ(EXTI15_10_IRQn);
 
 	/*
 	 * =========================================================================
 	 * ENTER STM32L476 STOP 2 LOW-POWER MODE
 	 * High-speed clocks (PLL, HSI, HSE) are halted.
 	 * VCORE regulator operates in low-power mode. SRAM1 & SRAM2 are retained.
-	 * Only RTC (LSE/LSI) and EXTI lines remain active.
+	 * ONLY RTC (LSE/LSI) on EXTI Line 20 can wake the core.
 	 * MCU core current through JP6 (IDD) drops to ultra-low Stop 2 level.
 	 * =========================================================================
 	 */
@@ -262,7 +318,7 @@ int rtc_sleep_enter_stop2(uint32_t seconds)
 
 	/*
 	 * =========================================================================
-	 * WAKE-UP SEQUENCE FROM STOP 2 MODE
+	 * WAKE-UP SEQUENCE FROM STOP 2 MODE (STRICT RTC WAKE RECOVERY)
 	 * =========================================================================
 	 */
 	/* 1. Clear SLEEPDEEP bit in Cortex-M4 SCR */
@@ -274,26 +330,25 @@ int rtc_sleep_enter_stop2(uint32_t seconds)
 	/* 3. Re-initialize 72 MHz PLL clock tree via Zephyr clock control */
 	stm32_clock_control_init(NULL);
 
-	/* 4. Clear pending EXTI and RTC flags */
+	/* 4. Restore NVIC interrupt enable configuration */
+	NVIC->ISER[0] = saved_nvic_iser[0];
+	NVIC->ISER[1] = saved_nvic_iser[1];
+	NVIC->ISER[2] = saved_nvic_iser[2];
+
+	/* 5. Restore EXTI mask configuration */
+	EXTI->IMR1 = saved_exti_imr1;
+	EXTI->EMR1 = saved_exti_emr1;
+	EXTI->IMR2 = saved_exti_imr2;
+	EXTI->EMR2 = saved_exti_emr2;
+
+	/* 6. Disarm RTC Wakeup Timer and clear pending flags */
+	rtc_sleep_disarm();
 	LL_RTC_DisableWriteProtection(RTC);
 	LL_RTC_ClearFlag_WUT(RTC);
 	LL_RTC_EnableWriteProtection(RTC);
 	LL_EXTI_ClearFlag_0_31(LL_EXTI_LINE_20);
 	LL_EXTI_ClearFlag_0_31(LL_EXTI_LINE_13);
-
-	/* 5. Disarm RTC Wakeup Timer */
-	rtc_sleep_disarm();
-
-	/* 6. Check wake source */
-	if (user_button_pressed || LL_EXTI_IsActiveFlag_0_31(LL_EXTI_LINE_13) ||
-	    LL_GPIO_IsInputPinSet(GPIOC, LL_GPIO_PIN_13) == 0) {
-		last_wake_source = RTC_WAKE_USER_BUTTON;
-		return -EINTR;
-	}
-	if (recorder_is_abort_requested() || console_check_abort_requested()) {
-		last_wake_source = RTC_WAKE_CONSOLE_ABORT;
-		return -EINTR;
-	}
+	NVIC_ClearPendingIRQ(RTC_WKUP_IRQn);
 
 	last_wake_source = RTC_WAKE_TIMER;
 	return 0;
@@ -320,7 +375,7 @@ int rtc_sleep_wait(uint32_t timeout_seconds)
 {
 	if (timeout_seconds == 0) return 0;
 	for (uint32_t s = 0; s < timeout_seconds; s++) {
-		if (recorder_is_abort_requested() || console_check_abort_requested()) {
+		if (recorder_is_abort_requested()) {
 			return -EINTR;
 		}
 		k_sleep(K_SECONDS(1));

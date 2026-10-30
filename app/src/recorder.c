@@ -20,154 +20,61 @@
 #include "rtc_calendar.h"
 #include "rtc_sleep.h"
 #include "wav.h"
+#include "console.h"
+#include "scheduler.h"
+#include "audio_format.h"
+#include "main.h"
+#include <ctype.h>
 #include <ff.h>
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
 #include <zephyr/fs/fs.h>
 #include <zephyr/kernel.h>
 #include <zephyr/logging/log.h>
 #include <zephyr/storage/disk_access.h>
 #include <zephyr/sys/time_units.h>
+#include "led_indicator.h"
 
+#if defined(CONFIG_WILDSONIC_VERBOSE_LOGS)
 LOG_MODULE_REGISTER(recorder, LOG_LEVEL_INF);
+#else
+LOG_MODULE_REGISTER(recorder, LOG_LEVEL_WRN);
+#endif
 
 #define SAMPLE_BYTES (CONFIG_AUDIO_SAMPLE_BITS / 8)
 #define BLOCK_SAMPLES CONFIG_AUDIO_BLOCK_SAMPLES
 #define BLOCK_BYTES (BLOCK_SAMPLES * SAMPLE_BYTES)
 #define NUM_BLOCKS CONFIG_AUDIO_NUM_BLOCKS
-#define DIAG_BLOCK_SAMPLES CONFIG_AUDIO_DIAGNOSTIC_BLOCK_SAMPLES
-#define DIAG_BLOCK_BYTES (DIAG_BLOCK_SAMPLES * SAMPLE_BYTES)
-#define DIAG_POOL_BLOCKS 2
-#define SLOW_WRITE_US 50000U /* log any single write slower than this (50 ms)  \
-                              */
+#define SLOW_WRITE_US 50000U /* log any single write slower than this (50 ms) */
 
-#if CONFIG_AUDIO_INTEGRITY_REPLAY
-static uint32_t crc32_update(uint32_t crc, const uint8_t *data, size_t len)
-{
-  while (len--) {
-    crc ^= *data++;
-    for (unsigned bit = 0; bit < 8; bit++) {
-      crc = (crc >> 1) ^ (0xEDB88320U & (0U - (crc & 1U)));
-    }
-  }
-  return crc;
-}
-
-static uint32_t integrity_expected_crc(uint64_t samples)
-{
-  uint32_t crc = 0xFFFFFFFFU;
-  for (uint64_t i = 0; i < samples; i++) {
-    uint16_t bits = (uint16_t)audio_in_integrity_sample(i);
-    uint8_t pcm_le[2] = {(uint8_t)bits, (uint8_t)(bits >> 8)};
-    crc = crc32_update(crc, pcm_le, sizeof(pcm_le));
-  }
-  return ~crc;
-}
-
-static uint32_t get_le32(const uint8_t *p)
-{
-  return (uint32_t)p[0] | ((uint32_t)p[1] << 8) |
-         ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
-}
-
-static int fs_read_exact(struct fs_file_t *file, void *dst, size_t len)
-{
-  uint8_t *cursor = dst;
-  while (len > 0) {
-    ssize_t got = fs_read(file, cursor, len);
-    if (got < 0) return (int)got;
-    if (got == 0) return -EIO;
-    cursor += (size_t)got;
-    len -= (size_t)got;
-  }
-  return 0;
-}
-
-/* Parse RIFF chunks and read only the data payload, using a bounded 512 B buffer. */
-static int integrity_readback_crc(const char *path, uint32_t *crc_out,
-                                  uint64_t *bytes_out)
-{
-  struct fs_file_t file;
-  struct fs_dirent ent;
-  uint8_t chunk_hdr[8];
-  static uint8_t buf[512] __aligned(4);
-  uint64_t data_offset = 0, data_size = 0;
-  int ret = fs_stat(path, &ent);
-  if (ret != 0) return ret;
-  uint64_t file_size = ent.size;
-
-  fs_file_t_init(&file);
-  ret = fs_open(&file, path, FS_O_READ);
-  if (ret != 0) return ret;
-  uint8_t riff[12];
-  if (fs_read_exact(&file, riff, sizeof(riff)) != 0 ||
-      memcmp(riff, "RIFF", 4) != 0 || memcmp(riff + 8, "WAVE", 4) != 0) {
-    fs_close(&file);
-    return -EBADMSG;
-  }
-  uint64_t riff_end = (uint64_t)get_le32(riff + 4) + 8U;
-  if (riff_end > file_size || riff_end < sizeof(riff)) {
-    fs_close(&file);
-    return -EBADMSG;
-  }
-
-  uint64_t pos = sizeof(riff);
-  while (pos + sizeof(chunk_hdr) <= riff_end) {
-    if (fs_seek(&file, (off_t)pos, FS_SEEK_SET) != 0 ||
-        fs_read_exact(&file, chunk_hdr, sizeof(chunk_hdr)) != 0) {
-      fs_close(&file);
-      return -EIO;
-    }
-    uint32_t chunk_size = get_le32(chunk_hdr + 4);
-    uint64_t payload = pos + sizeof(chunk_hdr);
-    uint64_t chunk_end = payload + chunk_size + (chunk_size & 1U);
-    if (chunk_end > riff_end || chunk_end > file_size) {
-      fs_close(&file);
-      return -EBADMSG;
-    }
-    if (memcmp(chunk_hdr, "data", 4) == 0) {
-      data_offset = payload;
-      data_size = chunk_size;
-      break;
-    }
-    pos = chunk_end;
-  }
-  if (data_size == 0 || data_offset + data_size > riff_end) {
-    fs_close(&file);
-    return -EBADMSG;
-  }
-
-  ret = fs_seek(&file, (off_t)data_offset, FS_SEEK_SET);
-  uint64_t remaining = data_size;
-  uint32_t crc = 0xFFFFFFFFU;
-  while (ret == 0 && remaining > 0) {
-    uint32_t amount = (remaining > sizeof(buf)) ? sizeof(buf) : (uint32_t)remaining;
-    ssize_t got = fs_read(&file, buf, amount);
-    if (got <= 0) {
-      ret = (got < 0) ? (int)got : -EIO;
-      break;
-    }
-    crc = crc32_update(crc, buf, (size_t)got);
-    remaining -= (uint64_t)got;
-  }
-  fs_close(&file);
-  if (ret != 0) return ret;
-  *crc_out = ~crc;
-  *bytes_out = data_size;
-  return 0;
-}
-#endif
-
+/*
+ * Hardware Memory Mapping Note (STM32L476 vs Upstream Zephyr DTS):
+ *
+ * In ST RM0351 documentation:
+ *   - SRAM1: 96 KiB base at 0x20000000 (Main system memory)
+ *   - SRAM2: 32 KiB base at 0x10000000 (Zero wait-state retention memory)
+ *
+ * In Upstream Zephyr Devicetree (dts/arm/st/l4/stm32l4.dtsi & stm32l471.dtsi):
+ *   - sram0: memory@20000000 -> zephyr,memory-region = "SRAM0" (maps to linker region RAM / SRAM0)
+ *   - sram1: memory@10000000 -> zephyr,memory-region = "SRAM1" (maps to linker region SRAM1)
+ *
+ * Zephyr numbers DTS nodes 0-indexed. Hence, Zephyr generates the output section
+ * name "SRAM1" for the physical 32 KiB SRAM2 at 0x10000000.
+ * We define STM32_SRAM2_RETENTION_SECTION to map explicitly to Zephyr's SRAM1 section.
+ */
+#if defined(__ZEPHYR__)
+#define STM32_SRAM2_RETENTION_SECTION __attribute__((section("SRAM1")))
+static char __aligned(4) STM32_SRAM2_RETENTION_SECTION
+    _k_mem_slab_buf_pool[(NUM_BLOCKS) * ROUND_UP(BLOCK_BYTES, 4)];
+static STRUCT_SECTION_ITERABLE(k_mem_slab, pool) =
+    Z_MEM_SLAB_INITIALIZER(pool, _k_mem_slab_buf_pool, BLOCK_BYTES, NUM_BLOCKS);
+#else
 K_MEM_SLAB_DEFINE_STATIC(pool, BLOCK_BYTES, NUM_BLOCKS, 4);
-K_MSGQ_DEFINE(filled_q, sizeof(void *), NUM_BLOCKS, 4);
-#if CONFIG_AUDIO_STAGE_DIAGNOSTICS
-/* CPU-only diagnostic blocks live in the separate 32 KiB SRAM2 region. */
-K_MEM_SLAB_DEFINE_IN_SECT_STATIC(diag_pool, __attribute__((section("SRAM1"))),
-				 DIAG_BLOCK_BYTES, DIAG_POOL_BLOCKS, 4);
-K_MSGQ_DEFINE(diag_filled_q, sizeof(void *), DIAG_POOL_BLOCKS, 4);
 #endif
+K_MSGQ_DEFINE(filled_q, sizeof(void *), NUM_BLOCKS, 4);
 
 /* Asynchronous non-PSRAM block message queue to sd_writer_thread */
 struct sd_block_msg {
@@ -177,7 +84,7 @@ struct sd_block_msg {
 };
 K_MSGQ_DEFINE(sd_block_q, sizeof(struct sd_block_msg), NUM_BLOCKS, 4);
 
-#define SD_WRITER_STACK_SIZE 8192
+#define SD_WRITER_STACK_SIZE 4096
 /* SD writer runs at preemptive priority 2 (below real-time capture priority 0,
  * above background tasks) */
 #define SD_WRITER_PRIORITY 2
@@ -207,10 +114,6 @@ static bool g_psram_staging_enabled = true;
 static bool g_psram_staging_enabled = false;
 #endif
 static volatile bool active_use_psram = false;
-static volatile bool s_benchmark_running = false;
-
-bool benchmark_is_running(void) { return s_benchmark_running; }
-void benchmark_set_running(bool running) { s_benchmark_running = running; }
 
 void recorder_set_psram_staging_enabled(bool enabled) {
   if (enabled) {
@@ -229,58 +132,6 @@ void recorder_set_psram_staging_enabled(bool enabled) {
 }
 
 bool recorder_is_psram_staging_enabled(void) { return g_psram_staging_enabled; }
-
-int recorder_borrow_pool_blocks(void **blocks, uint32_t count) {
-  if (!blocks || count == 0 || count > NUM_BLOCKS) {
-    return -EINVAL;
-  }
-  if (recorder_is_active()) {
-    return -EBUSY;
-  }
-  uint32_t allocated = 0;
-  for (uint32_t i = 0; i < count; i++) {
-    void *blk = NULL;
-    if (k_mem_slab_alloc(&pool, &blk, K_NO_WAIT) != 0) {
-      for (uint32_t j = 0; j < allocated; j++) {
-        k_mem_slab_free(&pool, blocks[j]);
-        blocks[j] = NULL;
-      }
-      return -ENOMEM;
-    }
-    blocks[i] = blk;
-    allocated++;
-  }
-  return 0;
-}
-
-void recorder_return_pool_blocks(void **blocks, uint32_t count) {
-  if (!blocks) return;
-  for (uint32_t i = 0; i < count; i++) {
-    if (blocks[i]) {
-      k_mem_slab_free(&pool, blocks[i]);
-      blocks[i] = NULL;
-    }
-  }
-}
-
-int recorder_borrow_contiguous_pool(void **buf, uint32_t *max_bytes) {
-  if (!buf || !max_bytes) return -EINVAL;
-  if (recorder_is_active()) return -EBUSY;
-  if (k_mem_slab_num_free_get(&pool) != NUM_BLOCKS) return -EBUSY;
-
-  /*
-   * When recorder is idle and all blocks are free, the underlying static array
-   * _k_mem_slab_buf_pool provides a contiguous 64 KiB buffer aligned to 4 bytes.
-   */
-  *buf = (void *)_k_mem_slab_buf_pool;
-  *max_bytes = NUM_BLOCKS * BLOCK_BYTES; /* 16 * 4096 = 65536 */
-  return 0;
-}
-
-void recorder_return_contiguous_pool(void) {
-  /* Restore the slab free-list pointers and clean state for audio recording */
-  k_mem_slab_init(&pool, _k_mem_slab_buf_pool, BLOCK_BYTES, NUM_BLOCKS);
-}
 
 static void sd_writer_thread_fn(void *p1, void *p2, void *p3) {
   ARG_UNUSED(p1);
@@ -383,6 +234,8 @@ static void sd_writer_thread_fn(void *p1, void *p2, void *p3) {
         }
 
         if (sd_writer_err != 0) {
+          LOG_ERR("Batch %u interrupted: wrote %u of %u bytes to SD before failure (%d)",
+                  cur_batch, batch_bytes_written, to_write + batch_bytes_written, sd_writer_err);
           break;
         }
       }
@@ -456,204 +309,13 @@ static volatile uint32_t queue_submit_drops;
 static volatile uint32_t sram_writer_drops;
 static volatile uint32_t high_water;
 static volatile uint32_t audio_queue_high_water;
-static volatile uint32_t diag_queue_high_water;
 static volatile uint32_t sd_queue_high_water;
-#if CONFIG_AUDIO_STAGE_DIAGNOSTICS
-static volatile bool diagnostic_capture_active;
-
-#define DIAG_TARGET_FREQUENCIES 8
-#define DIAG_SCAN_RATE_HZ 8000U
-#define DIAG_SCAN_SAMPLES 8192U
-#define DIAG_SCAN_LOW_HZ 20U
-#define DIAG_SCAN_HIGH_HZ 4000U
-#define DIAG_SCAN_SECTION __attribute__((section("SRAM1")))
-
-/* One 1.024 s decimated Stage A window; the CPU analyzes it after capture. */
-static int16_t diag_scan_ring[DIAG_SCAN_SAMPLES] DIAG_SCAN_SECTION;
-
-struct diag_scan_capture {
-  uint32_t sample_rate_hz;
-  uint32_t decimation;
-  uint32_t samples;
-  uint32_t write_index;
-  uint32_t decimation_phase;
-  int32_t decimation_sum;
-};
-struct diag_goertzel {
-  float frequency_hz;
-  float coeff;
-  float s1;
-  float s2;
-};
-
-struct diag_spectrum {
-  struct diag_goertzel bins[DIAG_TARGET_FREQUENCIES];
-  uint32_t samples;
-};
-
-static const float diag_target_frequencies[DIAG_TARGET_FREQUENCIES] = {
-    50.0f, 60.0f, 93.75f, 100.0f, 120.0f, 150.0f, 187.5f, 200.0f};
-
-static void diag_scan_reset(struct diag_scan_capture *s) {
-  s->samples = 0;
-  s->write_index = 0;
-  s->decimation_phase = 0;
-  s->decimation_sum = 0;
-}
-
-static void diag_scan_init(struct diag_scan_capture *s, uint32_t sample_rate) {
-  memset(s, 0, sizeof(*s));
-  s->sample_rate_hz = sample_rate;
-  s->decimation = (sample_rate % DIAG_SCAN_RATE_HZ == 0)
-                      ? sample_rate / DIAG_SCAN_RATE_HZ
-                      : 0;
-}
-
-static void diag_scan_update(struct diag_scan_capture *s,
-                             const int16_t *samples, uint32_t count,
-                             bool contiguous) {
-  if (!contiguous) diag_scan_reset(s);
-  if (s->decimation == 0) return;
-
-  for (uint32_t i = 0; i < count; i++) {
-    s->decimation_sum += samples[i];
-    s->decimation_phase++;
-    if (s->decimation_phase == s->decimation) {
-      diag_scan_ring[s->write_index] =
-          (int16_t)(s->decimation_sum / (int32_t)s->decimation);
-      s->write_index = (s->write_index + 1U) % DIAG_SCAN_SAMPLES;
-      if (s->samples < DIAG_SCAN_SAMPLES) s->samples++;
-      s->decimation_phase = 0;
-      s->decimation_sum = 0;
-    }
-  }
-}
-
-static void diag_scan_report(const struct diag_scan_capture *s) {
-  uint32_t fs = s->decimation ? s->sample_rate_hz / s->decimation : 0;
-  if (s->samples < fs || fs == 0) {
-    printk("  Broad Stage A Scan: unavailable (need >=1 s contiguous input; "
-           "have %u samples at %u Hz)\n",
-           s->samples, fs);
-    return;
-  }
-
-  uint32_t start = (s->samples == DIAG_SCAN_SAMPLES) ? s->write_index : 0;
-  float strongest_dbfs = -120.0f;
-  float strongest_hz = 0.0f;
-  uint32_t first_bin = (DIAG_SCAN_LOW_HZ * s->samples + fs - 1U) / fs;
-  uint32_t last_bin = (DIAG_SCAN_HIGH_HZ * s->samples) / fs;
-  if (last_bin >= s->samples / 2U) last_bin = s->samples / 2U - 1U;
-
-  for (uint32_t bin = first_bin; bin <= last_bin; bin++) {
-    float frequency = (float)bin * fs / s->samples;
-    float w = 6.283185307179586f * (float)bin / s->samples;
-    float coeff = 2.0f * cosf(w);
-    float q1 = 0.0f, q2 = 0.0f;
-    for (uint32_t i = 0; i < s->samples; i++) {
-      uint32_t index = (start + i) % DIAG_SCAN_SAMPLES;
-      float q0 = (float)diag_scan_ring[index] + coeff * q1 - q2;
-      q2 = q1;
-      q1 = q0;
-    }
-    float power = q1 * q1 + q2 * q2 - coeff * q1 * q2;
-    float peak = (power > 0.0f) ? 2.0f * sqrtf(power) / s->samples : 0.0f;
-    float half_w = 3.141592653589793f * frequency / s->sample_rate_hz;
-    float response = fabsf(sinf(half_w * s->decimation) /
-                           (s->decimation * sinf(half_w)));
-    if (response > 1e-6f) peak /= response;
-    float dbfs = peak > 0.0f ? 20.0f * log10f(peak / 32768.0f) : -120.0f;
-    if (dbfs > strongest_dbfs) {
-      strongest_dbfs = dbfs;
-      strongest_hz = frequency;
-    }
-  }
-
-  printk("  Broad Stage A Scan: %u decimated centered-PCM samples, %u Hz, "
-         "rectangular window, %.3f Hz spacing, %u-%u Hz\n",
-         s->samples, fs, (double)fs / s->samples, DIAG_SCAN_LOW_HZ,
-         DIAG_SCAN_HIGH_HZ);
-  printk("    Strongest scanned peak: %.2f Hz, peak=%7.1f dBFS "
-         "(boxcar response corrected)\n",
-         (double)strongest_hz, (double)strongest_dbfs);
-}
-
-static void diag_spectrum_init(struct diag_spectrum *s, uint32_t sample_rate) {
-  memset(s, 0, sizeof(*s));
-  for (uint32_t i = 0; i < DIAG_TARGET_FREQUENCIES; i++) {
-    float w = 6.283185307179586f * diag_target_frequencies[i] / sample_rate;
-    s->bins[i].frequency_hz = diag_target_frequencies[i];
-    s->bins[i].coeff = 2.0f * cosf(w);
-  }
-}
-
-static void diag_spectrum_update(struct diag_spectrum *s, const int16_t *samples,
-                                 uint32_t count, bool contiguous) {
-  if (!contiguous) {
-    s->samples = 0;
-    for (uint32_t i = 0; i < DIAG_TARGET_FREQUENCIES; i++) {
-      s->bins[i].s1 = 0.0f;
-      s->bins[i].s2 = 0.0f;
-    }
-  }
-  for (uint32_t n = 0; n < count; n++) {
-    float x = (float)samples[n];
-    for (uint32_t i = 0; i < DIAG_TARGET_FREQUENCIES; i++) {
-      struct diag_goertzel *b = &s->bins[i];
-      float next = x + b->coeff * b->s1 - b->s2;
-      b->s2 = b->s1;
-      b->s1 = next;
-    }
-  }
-  s->samples += count;
-}
-
-static void diag_spectrum_report(const struct diag_spectrum *s,
-                                 uint32_t sample_rate) {
-  uint32_t resolution_millihz = s->samples
-                                    ? (uint32_t)(((uint64_t)sample_rate * 1000ULL) /
-                                                 s->samples)
-                                    : 0;
-  printk("  Long Stage A Spectrum: %u contiguous centered-PCM samples, "
-         "rectangular window, resolution %.3f Hz\n",
-         s->samples, (double)resolution_millihz / 1000.0);
-  if (s->samples == 0) {
-    return;
-  }
-  float strongest_dbfs = -120.0f;
-  float strongest_hz = 0.0f;
-  for (uint32_t i = 0; i < DIAG_TARGET_FREQUENCIES; i++) {
-    const struct diag_goertzel *b = &s->bins[i];
-    float power = b->s1 * b->s1 + b->s2 * b->s2 - b->coeff * b->s1 * b->s2;
-    float peak = (power > 0.0f) ? (2.0f * sqrtf(power) / s->samples) : 0.0f;
-    float dbfs = peak > 0.0f ? 20.0f * log10f(peak / 32768.0f) : -120.0f;
-    printk("    %7.2f Hz: peak=%8.2f PCM counts, peak dBFS=%7.1f\n",
-           (double)b->frequency_hz, (double)peak, (double)dbfs);
-    if (dbfs > strongest_dbfs) {
-      strongest_dbfs = dbfs;
-      strongest_hz = b->frequency_hz;
-    }
-  }
-  printk("    Strongest requested target: %.2f Hz at %.1f dBFS peak\n",
-         (double)strongest_hz, (double)strongest_dbfs);
-}
-#endif
 
 /* ---- audio_sink callbacks: called from the high-priority acquisition thread ---- */
 static void *sink_alloc(void *user) {
   void *blk;
 
   ARG_UNUSED(user);
-#if CONFIG_AUDIO_STAGE_DIAGNOSTICS
-  if (diagnostic_capture_active) {
-    if (k_mem_slab_alloc(&diag_pool, &blk, K_NO_WAIT) != 0) {
-      dma_alloc_drops++;
-      drops++;
-      return NULL;
-    }
-    return blk;
-  }
-#endif
   if (k_mem_slab_alloc(&pool, &blk, K_NO_WAIT) != 0) {
     dma_alloc_drops++;
     drops++;
@@ -664,23 +326,6 @@ static void *sink_alloc(void *user) {
 
 static int sink_submit(void *blk, void *user) {
   ARG_UNUSED(user);
-#if CONFIG_AUDIO_STAGE_DIAGNOSTICS
-  if (diagnostic_capture_active) {
-    if (k_msgq_put(&diag_filled_q, &blk, K_NO_WAIT) != 0) {
-      queue_submit_drops++;
-      drops++;
-      k_mem_slab_free(&diag_pool, blk);
-      return -ENOBUFS;
-    }
-    uint32_t queued = k_msgq_num_used_get(&diag_filled_q);
-    if (queued > diag_queue_high_water) diag_queue_high_water = queued;
-    uint32_t in_use = DIAG_POOL_BLOCKS - k_mem_slab_num_free_get(&diag_pool);
-    if (in_use > high_water) {
-      high_water = in_use;
-    }
-    return 0;
-  }
-#endif
   if (k_msgq_put(&filled_q, &blk, K_NO_WAIT) != 0) {
     /* cannot happen (queue as deep as the pool) but never leak a block */
     queue_submit_drops++;
@@ -706,15 +351,9 @@ static int sink_submit(void *blk, void *user) {
 
 static void sink_release(void *blk, void *user) {
   ARG_UNUSED(user);
-#if CONFIG_AUDIO_STAGE_DIAGNOSTICS
-  if (diagnostic_capture_active) {
-    k_mem_slab_free(&diag_pool, blk);
-  } else
-#endif
-  {
-    k_mem_slab_free(&pool, blk);
-  }
+  k_mem_slab_free(&pool, blk);
 }
+
 
 static const struct audio_sink sink = {
     .alloc = sink_alloc,
@@ -826,7 +465,9 @@ int recorder_init(void) {
 
   /* Diagnostic: test raw SD card access before mounting FatFS */
   int sd_ret = disk_access_init("SD");
+#if defined(CONFIG_WILDSONIC_VERBOSE_LOGS)
   printk("[DBG] disk_access_init = %d\n", sd_ret);
+#endif
   LOG_INF("SD diagnostic: disk_access_init = %d", sd_ret);
 
   if (sd_ret == 0) {
@@ -872,9 +513,13 @@ int recorder_init(void) {
     }
   }
 
+#if defined(CONFIG_WILDSONIC_VERBOSE_LOGS)
   printk("[DBG] fs_mount start\n");
+#endif
   ret = fs_mount(&mp);
+#if defined(CONFIG_WILDSONIC_VERBOSE_LOGS)
   printk("[DBG] fs_mount ret=%d\n", ret);
+#endif
   if (ret) {
     LOG_ERR("SD mount failed: %d (card inserted? exFAT/FAT32 formatted? "
             "wiring/overlay?)",
@@ -924,21 +569,18 @@ int recorder_storage_recover(void) {
   if (recorder_is_active()) {
     return -EBUSY;
   }
-  if (!mounted) {
-    return -ENODEV;
+  if (mounted) {
+    int ret = fs_unmount(&mp);
+    if (ret != 0) {
+      LOG_WRN("Storage recovery: filesystem unmount returned %d; proceeding with re-init", ret);
+    }
+    mounted = false;
   }
-
-  int ret = fs_unmount(&mp);
-  if (ret != 0) {
-    LOG_ERR("Storage recovery: filesystem unmount failed: %d", ret);
-    return ret;
-  }
-  mounted = false;
 
   /* FatFs unmount powers the disk off through CTRL_DEINIT. Reinitialize the
    * disk before mounting the volume again; do not retry file operations on
    * the stale mounted filesystem after an SDMMC timeout. */
-  ret = disk_access_init("SD");
+  int ret = disk_access_init("SD");
   if (ret != 0) {
     LOG_ERR("Storage recovery: SDMMC reinitialization failed: %d", ret);
     return ret;
@@ -970,20 +612,261 @@ static int next_filename(char *name, size_t len) {
   return -ENOSPC;
 }
 
+static int ensure_dir_exists(const char *path) {
+#if defined(CONFIG_FILE_SYSTEM)
+  struct fs_dirent ent;
+  int stat_ret = fs_stat(path, &ent);
+  if (stat_ret == 0) {
+    if (ent.type == FS_DIR_ENTRY_DIR) {
+      return 0; /* Directory already exists and is usable */
+    }
+    LOG_ERR("Path %s exists but is not a directory", path);
+    return -ENOTDIR;
+  }
+
+  /* Directory does not exist; attempt to create it */
+  int ret = fs_mkdir(path);
+  if (ret == 0) {
+    return 0; /* Successfully created */
+  }
+  if (ret == -EEXIST) {
+    /* Handle -EEXIST only after verifying that directory exists and is usable */
+    stat_ret = fs_stat(path, &ent);
+    if (stat_ret == 0 && ent.type == FS_DIR_ENTRY_DIR) {
+      return 0;
+    }
+    LOG_ERR("Directory %s failed creation with -EEXIST but stat failed (%d)",
+            path, stat_ret);
+    return (stat_ret != 0) ? stat_ret : -ENOTDIR;
+  }
+  LOG_ERR("Failed to create directory %s: %d", path, ret);
+  return ret;
+#else
+  ARG_UNUSED(path);
+  return 0;
+#endif
+}
+
 static int generate_recording_filename(char *name, size_t len,
                                        bool *rtc_valid) {
   *rtc_valid = false;
   if (rtc_calendar_is_valid()) {
     struct rtc_calendar_time td;
     if (rtc_calendar_get(&td) == 0) {
-      int ret = rtc_calendar_generate_filename(name, len, &td);
-      if (ret == 0) {
+      struct wildsonic_config *cfg = console_get_config();
+      uint8_t folder_mode = cfg ? cfg->folder_structure : 2;
+
+      struct schedule_config scfg;
+      scheduler_get_config(&scfg);
+      int tz_off = scfg.time_zone_offset;
+
+      time_t epoch = scheduler_calendar_to_epoch(&td) + tz_off;
+      struct rtc_calendar_time loc_td;
+      scheduler_epoch_to_calendar(epoch, &loc_td);
+
+      char dir[64] = "/SD:";
+      if (folder_mode == 1) {
+        snprintf(dir, sizeof(dir), "/SD:/%04u%02u%02u", loc_td.year, loc_td.month, loc_td.day);
+        int d_ret = ensure_dir_exists(dir);
+        if (d_ret != 0) {
+          LOG_ERR("Failed to ensure directory %s exists: %d", dir, d_ret);
+          return d_ret;
+        }
+      } else if (folder_mode == 2) {
+        char day_dir[32];
+        snprintf(day_dir, sizeof(day_dir), "/SD:/%04u%02u%02u", loc_td.year, loc_td.month, loc_td.day);
+        int d_ret = ensure_dir_exists(day_dir);
+        if (d_ret != 0) {
+          LOG_ERR("Failed to ensure day directory %s exists: %d", day_dir, d_ret);
+          return d_ret;
+        }
+        snprintf(dir, sizeof(dir), "%s/%04u%02u%02u_%02u", day_dir, loc_td.year, loc_td.month, loc_td.day, loc_td.hour);
+        d_ret = ensure_dir_exists(dir);
+        if (d_ret != 0) {
+          LOG_ERR("Failed to ensure hour directory %s exists: %d", dir, d_ret);
+          return d_ret;
+        }
+      }
+
+      for (unsigned int n = 1; n < 1000; n++) {
+        snprintf(name, len, "%s/WS_%04u%02u%02u_%02u%02u%02u_%02u.WAV",
+                 dir, loc_td.year, loc_td.month, loc_td.day, loc_td.hour, loc_td.min, loc_td.sec, n);
+#if defined(CONFIG_FILE_SYSTEM)
+        struct fs_dirent ent;
+        if (fs_stat(name, &ent) != 0) {
+          *rtc_valid = true;
+          return 0;
+        }
+#else
         *rtc_valid = true;
         return 0;
+#endif
       }
     }
   }
   return next_filename(name, len);
+}
+
+int recorder_scan_last_file(char *out_folder, size_t folder_len, char *out_file, size_t file_len) {
+  if (!out_file || file_len == 0) return -EINVAL;
+  out_file[0] = '\0';
+  if (out_folder && folder_len > 0) out_folder[0] = '\0';
+
+#if defined(CONFIG_FILE_SYSTEM)
+  struct wildsonic_config *cfg = console_get_config();
+  uint8_t folder_mode = cfg ? cfg->folder_structure : 2;
+
+  if (folder_mode == 2) {
+    /* HOUR mode: Find latest YYYYMMDD day dir, then latest YYYYMMDD_HH hour dir, then latest WAV file */
+    struct fs_dir_t dirp;
+    fs_dir_t_init(&dirp);
+    if (fs_opendir(&dirp, "/SD:") == 0) {
+      char latest_day[16] = {0};
+      struct fs_dirent entry;
+      while (fs_readdir(&dirp, &entry) == 0 && entry.name[0] != '\0') {
+        if (entry.type == FS_DIR_ENTRY_DIR && strlen(entry.name) == 8) {
+          bool digits = true;
+          for (int i = 0; i < 8; i++) {
+            if (!isdigit((unsigned char)entry.name[i])) { digits = false; break; }
+          }
+          if (digits && strcmp(entry.name, latest_day) > 0) {
+            strncpy(latest_day, entry.name, sizeof(latest_day) - 1);
+          }
+        }
+      }
+      fs_closedir(&dirp);
+
+      if (latest_day[0] != '\0') {
+        char day_path[32];
+        snprintf(day_path, sizeof(day_path), "/SD:/%s", latest_day);
+        fs_dir_t_init(&dirp);
+        if (fs_opendir(&dirp, day_path) == 0) {
+          char latest_hour[24] = {0};
+          while (fs_readdir(&dirp, &entry) == 0 && entry.name[0] != '\0') {
+            if (entry.type == FS_DIR_ENTRY_DIR && strlen(entry.name) == 11) {
+              if (strcmp(entry.name, latest_hour) > 0) {
+                strncpy(latest_hour, entry.name, sizeof(latest_hour) - 1);
+              }
+            }
+          }
+          fs_closedir(&dirp);
+
+          if (latest_hour[0] != '\0') {
+            char hour_path[64];
+            snprintf(hour_path, sizeof(hour_path), "%s/%s", day_path, latest_hour);
+            fs_dir_t_init(&dirp);
+            if (fs_opendir(&dirp, hour_path) == 0) {
+              char latest_wav[48] = {0};
+              while (fs_readdir(&dirp, &entry) == 0 && entry.name[0] != '\0') {
+                if (entry.type == FS_DIR_ENTRY_FILE) {
+                  size_t nlen = strlen(entry.name);
+                  if (nlen > 4 && (strcasecmp(&entry.name[nlen - 4], ".wav") == 0)) {
+                    if (strcmp(entry.name, latest_wav) > 0) {
+                      strncpy(latest_wav, entry.name, sizeof(latest_wav) - 1);
+                    }
+                  }
+                }
+              }
+              fs_closedir(&dirp);
+
+              if (latest_wav[0] != '\0') {
+                if (out_folder && folder_len > 0) {
+                  strncpy(out_folder, hour_path, folder_len - 1);
+                  out_folder[folder_len - 1] = '\0';
+                }
+                strncpy(out_file, latest_wav, file_len - 1);
+                out_file[file_len - 1] = '\0';
+                return 0;
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+
+  if (folder_mode == 1 || folder_mode == 2) {
+    /* DAY mode (or fallback from HOUR if no hour subfolders): Find latest YYYYMMDD day dir, then latest WAV file */
+    struct fs_dir_t dirp;
+    fs_dir_t_init(&dirp);
+    if (fs_opendir(&dirp, "/SD:") == 0) {
+      char latest_day[16] = {0};
+      struct fs_dirent entry;
+      while (fs_readdir(&dirp, &entry) == 0 && entry.name[0] != '\0') {
+        if (entry.type == FS_DIR_ENTRY_DIR && strlen(entry.name) == 8) {
+          bool digits = true;
+          for (int i = 0; i < 8; i++) {
+            if (!isdigit((unsigned char)entry.name[i])) { digits = false; break; }
+          }
+          if (digits && strcmp(entry.name, latest_day) > 0) {
+            strncpy(latest_day, entry.name, sizeof(latest_day) - 1);
+          }
+        }
+      }
+      fs_closedir(&dirp);
+
+      if (latest_day[0] != '\0') {
+        char day_path[32];
+        snprintf(day_path, sizeof(day_path), "/SD:/%s", latest_day);
+        fs_dir_t_init(&dirp);
+        if (fs_opendir(&dirp, day_path) == 0) {
+          char latest_wav[48] = {0};
+          while (fs_readdir(&dirp, &entry) == 0 && entry.name[0] != '\0') {
+            if (entry.type == FS_DIR_ENTRY_FILE) {
+              size_t nlen = strlen(entry.name);
+              if (nlen > 4 && (strcasecmp(&entry.name[nlen - 4], ".wav") == 0)) {
+                if (strcmp(entry.name, latest_wav) > 0) {
+                  strncpy(latest_wav, entry.name, sizeof(latest_wav) - 1);
+                }
+              }
+            }
+          }
+          fs_closedir(&dirp);
+
+          if (latest_wav[0] != '\0') {
+            if (out_folder && folder_len > 0) {
+              strncpy(out_folder, day_path, folder_len - 1);
+              out_folder[folder_len - 1] = '\0';
+            }
+            strncpy(out_file, latest_wav, file_len - 1);
+            out_file[file_len - 1] = '\0';
+            return 0;
+          }
+        }
+      }
+    }
+  }
+
+  /* FLAT mode (or fallback): Scan root folder for latest WAV file */
+  struct fs_dir_t dirp;
+  fs_dir_t_init(&dirp);
+  if (fs_opendir(&dirp, "/SD:") == 0) {
+    char latest_wav[48] = {0};
+    struct fs_dirent entry;
+    while (fs_readdir(&dirp, &entry) == 0 && entry.name[0] != '\0') {
+      if (entry.type == FS_DIR_ENTRY_FILE) {
+        size_t nlen = strlen(entry.name);
+        if (nlen > 4 && (strcasecmp(&entry.name[nlen - 4], ".wav") == 0)) {
+          if (strcmp(entry.name, latest_wav) > 0) {
+            strncpy(latest_wav, entry.name, sizeof(latest_wav) - 1);
+          }
+        }
+      }
+    }
+    fs_closedir(&dirp);
+
+    if (latest_wav[0] != '\0') {
+      if (out_folder && folder_len > 0) {
+        out_folder[0] = '\0';
+      }
+      strncpy(out_file, latest_wav, file_len - 1);
+      out_file[file_len - 1] = '\0';
+      return 0;
+    }
+  }
+#endif
+
+  return -ENOENT;
 }
 
 static uint32_t drain_queue(void) {
@@ -997,21 +880,9 @@ static uint32_t drain_queue(void) {
   return count;
 }
 
-#if CONFIG_AUDIO_STAGE_DIAGNOSTICS
-static uint32_t drain_diagnostic_queue(void) {
-  void *blk;
-  uint32_t count = 0;
-
-  while (k_msgq_get(&diag_filled_q, &blk, K_NO_WAIT) == 0) {
-    k_mem_slab_free(&diag_pool, blk);
-    count++;
-  }
-  return count;
-}
-#endif
-
-int recorder_verify_file(const char *path, uint32_t expected_rate,
-                         uint16_t expected_bits, uint64_t expected_data_bytes) {
+int recorder_verify_file_format(const char *path, uint32_t expected_rate,
+                                uint16_t expected_channels, uint16_t expected_bits,
+                                uint64_t expected_data_bytes) {
   struct fs_file_t vf;
   fs_file_t_init(&vf);
   int ret = fs_open(&vf, path, FS_O_READ);
@@ -1024,12 +895,17 @@ int recorder_verify_file(const char *path, uint32_t expected_rate,
   ssize_t r = fs_read(&vf, hdr, sizeof(hdr));
   fs_close(&vf);
 
+  if (r < 0) {
+    LOG_ERR("Verify read %s failed with I/O error: %d", path, (int)r);
+    return (int)r;
+  }
   if (r != sizeof(hdr)) {
-    LOG_ERR("Verify read %s failed: %d", path, (int)r);
+    LOG_ERR("Verify read %s short read: %d bytes read (expected %zu)", path,
+            (int)r, sizeof(hdr));
     return -EIO;
   }
 
-  ret = wav_verify_header(hdr, expected_rate, 1, expected_bits,
+  ret = wav_verify_header(hdr, expected_rate, expected_channels, expected_bits,
                           (uint32_t)expected_data_bytes);
   if (ret) {
     LOG_ERR("WAV header verification failed for %s: code %d", path, ret);
@@ -1047,6 +923,11 @@ int recorder_verify_file(const char *path, uint32_t expected_rate,
     }
   }
   return 0;
+}
+
+int recorder_verify_file(const char *path, uint32_t expected_rate,
+                         uint16_t expected_bits, uint64_t expected_data_bytes) {
+  return recorder_verify_file_format(path, expected_rate, 1, expected_bits, expected_data_bytes);
 }
 
 int recorder_sleep(uint32_t seconds, uint32_t *wake_recovery_us) {
@@ -1117,6 +998,17 @@ bool recorder_is_abort_requested(void) { return recorder_abort_requested; }
 
 void recorder_request_stop(void) { recorder_abort_requested = true; }
 
+int recorder_wait_idle(uint32_t timeout_ms) {
+  int64_t start = k_uptime_get();
+  while (recorder_active) {
+    if (timeout_ms != UINT32_MAX && (uint32_t)(k_uptime_get() - start) > timeout_ms) {
+      return -ETIMEDOUT;
+    }
+    k_sleep(K_MSEC(10));
+  }
+  return 0;
+}
+
 int recorder_record(uint32_t seconds, struct rec_stats *out) {
   return recorder_record_session(seconds, 1, REC_MODE_NORMAL, out);
 }
@@ -1128,15 +1020,7 @@ int recorder_record_cycle(uint32_t seconds, uint32_t cycle,
 
 int recorder_record_session(uint32_t seconds, uint32_t cycle,
                             enum recorder_mode mode, struct rec_stats *out) {
-  if (benchmark_is_running()) {
-    LOG_ERR("Cannot start recording: benchmark is currently running");
-    if (out) {
-      memset(out, 0, sizeof(*out));
-      out->err = -EBUSY;
-    }
-    return -EBUSY;
-  }
-
+  ARG_UNUSED(cycle);
   struct rec_stats st;
   memset(&st, 0, sizeof(st));
   if (out) {
@@ -1146,12 +1030,6 @@ int recorder_record_session(uint32_t seconds, uint32_t cycle,
   recorder_active = true;
 
   bool apply_dsp = true;
-  bool is_test_signal = false;
-#if CONFIG_AUDIO_INTEGRITY_REPLAY
-  bool is_integrity_replay = (mode == REC_MODE_INTEGRITY_REPLAY);
-  bool is_integrity_audit = is_integrity_replay ||
-                            (mode == REC_MODE_INTEGRITY_CAPTURE);
-#endif
   const char *mode_str = "FILTERED";
 
   switch (mode) {
@@ -1159,39 +1037,8 @@ int recorder_record_session(uint32_t seconds, uint32_t cycle,
     apply_dsp = false;
     mode_str = "RAW (Unfiltered ADC PCM)";
     break;
-  case REC_MODE_FILTERED:
-    apply_dsp = true;
-    mode_str = "FILTERED (Active DSP Chain)";
-    break;
-  case REC_MODE_COMPARE:
-    if ((cycle % 2) == 1) {
-      apply_dsp = false;
-      mode_str = "RAW (Comparison Cycle 1)";
-    } else {
-      apply_dsp = true;
-      mode_str = "FILTERED (Comparison Cycle 2)";
-    }
-    break;
-  case REC_MODE_STRESS:
-    apply_dsp = true;
-    mode_str = "STRESS TEST";
-    break;
-  case REC_MODE_TEST_SIGNAL:
-    apply_dsp = true;
-    is_test_signal = true;
-    mode_str = "TEST SIGNAL (Synthetic Calibration Tone)";
-    break;
-#if CONFIG_AUDIO_INTEGRITY_REPLAY
-  case REC_MODE_INTEGRITY_REPLAY:
-    apply_dsp = false;
-    mode_str = "TEST ONLY PCM REPLAY (ADC values substituted; DSP/gain bypassed)";
-    break;
-  case REC_MODE_INTEGRITY_CAPTURE:
-    apply_dsp = true;
-    mode_str = "INTEGRITY ADC CAPTURE (production DSP/gain; PCM readback CRC)";
-    break;
-#endif
   case REC_MODE_NORMAL:
+  case REC_MODE_FILTERED:
   default:
     apply_dsp = true;
     mode_str = "PRODUCTION FILTERED";
@@ -1203,14 +1050,17 @@ int recorder_record_session(uint32_t seconds, uint32_t cycle,
   dsp_reset();
   dsp_reset_stats(audio_in_rate(), BLOCK_SAMPLES);
   dsp_reset_all_clipping_counts();
+#if defined(CONFIG_WILDSONIC_VERBOSE_LOGS)
   printk("[PHASE 3] DSP initialized (%s, gain %.2fx)\n", st.dsp_mode_str,
          (double)st.digital_gain);
+#endif
 
   struct fs_file_t f;
   static uint8_t hdr[WAV_HEADER_BYTES] __aligned(4);
   int ret;
 
   if (!mounted) {
+    led_indicator_set(LED_IND_ERROR);
     st.err = -ENODEV;
     recorder_active = false;
     if (out)
@@ -1218,25 +1068,26 @@ int recorder_record_session(uint32_t seconds, uint32_t cycle,
     return -ENODEV;
   }
   st.sample_rate = audio_in_rate();
-  st.sample_bits = CONFIG_AUDIO_SAMPLE_BITS;
-  st.channels = 1;
+  struct app_settings *cur_settings = main_get_settings();
+  if (cur_settings) {
+    st.sample_bits = cur_settings->sample_bits ? cur_settings->sample_bits : 16;
+    st.channels = cur_settings->channels ? cur_settings->channels : 1;
+  } else {
+    st.sample_bits = 16;
+    st.channels = 1;
+  }
 
+  uint32_t bytes_per_frame = (uint32_t)st.channels * ((uint32_t)st.sample_bits / 8U);
   st.expected_samples = (uint64_t)seconds * st.sample_rate;
   const uint64_t want_blocks =
       (st.expected_samples + BLOCK_SAMPLES - 1) / BLOCK_SAMPLES;
   st.expected_blocks = (uint32_t)want_blocks;
-  const uint64_t exact_bytes = st.expected_samples * SAMPLE_BYTES;
-  const uint64_t prealloc_bytes = want_blocks * BLOCK_BYTES;
-  ARG_UNUSED(prealloc_bytes);
-#if CONFIG_AUDIO_INTEGRITY_REPLAY
-  st.integrity_replay = is_integrity_replay;
-  st.integrity_audit = is_integrity_audit;
-  if (is_integrity_replay) {
-    st.integrity_expected_crc32 = integrity_expected_crc(st.expected_samples);
-    printk("[INTEGRITY] Expected PCM16 LE payload: %llu samples, %llu bytes, CRC32=%08x\n",
-           st.expected_samples, exact_bytes, st.integrity_expected_crc32);
+  uint64_t exact_bytes = st.expected_samples * bytes_per_frame;
+  if (st.sample_bits == 16 && st.channels == 1) {
+    exact_bytes = st.expected_samples * SAMPLE_BYTES;
   }
-#endif
+  const uint64_t prealloc_bytes = want_blocks * (BLOCK_SAMPLES * bytes_per_frame);
+  ARG_UNUSED(prealloc_bytes);
 
   bool rtc_valid = false;
   ret = generate_recording_filename(st.file, sizeof(st.file), &rtc_valid);
@@ -1253,6 +1104,7 @@ int recorder_record_session(uint32_t seconds, uint32_t cycle,
     snprintf(st.start_time_str, sizeof(st.start_time_str), "[RTC UNSET]");
   }
   if (ret) {
+    led_indicator_set(LED_IND_ERROR);
     st.file[0] = '\0';
     st.err = ret;
     if (out)
@@ -1263,6 +1115,7 @@ int recorder_record_session(uint32_t seconds, uint32_t cycle,
   ret = fs_open(&f, st.file, FS_O_CREATE | FS_O_WRITE);
   if (ret) {
     LOG_ERR("open %s: %d", st.file, ret);
+    led_indicator_set(LED_IND_ERROR);
     st.file[0] = '\0';
     st.err = ret;
     if (out)
@@ -1297,9 +1150,10 @@ int recorder_record_session(uint32_t seconds, uint32_t cycle,
   LOG_INF("File pre-allocation disabled; using sequential dynamic writes");
 #endif
 
-  wav_fill_header(hdr, st.sample_rate, 1, CONFIG_AUDIO_SAMPLE_BITS, 0);
+  wav_fill_header(hdr, st.sample_rate, st.channels, st.sample_bits, 0);
   ret = fs_write(&f, hdr, WAV_HEADER_BYTES);
   if (ret != WAV_HEADER_BYTES) {
+    led_indicator_set(LED_IND_ERROR);
     fs_close(&f);
     fs_unlink(st.file);
     st.file[0] = '\0';
@@ -1309,8 +1163,10 @@ int recorder_record_session(uint32_t seconds, uint32_t cycle,
       *out = st;
     return st.err;
   }
+#if defined(CONFIG_WILDSONIC_VERBOSE_LOGS)
   printk("[PHASE 4] WAV file opened: %s (header %u bytes written)\n", st.file,
          WAV_HEADER_BYTES);
+#endif
 
   drops = 0;
   dma_alloc_drops = 0;
@@ -1366,37 +1222,43 @@ int recorder_record_session(uint32_t seconds, uint32_t cycle,
     k_mem_slab_free(&pool, stale_msg.blk);
   }
 
+#if defined(CONFIG_WILDSONIC_VERBOSE_LOGS)
+  if (audio_format_is_experimental(st.sample_rate, st.channels, st.sample_bits)) {
+    uint32_t est_rate_bps = st.sample_rate * bytes_per_frame;
+    printk("\n================================================================================\n");
+    printk("WARNING: Experimental audio configuration active\n");
+    printk("  Not validated for production hardware: for bench and platform validation only\n");
+    printk("  Rate: %u Hz (Requested: %u Hz) | Channels: %u | Bits: %u\n",
+           st.sample_rate, audio_in_requested_rate(), st.channels, st.sample_bits);
+    printk("  Data rate: %u bytes/sec (%u KB/s) | Target platform: STM32U585\n",
+           est_rate_bps, est_rate_bps / 1000);
+    if (st.channels == 2) {
+      if (audio_in_get_capture_source() == AUDIO_SRC_SYNTHETIC) {
+        printk("  Channel mode: Synthetic dual-tone (Left=1 kHz sine, Right=2 kHz sine)\n");
+      } else {
+        printk("  Channel mode: Duplicated Mono container (2 channels, single ADC input)\n");
+      }
+    }
+    if (st.sample_bits == 32) {
+      printk("  PCM format: 32-bit signed PCM (container scaled via audio_pcm16_to_pcm32, 4 bytes/sample)\n");
+    }
+    printk("================================================================================\n\n");
+  }
+#endif
+
   const uint32_t buffer_ms =
       (uint32_t)((uint64_t)NUM_BLOCKS * BLOCK_SAMPLES * 1000 / st.sample_rate);
-  LOG_INF("recording %u s to %s at %u Hz, %u-bit mono (expect %llu samples, %u "
+  const char *ch_str = (st.channels == 2) ? "stereo" : "mono";
+  LOG_INF("recording %u s to %s at %u Hz, %u-bit %s (expect %llu samples, %u "
           "blocks, %llu bytes, pool %u = %u ms buffer)",
-          seconds, st.file, st.sample_rate, CONFIG_AUDIO_SAMPLE_BITS,
+          seconds, st.file, st.sample_rate, st.sample_bits, ch_str,
           st.expected_samples, st.expected_blocks, exact_bytes, NUM_BLOCKS,
           buffer_ms);
 
-#if CONFIG_AUDIO_INTEGRITY_REPLAY
-  ret = is_integrity_replay ? audio_in_set_integrity_replay(true) : 0;
-#else
-  ret = 0;
-#endif
-  if (ret != 0) {
-    fs_close(&f);
-    fs_unlink(st.file);
-    st.file[0] = '\0';
-    st.err = ret;
-    if (out) *out = st;
-    return ret;
-  }
-#if CONFIG_AUDIO_INTEGRITY_REPLAY
-  uint32_t pipeline_crc_state = 0xFFFFFFFFU;
-  uint64_t pipeline_crc_bytes = 0;
-#endif
   ret = audio_in_start();
   if (ret) {
-#if CONFIG_AUDIO_INTEGRITY_REPLAY
-    if (is_integrity_replay) audio_in_set_integrity_replay(false);
-#endif
     LOG_ERR("audio_in_start failed: %d", ret);
+    led_indicator_set(LED_IND_ERROR);
     fs_close(&f);
     fs_unlink(st.file);
     st.file[0] = '\0';
@@ -1407,6 +1269,8 @@ int recorder_record_session(uint32_t seconds, uint32_t cycle,
     return ret;
   }
 
+  led_indicator_set(LED_IND_RECORDING);
+
   const uint64_t t_start_cyc = k_cycle_get_64();
   uint64_t t_first_block_cyc = 0;
   uint64_t t_last_block_cyc = 0;
@@ -1414,8 +1278,7 @@ int recorder_record_session(uint32_t seconds, uint32_t cycle,
   uint64_t samples_remaining = st.expected_samples;
 
   while (samples_remaining > 0) {
-    if (recorder_abort_requested || console_check_abort_requested()) {
-      recorder_abort_requested = true;
+    if (recorder_abort_requested) {
       LOG_INF("Stop requested: finalizing recorded frames early (%llu samples "
               "written)",
               st.samples_written);
@@ -1440,17 +1303,6 @@ int recorder_record_session(uint32_t seconds, uint32_t cycle,
     uint32_t samples_in_block = (samples_remaining > BLOCK_SAMPLES)
                                     ? BLOCK_SAMPLES
                                     : (uint32_t)samples_remaining;
-    uint32_t bytes_to_write = samples_in_block * SAMPLE_BYTES;
-
-    if (is_test_signal) {
-#if CONFIG_AUDIO_SAMPLE_BITS == 32
-      dsp_generate_test_signal_i32((int32_t *)blk, samples_in_block,
-                                   st.sample_rate);
-#else
-      dsp_generate_test_signal_i16((int16_t *)blk, samples_in_block,
-                                   st.sample_rate);
-#endif
-    }
 
     if (apply_dsp) {
 #if CONFIG_AUDIO_SAMPLE_BITS == 32
@@ -1460,103 +1312,210 @@ int recorder_record_session(uint32_t seconds, uint32_t cycle,
 #endif
     }
 
-#if CONFIG_AUDIO_INTEGRITY_REPLAY
-    /* This is the finalized PCM immediately before PSRAM/SD queue handoff. */
-    if (is_integrity_audit) {
-      pipeline_crc_state = crc32_update(pipeline_crc_state,
-                                         (const uint8_t *)blk, bytes_to_write);
-      pipeline_crc_bytes += bytes_to_write;
-    }
-#endif
-
-    if (use_psram) {
-      int p_ret = psram_staging_push(blk, bytes_to_write, samples_in_block);
-      k_mem_slab_free(&pool, blk);
-
-      if (p_ret == -ENOBUFS) {
-        /* PSRAM staging buffer is full */
-        st.psram_full_events++;
-        st.psram_dropped_samples += samples_in_block;
-        static uint32_t last_full_warn_ms = 0;
-        uint32_t now_ms = k_uptime_get_32();
-        if (now_ms - last_full_warn_ms > 1000) {
-          last_full_warn_ms = now_ms;
-          LOG_WRN("PSRAM staging buffer full! Occupancy: %u KB / %u KB. "
-                  "Dropping audio block (%u samples)",
-                  psram_staging_occupied() >> 10,
-                  psram_staging_capacity() >> 10, samples_in_block);
-        }
-        /* Abort capture cleanly to preserve stream integrity */
-        err = -ENOBUFS;
-        break;
-      } else if (p_ret != 0) {
-        LOG_ERR("PSRAM push fatal error: %d", p_ret);
-        err = p_ret;
-        break;
-      }
-
-      if (sd_writer_err != 0) {
-        LOG_ERR("SD writer error detected in recording loop: %d",
-                sd_writer_err);
-        err = sd_writer_err;
-        break;
-      }
-
-      /* Trigger SD writer if batch threshold reached */
-      if (psram_staging_occupied() >= psram_staging_batch_size()) {
-        k_sem_give(&sd_writer_sem);
-      }
-
-      if (samples_in_block == BLOCK_SAMPLES) {
-        st.full_blocks_written++;
-      } else {
-        st.partial_blocks_written++;
-        st.partial_block_samples = samples_in_block;
-      }
-      st.blocks_written++;
-      if (st.blocks_written == 1) {
-        printk(
-            "[PHASE 8] First block accepted and buffered in PSRAM (%u bytes)\n",
-            bytes_to_write);
-      }
-      st.samples_accepted += samples_in_block;
-      samples_remaining -= samples_in_block;
-    } else {
-      /* Decoupled non-PSRAM storage path: Enqueue processed block to
-       * sd_writer_thread */
-      struct sd_block_msg s_msg = {
-          .blk = blk,
-          .bytes = bytes_to_write,
-          .samples = samples_in_block,
-      };
-
-      int q_ret = k_msgq_put(&sd_block_q, &s_msg, K_NO_WAIT);
-      if (q_ret == 0) {
-        uint32_t sd_queued = k_msgq_num_used_get(&sd_block_q);
-        if (sd_queued > sd_queue_high_water) sd_queue_high_water = sd_queued;
-      }
-      if (q_ret != 0) {
-        /* Bounded RAM queue capacity exhausted */
-        sram_writer_drops++;
+    if (st.sample_bits == 16 && st.channels == 1) {
+      uint32_t bytes_to_write = samples_in_block * SAMPLE_BYTES;
+      if (use_psram) {
+        int p_ret = psram_staging_push(blk, bytes_to_write, samples_in_block);
         k_mem_slab_free(&pool, blk);
-        LOG_ERR("Non-PSRAM RAM queue exhausted (%u/%u blocks)! Dropping block "
-                "(%u samples). Aborting capture.",
-                (unsigned)k_msgq_num_used_get(&sd_block_q), NUM_BLOCKS,
-                samples_in_block);
-        err = -ENOBUFS;
-        break;
+
+        if (p_ret == -ENOBUFS) {
+          /* PSRAM staging buffer is full */
+          st.psram_full_events++;
+          st.psram_dropped_samples += samples_in_block;
+          static uint32_t last_full_warn_ms = 0;
+          uint32_t now_ms = k_uptime_get_32();
+          if (now_ms - last_full_warn_ms > 1000) {
+            last_full_warn_ms = now_ms;
+            LOG_WRN("PSRAM staging buffer full! Occupancy: %u KB / %u KB. "
+                    "Dropping audio block (%u samples)",
+                    psram_staging_occupied() >> 10,
+                    psram_staging_capacity() >> 10, samples_in_block);
+          }
+          /* Abort capture cleanly to preserve stream integrity */
+          err = -ENOBUFS;
+          break;
+        } else if (p_ret != 0) {
+          LOG_ERR("PSRAM push fatal error: %d", p_ret);
+          err = p_ret;
+          break;
+        }
+
+        if (sd_writer_err != 0) {
+          LOG_ERR("SD writer error detected in recording loop: %d",
+                  sd_writer_err);
+          err = sd_writer_err;
+          break;
+        }
+
+        /* Trigger SD writer if batch threshold reached */
+        if (psram_staging_occupied() >= psram_staging_batch_size()) {
+          k_sem_give(&sd_writer_sem);
+        }
+
+        if (samples_in_block == BLOCK_SAMPLES) {
+          st.full_blocks_written++;
+        } else {
+          st.partial_blocks_written++;
+          st.partial_block_samples = samples_in_block;
+        }
+        st.blocks_written++;
+#if defined(CONFIG_WILDSONIC_VERBOSE_LOGS)
+        if (st.blocks_written == 1) {
+          printk(
+              "[PHASE 8] First block accepted and buffered in PSRAM (%u bytes)\n",
+              bytes_to_write);
+        }
+#endif
+        st.samples_accepted += samples_in_block;
+        samples_remaining -= samples_in_block;
+      } else {
+        /* Decoupled non-PSRAM storage path: Enqueue processed block to
+         * sd_writer_thread */
+        struct sd_block_msg s_msg = {
+            .blk = blk,
+            .bytes = bytes_to_write,
+            .samples = samples_in_block,
+        };
+
+        int q_ret = k_msgq_put(&sd_block_q, &s_msg, K_NO_WAIT);
+        if (q_ret == 0) {
+          uint32_t sd_queued = k_msgq_num_used_get(&sd_block_q);
+          if (sd_queued > sd_queue_high_water) sd_queue_high_water = sd_queued;
+        }
+        if (q_ret != 0) {
+          /* Bounded RAM queue capacity exhausted */
+          sram_writer_drops++;
+          k_mem_slab_free(&pool, blk);
+          LOG_ERR("Non-PSRAM RAM queue exhausted (%u/%u blocks)! Dropping block "
+                  "(%u samples). Aborting capture.",
+                  (unsigned)k_msgq_num_used_get(&sd_block_q), NUM_BLOCKS,
+                  samples_in_block);
+          err = -ENOBUFS;
+          break;
+        }
+
+        /* Signal SD writer thread to consume queued block */
+        k_sem_give(&sd_writer_sem);
+
+        if (sd_writer_err != 0) {
+          LOG_ERR("SD writer error detected in recording loop: %d",
+                  sd_writer_err);
+          err = sd_writer_err;
+          break;
+        }
+
+        if (samples_in_block == BLOCK_SAMPLES) {
+          st.full_blocks_written++;
+        } else {
+          st.partial_blocks_written++;
+          st.partial_block_samples = samples_in_block;
+        }
+        st.blocks_written++;
+#if defined(CONFIG_WILDSONIC_VERBOSE_LOGS)
+        if (st.blocks_written == 1) {
+          printk("[PHASE 8] First block accepted and written (%u bytes, queued "
+                 "to SD writer)\n",
+                 bytes_to_write);
+        }
+#endif
+        st.samples_accepted += samples_in_block;
+        samples_remaining -= samples_in_block;
+      }
+    } else {
+      /* Experimental format conversion (32-bit PCM, stereo duplication, synthetic tone) */
+      static uint8_t format_chunk_buf[8192] __aligned(4);
+      uint32_t chunk_frames = 1024;
+      bool chunk_failed = false;
+      const int16_t *src_s16 = (const int16_t *)blk;
+
+      for (uint32_t off = 0; off < samples_in_block; off += chunk_frames) {
+        uint32_t chunk_len = (samples_in_block - off > chunk_frames) ? chunk_frames : (samples_in_block - off);
+        uint32_t chunk_bytes = chunk_len * bytes_per_frame;
+
+        if (st.sample_bits == 32 && st.channels == 1) {
+          int32_t *dst32 = (int32_t *)format_chunk_buf;
+          for (uint32_t k = 0; k < chunk_len; k++) {
+            dst32[k] = audio_pcm16_to_pcm32(src_s16[off + k]);
+          }
+        } else if (st.sample_bits == 16 && st.channels == 2) {
+          int16_t *dst16 = (int16_t *)format_chunk_buf;
+          if (audio_in_get_capture_source() == AUDIO_SRC_SYNTHETIC) {
+            for (uint32_t k = 0; k < chunk_len; k++) {
+              uint64_t gframe = st.samples_accepted + off + k;
+              float p1 = 2.0f * 3.14159265f * 1000.0f * (float)gframe / (float)st.sample_rate;
+              float p2 = 2.0f * 3.14159265f * 2000.0f * (float)gframe / (float)st.sample_rate;
+              dst16[2 * k + 0] = (int16_t)(sinf(p1) * 16384.0f);
+              dst16[2 * k + 1] = (int16_t)(sinf(p2) * 16384.0f);
+            }
+          } else {
+            /* Duplicated Mono container: copy single ADC channel to both Left and Right */
+            for (uint32_t k = 0; k < chunk_len; k++) {
+              int16_t s = src_s16[off + k];
+              dst16[2 * k + 0] = s;
+              dst16[2 * k + 1] = s;
+            }
+          }
+        } else if (st.sample_bits == 32 && st.channels == 2) {
+          int32_t *dst32 = (int32_t *)format_chunk_buf;
+          if (audio_in_get_capture_source() == AUDIO_SRC_SYNTHETIC) {
+            for (uint32_t k = 0; k < chunk_len; k++) {
+              uint64_t gframe = st.samples_accepted + off + k;
+              float p1 = 2.0f * 3.14159265f * 1000.0f * (float)gframe / (float)st.sample_rate;
+              float p2 = 2.0f * 3.14159265f * 2000.0f * (float)gframe / (float)st.sample_rate;
+              dst32[2 * k + 0] = audio_pcm16_to_pcm32((int16_t)(sinf(p1) * 16384.0f));
+              dst32[2 * k + 1] = audio_pcm16_to_pcm32((int16_t)(sinf(p2) * 16384.0f));
+            }
+          } else {
+            /* Duplicated Mono container: copy single ADC channel to both Left and Right in 32-bit container */
+            for (uint32_t k = 0; k < chunk_len; k++) {
+              int32_t s32 = audio_pcm16_to_pcm32(src_s16[off + k]);
+              dst32[2 * k + 0] = s32;
+              dst32[2 * k + 1] = s32;
+            }
+          }
+        }
+
+        if (use_psram) {
+          int p_ret = psram_staging_push(format_chunk_buf, chunk_bytes, chunk_len);
+          if (p_ret == -ENOBUFS) {
+            st.psram_full_events++;
+            st.psram_dropped_samples += (samples_in_block - off);
+            err = -ENOBUFS;
+            chunk_failed = true;
+            break;
+          } else if (p_ret != 0) {
+            LOG_ERR("PSRAM push fatal error: %d", p_ret);
+            err = p_ret;
+            chunk_failed = true;
+            break;
+          }
+        } else {
+          ssize_t w = fs_write(&f, format_chunk_buf, chunk_bytes);
+          if (w != (ssize_t)chunk_bytes) {
+            err = (w < 0) ? (int)w : -EIO;
+            sd_writer_err = err;
+            chunk_failed = true;
+            break;
+          }
+          sd_writer_bytes_written += chunk_bytes;
+          sd_writer_write_count++;
+        }
       }
 
-      /* Signal SD writer thread to consume queued block */
-      k_sem_give(&sd_writer_sem);
-
-      if (sd_writer_err != 0) {
-        LOG_ERR("SD writer error detected in recording loop: %d",
-                sd_writer_err);
-        err = sd_writer_err;
+      k_mem_slab_free(&pool, blk);
+      if (chunk_failed) {
         break;
       }
-
+      if (use_psram) {
+        if (sd_writer_err != 0) {
+          LOG_ERR("SD writer error detected in recording loop: %d", sd_writer_err);
+          err = sd_writer_err;
+          break;
+        }
+        if (psram_staging_occupied() >= psram_staging_batch_size()) {
+          k_sem_give(&sd_writer_sem);
+        }
+      }
       if (samples_in_block == BLOCK_SAMPLES) {
         st.full_blocks_written++;
       } else {
@@ -1564,11 +1523,12 @@ int recorder_record_session(uint32_t seconds, uint32_t cycle,
         st.partial_block_samples = samples_in_block;
       }
       st.blocks_written++;
+#if defined(CONFIG_WILDSONIC_VERBOSE_LOGS)
       if (st.blocks_written == 1) {
-        printk("[PHASE 8] First block accepted and written (%u bytes, queued "
-               "to SD writer)\n",
-               bytes_to_write);
+        printk("[PHASE 8] First experimental block formatted and buffered (%u bytes)\n",
+               samples_in_block * bytes_per_frame);
       }
+#endif
       st.samples_accepted += samples_in_block;
       samples_remaining -= samples_in_block;
     }
@@ -1580,9 +1540,6 @@ int recorder_record_session(uint32_t seconds, uint32_t cycle,
   uint64_t session_wall_us = k_cyc_to_us_floor64(wall_cyc);
 
   audio_in_stop();
-#if CONFIG_AUDIO_INTEGRITY_REPLAY
-  if (is_integrity_replay) audio_in_set_integrity_replay(false);
-#endif
   uint32_t drained_blocks = drain_queue();
   st.queue_drained_blocks = drained_blocks;
   st.queue_drained_samples = drained_blocks * BLOCK_SAMPLES;
@@ -1606,6 +1563,9 @@ int recorder_record_session(uint32_t seconds, uint32_t cycle,
                           BLOCK_SAMPLES;
 
   /* Signal SD writer thread to flush any remaining audio bytes/blocks */
+  if (use_psram) {
+    psram_staging_flush_publish();
+  }
   sd_writer_flush_req = true;
   k_sem_give(&sd_writer_sem);
   k_sem_take(&sd_writer_done_sem, K_FOREVER);
@@ -1623,7 +1583,7 @@ int recorder_record_session(uint32_t seconds, uint32_t cycle,
   }
 
   st.bytes_written = sd_writer_bytes_written;
-  st.samples_written = st.bytes_written / SAMPLE_BYTES;
+  st.samples_written = (bytes_per_frame > 0) ? (st.bytes_written / bytes_per_frame) : 0;
   st.write_count = sd_writer_write_count;
   st.worst_write_us = sd_writer_worst_write_us;
   st.total_write_us = sd_writer_write_us_sum;
@@ -1632,14 +1592,7 @@ int recorder_record_session(uint32_t seconds, uint32_t cycle,
           ? (uint32_t)(sd_writer_bytes_written / sd_writer_write_count)
           : 0;
   st.sd_write_error = sd_writer_err;
-  st.sd_failed_samples = sd_writer_failed_bytes / SAMPLE_BYTES;
-#if CONFIG_AUDIO_INTEGRITY_REPLAY
-  st.integrity_pipeline_crc32 = ~pipeline_crc_state;
-  if (is_integrity_audit && !is_integrity_replay) {
-    /* For live ADC, the finalized pre-writer PCM stream is the reference. */
-    st.integrity_expected_crc32 = st.integrity_pipeline_crc32;
-  }
-#endif
+  st.sd_failed_samples = (bytes_per_frame > 0) ? (sd_writer_failed_bytes / bytes_per_frame) : 0;
 
   if (use_psram) {
     struct psram_staging_stats pstat;
@@ -1721,22 +1674,28 @@ int recorder_record_session(uint32_t seconds, uint32_t cycle,
    * space */
   const uint32_t data_bytes = (uint32_t)st.bytes_written;
 
-  wav_fill_header(hdr, st.sample_rate, 1, CONFIG_AUDIO_SAMPLE_BITS, data_bytes);
-  int finalize_ret = fs_seek(&f, 0, FS_SEEK_SET);
-  if (finalize_ret == 0) {
-    ssize_t header_written = fs_write(&f, hdr, WAV_HEADER_BYTES);
-    if (header_written != WAV_HEADER_BYTES)
-      finalize_ret = (header_written < 0) ? (int)header_written : -EIO;
+  wav_fill_header(hdr, st.sample_rate, st.channels, st.sample_bits, data_bytes);
+  int finalize_ret = 0;
+  if (err == 0 && sd_writer_err == 0) {
+    finalize_ret = fs_seek(&f, 0, FS_SEEK_SET);
+    if (finalize_ret == 0) {
+      ssize_t header_written = fs_write(&f, hdr, WAV_HEADER_BYTES);
+      if (header_written != WAV_HEADER_BYTES)
+        finalize_ret = (header_written < 0) ? (int)header_written : -EIO;
+    }
+    if (finalize_ret == 0)
+      finalize_ret = fs_truncate(&f, WAV_HEADER_BYTES + data_bytes);
+    if (finalize_ret == 0)
+      finalize_ret = fs_sync(&f);
+  } else {
+    LOG_WRN("Skipping WAV header finalization due to previous storage error (%d)",
+            err != 0 ? err : sd_writer_err);
   }
-  if (finalize_ret == 0)
-    finalize_ret = fs_truncate(&f, WAV_HEADER_BYTES + data_bytes);
-  if (finalize_ret == 0)
-    finalize_ret = fs_sync(&f);
   int close_ret = fs_close(&f);
   if (finalize_ret == 0) finalize_ret = close_ret;
-  if (finalize_ret != 0) {
+  if (finalize_ret != 0 && err == 0) {
     LOG_ERR("WAV finalize/sync/close failed: %d", finalize_ret);
-    if (err == 0) err = finalize_ret;
+    err = finalize_ret;
     if (st.sd_write_error == 0) st.sd_write_error = finalize_ret;
   }
 
@@ -1755,522 +1714,52 @@ int recorder_record_session(uint32_t seconds, uint32_t cycle,
     }
   }
 
-  /* Verify the file on disk if audio frames were written */
-  if (st.bytes_written > 0) {
-    int v_ret = recorder_verify_file(
-        st.file, st.sample_rate, CONFIG_AUDIO_SAMPLE_BITS, st.bytes_written);
+  /* Verify the file on disk ONLY if audio frames were written AND session completed cleanly without errors */
+  if (err == 0 && !recorder_abort_requested && st.bytes_written > 0) {
+    int v_ret = recorder_verify_file_format(
+        st.file, st.sample_rate, st.channels, st.sample_bits, st.bytes_written);
     st.wav_verified = (v_ret == 0);
-    if (v_ret != 0 && err == 0) {
+    if (v_ret != 0) {
+      LOG_ERR("Post-recording file verification failed: %d", v_ret);
       err = v_ret;
     }
+  } else {
+    st.wav_verified = false;
   }
   struct fs_dirent file_ent;
   if (fs_stat(st.file, &file_ent) == 0) {
     st.file_size_bytes = file_ent.size;
   }
 
-#if CONFIG_AUDIO_INTEGRITY_REPLAY
-  if (is_integrity_audit) {
-    uint64_t payload_bytes = 0;
-    int crc_ret = integrity_readback_crc(st.file,
-                                         &st.integrity_readback_crc32,
-                                         &payload_bytes);
-    if (crc_ret == 0) {
-      st.integrity_readback_bytes = payload_bytes;
-      st.integrity_readback_samples = payload_bytes / SAMPLE_BYTES;
-      st.integrity_readback_blocks = (uint32_t)((st.integrity_readback_samples +
-                                     BLOCK_SAMPLES - 1U) / BLOCK_SAMPLES);
-      st.integrity_crc_match =
-          (st.integrity_expected_crc32 == st.integrity_readback_crc32) &&
-          (st.integrity_expected_crc32 == st.integrity_pipeline_crc32) &&
-          (pipeline_crc_bytes == exact_bytes) &&
-          (payload_bytes == exact_bytes) &&
-          st.wav_verified &&
-          (st.file_size_bytes == WAV_HEADER_BYTES + exact_bytes) &&
-          (st.integrity_readback_samples == st.expected_samples) &&
-          (st.integrity_readback_blocks == st.expected_blocks);
-    } else if (err == 0) {
-      err = crc_ret;
-    }
-    printk("[INTEGRITY] CRC expected=%08x pipeline=%08x readback=%08x; bytes=%llu/%llu samples=%llu/%llu blocks=%u/%u; %s\n",
-           st.integrity_expected_crc32, st.integrity_pipeline_crc32,
-           st.integrity_readback_crc32, st.integrity_readback_bytes, exact_bytes,
-           st.integrity_readback_samples, st.expected_samples,
-           st.integrity_readback_blocks, st.expected_blocks,
-           st.integrity_crc_match ? "PASS" : "FAIL");
-  }
-#endif
-
   st.queue_high_water = audio_queue_high_water;
   st.pool_high_water = high_water;
   st.sd_queue_high_water = sd_queue_high_water;
   st.err = err;
+  if (err != 0) {
+    st.wav_verified = false;
+  }
 
   if (out) {
     *out = st;
   }
   recorder_active = false;
+  if (err != 0 && !recorder_abort_requested) {
+    led_indicator_set(LED_IND_ERROR);
+    printk("[ERROR] Recording session failed: %d\n", err);
+#if defined(CONFIG_WILDSONIC_VERBOSE_LOGS)
+    printk("  Diagnostics: acquired=%llu, written=%llu, uncommitted=%llu, drops=%llu\n",
+           (unsigned long long)st.samples_acquired,
+           (unsigned long long)st.samples_written,
+           (unsigned long long)st.sd_failed_samples,
+           (unsigned long long)st.samples_dropped);
+    printk("  Pipeline: dma_err=%u, adc_ovr=%u, dsp_ovr=%u, psram_full=%u, sd_err=%d\n",
+           st.dma_errors, st.adc_overruns, st.dsp_overruns, st.psram_full_events, st.sd_write_error);
+#endif
+    /* Cleanly unmount and remount storage to recover from SDMMC/FatFs timeout */
+    recorder_storage_recover();
+  } else {
+    led_indicator_set(LED_IND_OFF);
+  }
   return err;
 }
 
-#if CONFIG_AUDIO_STAGE_DIAGNOSTICS
-int recorder_run_stage_diagnostics(uint32_t seconds) {
-  if (seconds == 0)
-    seconds = 5;
-  if (recorder_active) {
-    LOG_ERR("Cannot run stage diagnostic while recording is active");
-    return -EBUSY;
-  }
-  uint32_t rate = audio_in_rate();
-  if (rate == 0) return -EINVAL;
-  uint64_t requested_samples = (uint64_t)seconds * rate;
-  uint64_t total_blocks_64 =
-      (requested_samples + DIAG_BLOCK_SAMPLES - 1U) / DIAG_BLOCK_SAMPLES;
-  if (total_blocks_64 > UINT32_MAX ||
-      total_blocks_64 * DIAG_BLOCK_SAMPLES > UINT32_MAX) {
-    return -ERANGE;
-  }
-  int ret = audio_in_set_block_size(DIAG_BLOCK_SAMPLES);
-  if (ret) {
-    LOG_ERR("Unable to select diagnostic block size %u: %d",
-            DIAG_BLOCK_SAMPLES, ret);
-    return ret;
-  }
-  diagnostic_capture_active = true;
-  uint32_t total_blocks = (uint32_t)total_blocks_64;
-  float f_block = (float)rate / (float)DIAG_BLOCK_SAMPLES;
-  uint32_t deadline_us =
-      (uint32_t)((uint64_t)DIAG_BLOCK_SAMPLES * 1000000ULL / rate);
-
-  struct stage_metrics sm[5];
-  dsp_stage_metrics_init(&sm[0], "Stage A (Centered PCM)", rate, DIAG_BLOCK_SAMPLES);
-  dsp_stage_metrics_init(&sm[1], "Stage B (After DC)", rate, DIAG_BLOCK_SAMPLES);
-  dsp_stage_metrics_init(&sm[2], "Stage C (Post-HPF)", rate, DIAG_BLOCK_SAMPLES);
-  dsp_stage_metrics_init(&sm[3], "Stage D (Post-LPF)", rate, DIAG_BLOCK_SAMPLES);
-  dsp_stage_metrics_init(&sm[4], "Stage E (Final PCM)", rate, DIAG_BLOCK_SAMPLES);
-
-  dsp_reset();
-  dsp_reset_all_clipping_counts();
-  drops = 0;
-  dma_alloc_drops = 0;
-  queue_submit_drops = 0;
-  high_water = 0;
-  diag_queue_high_water = 0;
-  drain_queue();
-  drain_diagnostic_queue();
-
-  printk("\n==================================================================="
-         "======================\n");
-  printk("               INTERMEDIATE SIGNAL STAGE ISOLATION DIAGNOSTIC (%u s) "
-         "                    \n",
-         seconds);
-  printk("  MCU / ADC         : STM32L476RG ADC1 + TIM6 TRGO + DMA1 Ch1\n");
-  printk("  Sampling Rate     : %u Hz (Block size: %u samples = %.2f ms / %.4f "
-         "Hz)\n",
-         rate, DIAG_BLOCK_SAMPLES,
-         (double)DIAG_BLOCK_SAMPLES * 1000.0 / rate,
-         (double)f_block);
-  printk("  Block Harmonics   : 1x %.3f Hz, 2x %.3f Hz, 3x %.3f Hz, 4x %.3f Hz\n",
-         (double)f_block, (double)f_block * 2.0,
-         (double)f_block * 3.0, (double)f_block * 4.0);
-  printk(
-      "  Block Deadline    : %u us per block (Real-time latency requirement)\n",
-      deadline_us);
-  printk("  Testing Stages    : A: Raw ADC -> B: DC Block -> C: HPF/Notch -> "
-         "D: LPF -> E: Final PCM\n");
-  printk("  Measurement Mode  : Real-time In-RAM Bounded Analysis (SDMMC card "
-         "quiescent / no writes)\n");
-  printk("====================================================================="
-         "====================\n");
-
-  int64_t start_ms = k_uptime_get();
-  ret = audio_in_start();
-  if (ret) {
-    LOG_ERR("audio_in_start failed: %d", ret);
-    diagnostic_capture_active = false;
-    (void)audio_in_set_block_size(BLOCK_SAMPLES);
-    return ret;
-  }
-
-  uint32_t blocks_read = 0;
-  uint32_t last_drops = 0;
-  void *ref_blk = NULL;
-  bool ref_blk_contiguous = false;
-  struct diag_spectrum long_spectrum;
-  diag_spectrum_init(&long_spectrum, rate);
-  struct diag_scan_capture broad_scan;
-  diag_scan_init(&broad_scan, rate);
-  uint32_t last_event_misses = 0;
-  struct biquad_df2t blk_pre_stages[6];
-  struct biquad_df2t ref_pre_stages[6];
-
-  uint32_t min_proc_us = UINT32_MAX;
-  uint32_t worst_proc_us = 0;
-  uint64_t total_proc_us = 0;
-
-  while (blocks_read < total_blocks) {
-    if (console_check_abort_requested()) {
-      printk("\nDiagnostic aborted by user.\n");
-      break;
-    }
-    void *blk;
-    if (k_msgq_get(&diag_filled_q, &blk, K_SECONDS(2)) != 0) {
-      LOG_ERR("Diagnostic timeout waiting for block");
-      break;
-    }
-    blocks_read++;
-
-    uint32_t cur_drops = drops;
-    uint32_t cur_event_misses = audio_in_get_missed_event_count();
-    bool is_contiguous = (blocks_read == 1)
-                             ? (cur_event_misses == 0)
-                             : (cur_drops == last_drops &&
-                                cur_event_misses == last_event_misses);
-    last_drops = cur_drops;
-    last_event_misses = cur_event_misses;
-
-#if CONFIG_AUDIO_SAMPLE_BITS == 16
-    diag_spectrum_update(&long_spectrum, (const int16_t *)blk,
-                         DIAG_BLOCK_SAMPLES, is_contiguous);
-    diag_scan_update(&broad_scan, (const int16_t *)blk,
-                     DIAG_BLOCK_SAMPLES, is_contiguous);
-#endif
-
-    dsp_get_stage_filters(blk_pre_stages);
-
-    uint64_t t0 = k_cycle_get_64();
-#if CONFIG_AUDIO_SAMPLE_BITS == 16
-    dsp_process_stage_diagnostics_realtime((const int16_t *)blk,
-                                           DIAG_BLOCK_SAMPLES, sm,
-                                           is_contiguous);
-#endif
-    uint64_t t1 = k_cycle_get_64();
-    uint32_t proc_us =
-        (uint32_t)k_cyc_to_us_floor64((t1 >= t0) ? (t1 - t0) : 0);
-
-    if (proc_us < min_proc_us)
-      min_proc_us = proc_us;
-    if (proc_us > worst_proc_us)
-      worst_proc_us = proc_us;
-    total_proc_us += proc_us;
-
-    if (ref_blk) {
-      k_mem_slab_free(&diag_pool, ref_blk);
-    }
-    ref_blk = blk;
-    ref_blk_contiguous = is_contiguous;
-    memcpy(ref_pre_stages, blk_pre_stages, sizeof(ref_pre_stages));
-  }
-
-  int64_t elapsed_ms = k_uptime_get() - start_ms;
-
-  audio_in_stop();
-  struct audio_dma_stats final_dma_stats = {0};
-  audio_in_get_dma_stats(&final_dma_stats);
-  uint32_t queued_discarded = drain_diagnostic_queue();
-
-  uint32_t act_drops = drops;
-  uint32_t hw = high_water;
-  uint32_t prod_blocks = final_dma_stats.callbacks;
-  uint32_t avg_proc_us =
-      blocks_read ? (uint32_t)(total_proc_us / blocks_read) : 0;
-  if (min_proc_us == UINT32_MAX)
-    min_proc_us = 0;
-  float cpu_load_pct =
-      deadline_us ? ((float)avg_proc_us * 100.0f / (float)deadline_us) : 0.0f;
-
-  if (act_drops == 0 && ref_blk && ref_blk_contiguous) {
-#if CONFIG_AUDIO_SAMPLE_BITS == 16
-    dsp_run_post_capture_spectral_analysis((const int16_t *)ref_blk,
-                                           DIAG_BLOCK_SAMPLES, ref_pre_stages,
-                                           sm);
-#endif
-  }
-
-  if (ref_blk) {
-    k_mem_slab_free(&diag_pool, ref_blk);
-    ref_blk = NULL;
-  }
-
-  printk("  Diagnostic Blocks : %u DSP processed, %u producer block drops "
-         "(Pool high-water: "
-         "%u/%u blocks)\n",
-         blocks_read, act_drops, hw, DIAG_POOL_BLOCKS);
-  printk("  Producer Blocks   : %u HT/TC callbacks; %u DSP processed; %u "
-         "queued after target and discarded\n",
-         prod_blocks, blocks_read, queued_discarded);
-  printk(
-      "  Memory Pool Status: High-water %u/%u blocks (Peak usage: %u bytes)\n",
-      hw, DIAG_POOL_BLOCKS, hw * DIAG_BLOCK_BYTES);
-  printk("  Queue / Block Drops: diag queue high-water=%u/%u; slab failures=%u; "
-         "queue submit drops=%u; total producer drops=%u\n",
-         diag_queue_high_water, DIAG_POOL_BLOCKS, dma_alloc_drops,
-         queue_submit_drops, act_drops);
-  printk("  Real-time Latency : Min: %u us, Avg: %u us, Worst: %u us "
-         "(Deadline: %u us, CPU Load: %.1f%%)\n",
-         min_proc_us, avg_proc_us, worst_proc_us, deadline_us,
-         (double)cpu_load_pct);
-  struct audio_dma_stats dma_stats = final_dma_stats;
-  struct audio_diag adc_diag = {0};
-  audio_in_get_diag(&adc_diag);
-  uint32_t dma_ht = 0, dma_tc = 0;
-  audio_in_get_callback_counts(&dma_ht, &dma_tc);
-  uint32_t dma_interval_min_us = (uint32_t)k_cyc_to_us_floor64(
-      dma_stats.callback_interval_min_cycles);
-  uint32_t dma_interval_avg_us = (uint32_t)k_cyc_to_us_floor64(
-      dma_stats.callback_interval_avg_cycles);
-  uint32_t dma_interval_max_us = (uint32_t)k_cyc_to_us_floor64(
-      dma_stats.callback_interval_max_cycles);
-  printk("  DMA / Acquisition : HT=%u TC=%u ADC_OVR=%u DMA_errors=%u missed=%u "
-         "samples=%llu accounted=%u processed=%u lost=%u\n",
-         dma_ht, dma_tc, dma_stats.adc_overruns,
-         dma_stats.callback_errors, dma_stats.events_missed,
-         (unsigned long long)dma_stats.samples_acquired,
-         dma_stats.samples_accounted, dma_stats.samples_processed,
-         dma_stats.samples_lost);
-#if CONFIG_AUDIO_SRC_ADC_STM32L4
-  printk("  Raw ADC Codes     : N=%u min=%u max=%u mean=%u p-p=%u RMS/DC=%u "
-         "AC_RMS=%u codes (%u mV), RMS dBFS=%d.%d rail0=%u railMax=%u\n",
-         adc_diag.total_samples, adc_diag.raw_min, adc_diag.raw_max,
-         adc_diag.raw_midpoint, adc_diag.peak_to_peak, adc_diag.raw_rms_code,
-         adc_diag.raw_ac_rms_code, adc_diag.raw_rms_mv,
-         adc_diag.raw_rms_dbfs_x10 / 10,
-         abs(adc_diag.raw_rms_dbfs_x10 % 10),
-         adc_diag.clipping_low_count, adc_diag.clipping_high_count);
-#else
-  printk("  Raw ADC Codes     : not applicable for synthetic input\n");
-#endif
-  diag_spectrum_report(&long_spectrum, rate);
-  diag_scan_report(&broad_scan);
-  printk("  Callback Interval : min/avg/max=%u/%u/%u us; acquisition "
-         "wake latency max=%u cycles, process avg/max=%u/%u cycles; queue "
-	 "high-water=%u/%u\n",
-         dma_interval_min_us, dma_interval_avg_us, dma_interval_max_us,
-         dma_stats.acquisition_max_latency_cycles,
-         dma_stats.acquisition_process_avg_cycles,
-         dma_stats.acquisition_process_max_cycles,
-         dma_stats.event_queue_high_water, AUDIO_DMA_EVENT_QUEUE_DEPTH);
-  printk("  Elapsed Time      : %u ms (Target: %u s)\n", (uint32_t)elapsed_ms,
-         seconds);
-  if (sm[0].spectral_valid) {
-    printk("  Final-block Stages: %u contiguous samples for the 1x/2x "
-           "block-rate Goertzel comparison\n",
-           sm[0].spectral_samples);
-  } else {
-    printk("  Final-block Stages: REJECTED (spectral_valid = false: %u buffer "
-           "drops)\n",
-           act_drops);
-  }
-
-  for (int s = 0; s < 5; s++) {
-    dsp_stage_metrics_finish(&sm[s]);
-  }
-
-  printk("\nStage (PCM counts)  | Count  | Min    | Max    | P-P    | Mean   | RMS/DC | AC RMS | Near FS "
-         "| Excursions*| Bnd Delta | In Delta | final 1x   | final 2x\n");
-  printk("--------------------+--------+--------+--------+--------+--------+--------+--------+---------+--"
-         "----------+-----------+----------+------------+------------\n");
-  for (int s = 0; s < 5; s++) {
-    int32_t mean = sm[s].sample_count
-                       ? (int32_t)(sm[s].sum / (int64_t)sm[s].sample_count)
-                       : 0;
-    uint32_t rms =
-        sm[s].sample_count
-            ? (uint32_t)sqrtf((float)(sm[s].sum_sq / sm[s].sample_count))
-            : 0;
-    int64_t mean_sq = sm[s].sample_count
-                          ? sm[s].sum / (int64_t)sm[s].sample_count
-                          : 0;
-    uint64_t mean_square = (uint64_t)(mean_sq * mean_sq);
-    uint64_t mean_rms_sq = sm[s].sample_count
-                               ? sm[s].sum_sq / sm[s].sample_count
-                               : 0;
-    uint32_t ac_rms = (uint32_t)sqrtf((float)(mean_rms_sq > mean_square
-                                                   ? mean_rms_sq - mean_square
-                                                   : 0));
-    uint32_t peak_to_peak = sm[s].sample_count
-                                ? (uint32_t)((int64_t)sm[s].max - sm[s].min)
-                                : 0;
-    uint32_t bnd_avg =
-        sm[s].boundary_count
-            ? (uint32_t)(sm[s].boundary_delta_sum / sm[s].boundary_count)
-            : 0;
-    uint32_t in_avg =
-        sm[s].inside_delta_count
-            ? (uint32_t)(sm[s].inside_delta_sum / sm[s].inside_delta_count)
-            : 0;
-
-    char nfs_buf[16];
-    if (s == 0 || s == 4) {
-      snprintk(nfs_buf, sizeof(nfs_buf), "%7u", sm[s].near_full_scale);
-    } else {
-      snprintk(nfs_buf, sizeof(nfs_buf), "  N/A  ");
-    }
-
-    char bnd_buf[16];
-    if (sm[s].boundary_count > 0) {
-      snprintk(bnd_buf, sizeof(bnd_buf), "%5u/%-3u", bnd_avg,
-               sm[s].boundary_delta_max);
-    } else {
-      snprintk(bnd_buf, sizeof(bnd_buf), "  N/A    ");
-    }
-
-    char in_buf[16];
-    if (sm[s].inside_delta_count > 0) {
-      snprintk(in_buf, sizeof(in_buf), "%4u/%-4u", in_avg,
-               sm[s].inside_delta_max);
-    } else {
-      snprintk(in_buf, sizeof(in_buf), "  N/A   ");
-    }
-
-    char spec_buf1[16];
-    char spec_buf2[16];
-    if (sm[s].spectral_valid) {
-      snprintk(spec_buf1, sizeof(spec_buf1), "%6.1f dBFS",
-               (double)sm[s].g_mag[0]);
-      snprintk(spec_buf2, sizeof(spec_buf2), "%6.1f dBFS",
-               (double)sm[s].g_mag[1]);
-    } else {
-      snprintk(spec_buf1, sizeof(spec_buf1), "  INVALID ");
-      snprintk(spec_buf2, sizeof(spec_buf2), "  INVALID ");
-    }
-
-    printk("%-19s | %6u | %6d | %6d | %6u | %+6d | %6u | %6u | %-7s | %10u | %-9s | %-8s | %-10s "
-           "| %-10s\n",
-           sm[s].name, sm[s].sample_count, sm[s].min, sm[s].max, peak_to_peak,
-           mean, rms, ac_rms, nfs_buf,
-           sm[s].clip_count, bnd_buf, in_buf, spec_buf1, spec_buf2);
-  }
-  printk("====================================================================="
-         "====================\n");
-  printk("  * RMS/DC includes DC offset; AC RMS is RMS after subtracting the "
-         "stage mean.\n");
-  printk("  * Final-block spectra and Long Stage A spectra report peak-amplitude "
-         "dBFS (20 log10(peak / 32768)); PCM counts are centered signed 16-bit.\n");
-  printk("  * Near FS:    Samples with |v| >= 31128 (within 5%% of PCM full "
-         "scale).\n");
-  printk("  * Excursions: Stage A = PCM saturation after conversion (hardware "
-         "ADC rail counts are printed above);\n");
-  printk("                Stages B..D = Intermediate float headroom overshoot "
-         "(> +-32767);\n");
-  printk("                Stage E = Final digital PCM clamps (clamped to "
-         "[-32768, +32767]).\n");
-  printk("  Note: Stages B..D use 32-bit floating-point arithmetic with full "
-         "headroom (>140 dB dynamic range).\n");
-  printk("        Values beyond +-32767 reflect filter resonance/overshoot "
-         "without integer wraparound or precision loss.\n");
-  printk("---------------------------------------------------------------------"
-         "--------------------\n");
-
-  diagnostic_capture_active = false;
-  ret = audio_in_set_block_size(BLOCK_SAMPLES);
-  if (ret) {
-    LOG_ERR("Unable to restore production block size %u: %d",
-            BLOCK_SAMPLES, ret);
-    return ret;
-  }
-
-  /* Diagnostic Automated Verdict */
-  printk("DIAGNOSTIC VERDICT & ROOT-CAUSE ANALYSIS:\n");
-  bool deadline_violated =
-      (worst_proc_us > deadline_us) || (avg_proc_us > deadline_us);
-
-  if (act_drops > 0) {
-    printk("  [FAIL] Real-time buffer overflow detected: %u blocks dropped!\n",
-           act_drops);
-    printk("         Producer generated: %u blocks, Consumer processed: %u "
-           "blocks.\n",
-           prod_blocks, blocks_read);
-    printk("         Spectral analysis REJECTED (spectral_valid = false) to "
-           "prevent discontinuous data as noise evidence.\n");
-    printk("         Boundary delta calculation skipped dropped-block gaps to "
-           "preserve metric integrity.\n");
-  } else if (deadline_violated) {
-    printk("  [FAIL] Real-time processing deadline violated!\n");
-    printk("         Average latency: %u us, Worst latency: %u us (Block "
-           "deadline: %u us, CPU Load: %.1f%%).\n",
-           avg_proc_us, worst_proc_us, deadline_us, (double)cpu_load_pct);
-    printk("         Buffer pool temporarily masked the overrun (high-water: "
-           "%u/%u blocks),\n",
-           hw, DIAG_POOL_BLOCKS);
-    printk("         but longer recording sessions will exhaust available RAM "
-           "and drop blocks.\n");
-  } else {
-    int32_t margin_us = (int32_t)deadline_us - (int32_t)worst_proc_us;
-    printk("  [PASS] Real-time processing strictly bounded: 0 blocks dropped "
-           "(Pool high-water: %u/%u blocks).\n",
-           hw, DIAG_POOL_BLOCKS);
-    printk("         Latency: Min=%u us, Avg=%u us, Worst=%u us (Deadline: %u "
-           "us, Margin: +%d us, CPU load: %.1f%%).\n",
-           min_proc_us, avg_proc_us, worst_proc_us, deadline_us, margin_us,
-           (double)cpu_load_pct);
-
-    float a_1x = sm[0].g_mag[0];
-    float e_1x = sm[4].g_mag[0];
-    float d_diff = fabsf(e_1x - a_1x);
-
-    if (a_1x > -60.0f && d_diff < 3.0f) {
-      printk("  [OBSERVATION] Block-frequency components are visible in the "
-             "centered PCM Stage A at %.1f Hz and %.1f Hz.\n",
-             (double)f_block, (double)(2.0f * f_block));
-      printk("           This alone does not establish an electrical or software "
-             "cause; compare raw ADC and WAV data.\n");
-    } else if (e_1x > (a_1x + 6.0f)) {
-      printk("  [RESULT] DSP pipeline amplified block-frequency tone by %.1f "
-             "dB.\n",
-             (double)(e_1x - a_1x));
-    } else {
-      printk("  [PASS] Stage A shows clean spectrum (1x f_blk = %.1f dBFS, 2x "
-             "f_blk = %.1f dBFS).\n",
-             (double)a_1x, (double)sm[0].g_mag[1]);
-    }
-
-    uint32_t bnd0 =
-        sm[0].boundary_count
-            ? (uint32_t)(sm[0].boundary_delta_sum / sm[0].boundary_count)
-            : 0;
-    uint32_t in0 =
-        sm[0].inside_delta_count
-            ? (uint32_t)(sm[0].inside_delta_sum / sm[0].inside_delta_count)
-            : 0;
-    if (bnd0 > in0 * 2 && bnd0 > 500) {
-      printk("  [WARN] Block boundary delta (%u) is significantly higher than "
-             "inside delta (%u).\n",
-             bnd0, in0);
-    } else {
-      printk("  [PASS] Block boundary delta (%u) is consistent with continuous "
-             "intra-block deltas (%u).\n",
-             bnd0, in0);
-      printk("         Zero evidence of buffer truncation, skipped samples, or "
-             "block discontinuities.\n");
-    }
-  }
-
-  uint32_t rmsA =
-      sm[0].sample_count
-          ? (uint32_t)sqrtf((float)(sm[0].sum_sq / sm[0].sample_count))
-          : 0;
-  if (sm[0].clip_count > 0 ||
-      sm[0].near_full_scale > (sm[0].sample_count / 10)) {
-    printk("  [WARN] PCM NEAR-FULL-SCALE OR SATURATION DETECTED IN STAGE A:\n");
-    printk("         PCM saturation samples: %u (ADC rail hits: low=%u high=%u).\n",
-           sm[0].clip_count,
-           adc_diag.clipping_low_count, adc_diag.clipping_high_count);
-    printk("         Near-full-scale samples: %u (%.1f%% of samples within 5%% "
-           "of rails).\n",
-           sm[0].near_full_scale,
-           (double)sm[0].near_full_scale * 100.0 /
-               (sm[0].sample_count ? sm[0].sample_count : 1));
-    printk(
-        "         PCM RMS/DC: %u counts, Peak: [%d .. %d], Mean: %+d counts.\n",
-        rmsA, sm[0].min, sm[0].max,
-        (int32_t)(sm[0].sum /
-                  (int64_t)(sm[0].sample_count ? sm[0].sample_count : 1)));
-    printk("         Check the separate raw-code rail-hit counts above before "
-           "attributing this to ADC clipping.\n");
-  }
-  printk("====================================================================="
-         "====================\n\n");
-  return 0;
-}
-#endif
