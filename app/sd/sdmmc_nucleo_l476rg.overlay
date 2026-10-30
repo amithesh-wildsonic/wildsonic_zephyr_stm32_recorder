@@ -16,7 +16,7 @@
 		     &sdmmc1_d3_pc11 &sdmmc1_ck_pc12 &sdmmc1_cmd_pd2>;
 	pinctrl-names = "default";
 	bus-width = <4>;
-	clk-div = <2>;		/* STM32L4 formula: 48 MHz / (2 * 2) = 12 MHz; four-bit bus */
+	clk-div = <6>;		/* STM32L4 formula: 48 MHz / (6 + 2) = 6 MHz; four-bit bus (3.0 MB/s bus). Safe margin for breadboard jumper wires */
 	disk-name = "SD";
 };
 

@@ -46,6 +46,16 @@ LOG_MODULE_REGISTER(audio_adc, LOG_LEVEL_WRN);
 #define DMA_SLOT  DT_DMAS_CELL_BY_NAME(ZU, audio_rx, slot)
 #define DMA_CFG   DT_DMAS_CELL_BY_NAME(ZU, audio_rx, channel_config)
 
+/*
+ * Acquisition worker thread priority:
+ * Configured as highest preemptive priority (K_PRIO_PREEMPT(0)).
+ * Using cooperative negative priority (-1) risked starving kernel timers and
+ * console UART servicing during high sample-rate processing. Preemptive priority 0
+ * guarantees urgent processing of incoming DMA half-blocks to prevent overruns while
+ * strictly respecting preemptive scheduling boundaries.
+ */
+#define ACQUISITION_THREAD_PRIORITY K_PRIO_PREEMPT(0)
+
 #define BLOCK     CONFIG_AUDIO_BLOCK_SAMPLES
 #define MAX_BLOCK BLOCK
 #define OVS_LOG2  CONFIG_AUDIO_OVERSAMPLE_LOG2
@@ -476,9 +486,17 @@ int audio_in_init(uint32_t requested_rate_hz, const struct audio_sink *s)
 		return -ENODEV;
 	}
 	if (!acquisition_thread_started) {
+		/*
+		 * Acquisition worker thread priority:
+		 * Configured as highest preemptive priority (K_PRIO_PREEMPT(0)).
+		 * Using cooperative negative priority (-1) risked starving kernel timers and
+		 * console UART servicing during high sample-rate processing. Preemptive priority 0
+		 * guarantees urgent processing of incoming DMA half-blocks to prevent overruns while
+		 * strictly respecting preemptive scheduling boundaries.
+		 */
 		k_thread_create(&acquisition_thread_data, acquisition_thread_stack,
 				K_THREAD_STACK_SIZEOF(acquisition_thread_stack),
-				acquisition_thread_fn, NULL, NULL, NULL, K_PRIO_PREEMPT(-1),
+				acquisition_thread_fn, NULL, NULL, NULL, ACQUISITION_THREAD_PRIORITY,
 				0, K_NO_WAIT);
 		k_thread_name_set(&acquisition_thread_data, "audio_acquire");
 		acquisition_thread_started = true;
@@ -804,17 +822,23 @@ int audio_in_start(void)
 
 int audio_in_stop(void)
 {
+	int ret = 0;
+
 	/* 1. Stop TIM6 triggers first so no new conversions begin */
 	LL_TIM_DisableCounter(tim);
 	LL_TIM_SetCounter(tim, 0);
 	LL_TIM_ClearFlag_UPDATE(tim);
 
-	/* 2. Stop ongoing ADC regular conversion */
+	/* 2. Stop ongoing ADC regular conversion with bounded timeout */
 	if (LL_ADC_REG_IsConversionOngoing(adc)) {
 		LL_ADC_REG_StopConversion(adc);
 		uint32_t stop_timeout = 10000;
 		while (LL_ADC_REG_IsStopConversionOngoing(adc) && --stop_timeout) {
 			k_busy_wait(1);
+		}
+		if (stop_timeout == 0) {
+			LOG_ERR("Timeout stopping ADC conversion");
+			ret = -ETIMEDOUT;
 		}
 	}
 
@@ -824,34 +848,60 @@ int audio_in_stop(void)
 	 *    This safely releases driver ownership for the next session!
 	 */
 	if (dma_active) {
-		dma_stop(dma_dev, DMA_CH);
+		int dma_rc = dma_stop(dma_dev, DMA_CH);
 		dma_active = false;
-	}
-	while (atomic_get(&acquisition_events_pending) != 0 ||
-	       atomic_get(&acquisition_worker_active) != 0) {
-		k_sleep(K_MSEC(1));
+		if (dma_rc != 0 && ret == 0) {
+			LOG_ERR("dma_stop failed: %d", dma_rc);
+			ret = dma_rc;
+		}
 	}
 
-	/* 4. Disable ADC */
+	/* 4. Bounded wait for acquisition worker to finish active processing (max 100 ms) */
+	uint32_t drain_timeout_ms = 100;
+	while ((atomic_get(&acquisition_events_pending) != 0 ||
+	        atomic_get(&acquisition_worker_active) != 0) &&
+	       --drain_timeout_ms) {
+		k_sleep(K_MSEC(1));
+	}
+	if (drain_timeout_ms == 0 && ret == 0) {
+		LOG_ERR("Timeout draining acquisition worker (%d events pending, worker active=%d)",
+		        (int)atomic_get(&acquisition_events_pending),
+		        (int)atomic_get(&acquisition_worker_active));
+		ret = -ETIMEDOUT;
+	}
+
+	/* 5. Correct cleanup of pending DMA events and explicit residual sample accounting */
+	struct dma_event leftover_event;
+	while (k_msgq_get(&dma_event_q, &leftover_event, K_NO_WAIT) == 0) {
+		atomic_dec(&acquisition_events_pending);
+		atomic_add(&acquisition_lost_samples, active_block_samples);
+		atomic_add(&acquisition_samples_accounted, active_block_samples);
+	}
+
+	/* 6. Disable ADC with bounded timeout */
 	if (LL_ADC_IsEnabled(adc)) {
 		LL_ADC_Disable(adc);
 		uint32_t dis_timeout = 10000;
 		while (LL_ADC_IsEnabled(adc) && --dis_timeout) {
 			k_busy_wait(1);
 		}
+		if (dis_timeout == 0 && ret == 0) {
+			LOG_ERR("Timeout disabling ADC");
+			ret = -ETIMEDOUT;
+		}
 	}
 
-	/* 5. Clear residual flags after DMA is safely stopped */
+	/* 7. Clear residual flags after DMA is safely stopped */
 	LL_DMA_ClearFlag_GI1(DMA1);
 	LL_DMA_ClearFlag_TC1(DMA1);
 	LL_DMA_ClearFlag_HT1(DMA1);
 	LL_DMA_ClearFlag_TE1(DMA1);
 
-	/* 6. Enter ADC Deep Power Down and disable internal regulator for ultra-low sleep current */
+	/* 8. Enter ADC Deep Power Down and disable internal regulator for ultra-low sleep current */
 	LL_ADC_EnableDeepPowerDown(adc);
 	LL_ADC_DisableInternalRegulator(adc);
 
-	return 0;
+	return ret;
 }
 
 uint32_t audio_in_requested_rate(void)

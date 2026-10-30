@@ -112,6 +112,10 @@ void recorder_request_stop(void);
 bool recorder_is_active(void);
 bool recorder_is_abort_requested(void);
 int recorder_wait_idle(uint32_t timeout_ms);
+int recorder_get_last_error(void);
+int recorder_get_last_sd_error(void);
+void recorder_get_active_progress(uint64_t *samples_written, uint64_t *expected_samples);
+void recorder_get_active_file(char *out_buf, size_t max_len);
 
 /* Runtime configuration for PSRAM audio staging buffer (ON/OFF) */
 void recorder_set_psram_staging_enabled(bool enabled);

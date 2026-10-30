@@ -127,7 +127,11 @@ int rtc_calendar_get(struct rtc_calendar_time *t)
 	memset(t, 0, sizeof(*t));
 
 	/* Ensure RTC peripheral and backup domain access are initialized */
-	rtc_sleep_init();
+	int init_rc = rtc_sleep_init();
+	if (init_rc != 0) {
+		t->valid = false;
+		return init_rc;
+	}
 
 	/*
 	 * In STM32L4, RTC_ISR_INITS flag indicates if calendar registers
@@ -146,13 +150,13 @@ int rtc_calendar_get(struct rtc_calendar_time *t)
 	uint32_t tr = LL_RTC_TIME_Get(RTC);
 	uint32_t dr = LL_RTC_DATE_Get(RTC);
 
-	t->hour  = __LL_RTC_CONVERT_BCD2BIN((uint8_t)((tr & (RTC_TR_HT | RTC_TR_HU)) >> RTC_TR_HU_Pos));
-	t->min   = __LL_RTC_CONVERT_BCD2BIN((uint8_t)((tr & (RTC_TR_MNT | RTC_TR_MNU)) >> RTC_TR_MNU_Pos));
-	t->sec   = __LL_RTC_CONVERT_BCD2BIN((uint8_t)((tr & (RTC_TR_ST | RTC_TR_SU)) >> RTC_TR_SU_Pos));
+	t->hour  = __LL_RTC_CONVERT_BCD2BIN(__LL_RTC_GET_HOUR(tr));
+	t->min   = __LL_RTC_CONVERT_BCD2BIN(__LL_RTC_GET_MINUTE(tr));
+	t->sec   = __LL_RTC_CONVERT_BCD2BIN(__LL_RTC_GET_SECOND(tr));
 
-	t->year  = 2000 + __LL_RTC_CONVERT_BCD2BIN((uint8_t)((dr & (RTC_DR_YT | RTC_DR_YU)) >> RTC_DR_YU_Pos));
-	t->month = __LL_RTC_CONVERT_BCD2BIN((uint8_t)((dr & (RTC_DR_MT | RTC_DR_MU)) >> RTC_DR_MU_Pos));
-	t->day   = __LL_RTC_CONVERT_BCD2BIN((uint8_t)((dr & (RTC_DR_DT | RTC_DR_DU)) >> RTC_DR_DU_Pos));
+	t->year  = 2000 + __LL_RTC_CONVERT_BCD2BIN(__LL_RTC_GET_YEAR(dr));
+	t->month = __LL_RTC_CONVERT_BCD2BIN(__LL_RTC_GET_MONTH(dr));
+	t->day   = __LL_RTC_CONVERT_BCD2BIN(__LL_RTC_GET_DAY(dr));
 
 	if (rtc_calendar_validate(t) != 0) {
 		t->valid = false;
@@ -171,7 +175,10 @@ int rtc_calendar_set(const struct rtc_calendar_time *t)
 	}
 
 	/* Ensure RTC peripheral clock and backup domain are enabled */
-	rtc_sleep_init();
+	int init_rc = rtc_sleep_init();
+	if (init_rc != 0) {
+		return init_rc;
+	}
 
 	LL_PWR_EnableBkUpAccess();
 	LL_RTC_DisableWriteProtection(RTC);
@@ -216,17 +223,47 @@ int rtc_calendar_set(const struct rtc_calendar_time *t)
 	/* Exit RTC Initialization Mode */
 	LL_RTC_DisableInitMode(RTC);
 
+	/* Clear and wait for Registers Synchronization Flag (RSF) */
+	LL_RTC_ClearFlag_RS(RTC);
+	uint32_t rsf_to = 10000;
+	while (!LL_RTC_IsActiveFlag_RS(RTC) && --rsf_to) {
+		k_busy_wait(10);
+	}
+	if (rsf_to == 0) {
+		LOG_WRN("Timeout waiting for RTC RSF synchronization");
+	}
+
 	/* Re-enable write protection */
 	LL_RTC_EnableWriteProtection(RTC);
 
-	LOG_INF("RTC calendar updated: %04u-%02u-%02u %02u:%02u:%02u (weekday %u)",
+	/* Read back and verify programmed calendar */
+	struct rtc_calendar_time readback;
+	int read_rc = rtc_calendar_get(&readback);
+	if (read_rc != 0 || !readback.valid) {
+		LOG_ERR("RTC calendar readback verification failed (%d)", read_rc);
+		return (read_rc != 0) ? read_rc : -EIO;
+	}
+	if (readback.year != t->year || readback.month != t->month || readback.day != t->day ||
+	    readback.hour != t->hour || readback.min != t->min ||
+	    (readback.sec != t->sec && readback.sec != ((t->sec + 1) % 60))) {
+		LOG_ERR("RTC readback mismatch: expected %04u-%02u-%02u %02u:%02u:%02u, got %04u-%02u-%02u %02u:%02u:%02u",
+		        t->year, t->month, t->day, t->hour, t->min, t->sec,
+		        readback.year, readback.month, readback.day, readback.hour, readback.min, readback.sec);
+		return -EIO;
+	}
+
+	LOG_INF("RTC calendar updated and verified: %04u-%02u-%02u %02u:%02u:%02u (weekday %u)",
 	        t->year, t->month, t->day, t->hour, t->min, t->sec, weekday);
 	return 0;
 }
 
 int rtc_calendar_init(void)
 {
-	rtc_sleep_init();
+	int rc = rtc_sleep_init();
+	if (rc != 0) {
+		LOG_ERR("rtc_calendar_init failed: rtc_sleep_init returned %d", rc);
+		return rc;
+	}
 	LL_PWR_EnableBkUpAccess();
 	if (LL_RTC_IsActiveFlag_INITS(RTC)) {
 		struct rtc_calendar_time cur;
@@ -242,6 +279,9 @@ int rtc_calendar_init(void)
 
 bool rtc_calendar_is_valid(void)
 {
+	if (rtc_sleep_init() != 0) {
+		return false;
+	}
 	return (LL_RTC_IsActiveFlag_INITS(RTC) != 0);
 }
 

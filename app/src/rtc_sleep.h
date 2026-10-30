@@ -35,22 +35,26 @@ void rtc_sleep_disarm(void);
 enum rtc_wake_source {
 	RTC_WAKE_NONE = 0,
 	RTC_WAKE_TIMER,
-	RTC_WAKE_USER_BUTTON,
+	RTC_WAKE_USER_BUTTON, /* Retained for legacy API compatibility; strictly disabled in hardware */
 	RTC_WAKE_CONSOLE_ABORT,
 };
 
 /**
  * @brief Enter true STM32L476 Stop 2 low-power mode for specified duration.
  *
- * Configures RTC Wakeup Timer on 1 Hz ck_spre, configures User Button (B1 / PC13)
- * as EXTI Line 13 wakeup source, flushes UART, turns off user LED (PA5),
- * suspends SysTick, and executes __WFI() into Stop 2 mode.
- * Upon wakeup (via RTC timer or B1 button), clears deep-sleep, restores SysTick,
- * re-initializes 72 MHz PLL system clock tree via stm32_clock_control_init(),
- * and disarms the RTC timer.
+ * Configures RTC Wakeup Timer on 1 Hz ck_spre. Strictly enforces RTC-only wakeup:
+ * masks all EXTI lines except EXTI Line 20 (RTC Wakeup), disables STM32 PWR wakeup pins
+ * (WKUP1..WKUP5), disables USART2 wake-from-stop and RX interrupts, disables User Button (PC13)
+ * EXTI interrupt/event, turns off user LED (PA5), suspends SysTick, and executes __WFI()
+ * into Stop 2 mode.
+ *
+ * Upon wakeup (exclusively via RTC Wakeup Timer on EXTI Line 20): clears deep-sleep,
+ * verifies RTC WUTF / EXTI Line 20 flag, restores 72 MHz PLL system clock tree via
+ * stm32_clock_control_init(), restores SysTick and compensates kernel uptime ticks,
+ * restores EXTI/NVIC masks and console UART RX operation, and disarms the RTC timer.
  *
  * @param seconds Sleep duration in seconds (1 to 65535). If 0, returns 0 immediately.
- * @return 0 on RTC wakeup, -EINTR if user aborted via button/console, negative errno on error.
+ * @return 0 on RTC wakeup, -EINTR if aborted via console, negative errno on error.
  */
 int rtc_sleep_enter_stop2(uint32_t seconds);
 

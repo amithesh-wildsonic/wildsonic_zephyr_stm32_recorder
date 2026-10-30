@@ -2,8 +2,11 @@
 #include "rtc_sleep.h"
 #include "recorder.h"
 #include "psram_is66wvs.h"
+#include "console.h"
+#include "ble_comm.h"
 #include <zephyr/kernel.h>
 #include <zephyr/logging/log.h>
+#include <zephyr/drivers/timer/system_timer.h>
 
 LOG_MODULE_REGISTER(rtc_sleep, LOG_LEVEL_INF);
 
@@ -29,9 +32,28 @@ static bool rtc_initialized = false;
 static volatile bool user_button_pressed = false;
 static volatile enum rtc_wake_source last_wake_source = RTC_WAKE_NONE;
 
+static inline void rtc_access_enable(void)
+{
+	LL_APB1_GRP1_EnableClock(LL_APB1_GRP1_PERIPH_PWR);
+	LL_PWR_EnableBkUpAccess();
+}
+
+static inline void rtc_write_protect_disable(void)
+{
+	rtc_access_enable();
+	LL_RTC_DisableWriteProtection(RTC);
+}
+
+static inline void rtc_write_protect_enable(void)
+{
+	LL_RTC_EnableWriteProtection(RTC);
+}
+
 static void rtc_wkup_isr(const void *arg)
 {
 	ARG_UNUSED(arg);
+
+	rtc_access_enable();
 
 	/* Clear RTC Wakeup Timer Flag (WUTF) */
 	LL_RTC_DisableWriteProtection(RTC);
@@ -59,24 +81,66 @@ int rtc_sleep_init(void)
 	k_sem_init(&rtc_wake_sem, 0, 1);
 
 	/* Enable Power Controller clock and Backup Domain write access */
+	LL_APB1_GRP1_EnableClock(LL_APB1_GRP1_PERIPH_PWR);
 	LL_PWR_EnableBkUpAccess();
 
 	/* Enable RTC clock source if not already running */
 	if (!LL_RCC_IsEnabledRTC()) {
+		/* Attempt LSE initialization with bounded timeout */
+		if (!LL_RCC_LSE_IsReady()) {
+			LL_RCC_LSE_Enable();
+			uint32_t lse_to = 50000;
+			while (!LL_RCC_LSE_IsReady() && --lse_to) {
+				k_busy_wait(10);
+			}
+		}
+
 		if (LL_RCC_LSE_IsReady()) {
 			LL_RCC_SetRTCClockSource(LL_RCC_RTC_CLKSOURCE_LSE);
 			LOG_INF("RTC clock source configured: LSE (32.768 kHz external crystal)");
 		} else {
+			LOG_WRN("LSE oscillator not ready; attempting LSI fallback (~32 kHz internal RC)");
 			LL_RCC_LSI_Enable();
-			uint32_t t = 10000;
-			while (!LL_RCC_LSI_IsReady() && --t) {
+			uint32_t lsi_to = 10000;
+			while (!LL_RCC_LSI_IsReady() && --lsi_to) {
 				k_busy_wait(10);
 			}
+			if (!LL_RCC_LSI_IsReady()) {
+				LOG_ERR("LSI oscillator startup timed out; RTC initialization failed");
+				return -ETIMEDOUT;
+			}
 			LL_RCC_SetRTCClockSource(LL_RCC_RTC_CLKSOURCE_LSI);
-			LOG_INF("RTC clock source configured: LSI (~32 kHz internal RC oscillator)");
+			LOG_WRN("RTC clock source configured: LSI (~32 kHz internal RC oscillator; calibration limitations apply)");
 		}
 		LL_RCC_EnableRTC();
 	}
+
+	/* Verify RTC is running */
+	if (!LL_RCC_IsEnabledRTC()) {
+		LOG_ERR("Failed to enable RTC peripheral");
+		return -EIO;
+	}
+
+	/* Disable RTC write protection to configure prescalers */
+	LL_RTC_DisableWriteProtection(RTC);
+
+	/* Configure prescalers if not already initialized (Asynch 127, Synch 255 for 32.768 kHz -> 1 Hz ck_spre) */
+	if (!LL_RTC_IsActiveFlag_INITS(RTC)) {
+		LL_RTC_EnableInitMode(RTC);
+		uint32_t init_to = 10000;
+		while (!LL_RTC_IsActiveFlag_INIT(RTC) && --init_to) {
+			k_busy_wait(10);
+		}
+		if (init_to == 0) {
+			LL_RTC_EnableWriteProtection(RTC);
+			LOG_ERR("Timeout waiting for RTC INIT mode in rtc_sleep_init");
+			return -ETIMEDOUT;
+		}
+		LL_RTC_SetAsynchPrescaler(RTC, 127);
+		LL_RTC_SetSynchPrescaler(RTC, 255);
+		LL_RTC_DisableInitMode(RTC);
+	}
+	LL_RTC_EnableWriteProtection(RTC);
 
 	/* Configure EXTI Line 20 for RTC Wakeup (Interrupt, Event, Rising Edge) */
 	LL_EXTI_EnableIT_0_31(LL_EXTI_LINE_20);
@@ -129,20 +193,23 @@ int rtc_sleep_arm(uint32_t seconds)
 	/* Reset wakeup semaphore */
 	k_sem_reset(&rtc_wake_sem);
 
-	/* Disable RTC register write protection */
-	LL_RTC_DisableWriteProtection(RTC);
+	/* Enable Power Controller clock and Backup Domain write access */
+	rtc_write_protect_disable();
 
-	/* Disable Wakeup Timer to allow writing to WUTR */
-	LL_RTC_WAKEUP_Disable(RTC);
+	/* Disable Wakeup Timer only if it was enabled */
+	if (LL_RTC_WAKEUP_IsEnabled(RTC)) {
+		LL_RTC_WAKEUP_Disable(RTC);
+	}
 
-	/* Wait until WUTWF (Wakeup Timer Write Flag) is set */
+	/* Wait until WUTWF (Wakeup Timer Write Flag) is set (takes up to 2 RTCCLK cycles) */
 	uint32_t to = 10000;
 	while (!LL_RTC_IsActiveFlag_WUTW(RTC) && --to) {
 		k_busy_wait(10);
 	}
 	if (to == 0) {
-		LL_RTC_EnableWriteProtection(RTC);
-		LOG_ERR("Timeout waiting for RTC WUTWF");
+		rtc_write_protect_enable();
+		LOG_ERR("Timeout waiting for RTC WUTWF (ISR=0x%08X, CR=0x%08X)",
+		        (unsigned int)RTC->ISR, (unsigned int)RTC->CR);
 		return -ETIMEDOUT;
 	}
 
@@ -161,7 +228,13 @@ int rtc_sleep_arm(uint32_t seconds)
 	LL_RTC_WAKEUP_Enable(RTC);
 
 	/* Re-enable write protection */
-	LL_RTC_EnableWriteProtection(RTC);
+	rtc_write_protect_enable();
+
+	/* Verify timer is armed */
+	if (!LL_RTC_WAKEUP_IsEnabled(RTC)) {
+		LOG_ERR("Failed to arm RTC Wakeup Timer (CR=0x%08X)", (unsigned int)RTC->CR);
+		return -EIO;
+	}
 
 	rtc_timer_active = true;
 	return 0;
@@ -169,12 +242,13 @@ int rtc_sleep_arm(uint32_t seconds)
 
 void rtc_sleep_disarm(void)
 {
-	LL_RTC_DisableWriteProtection(RTC);
+	rtc_write_protect_disable();
 	LL_RTC_WAKEUP_Disable(RTC);
 	LL_RTC_DisableIT_WUT(RTC);
 	LL_RTC_ClearFlag_WUT(RTC);
-	LL_RTC_EnableWriteProtection(RTC);
+	rtc_write_protect_enable();
 	LL_EXTI_ClearFlag_0_31(LL_EXTI_LINE_20);
+	NVIC_ClearPendingIRQ(RTC_WKUP_IRQn);
 	rtc_timer_active = false;
 }
 
@@ -211,32 +285,55 @@ int rtc_sleep_enter_stop2(uint32_t seconds)
 	LL_GPIO_ResetOutputPin(GPIOA, LL_GPIO_PIN_5);
 
 	/* Flush USART2 transmit buffer before entering Stop 2 so no characters are lost */
-	uint32_t uart_flush_start_ms = k_uptime_get_32();
-	while (!LL_USART_IsActiveFlag_TC(USART2)) {
-		if ((uint32_t)(k_uptime_get_32() - uart_flush_start_ms) >= 1000U) {
-			LOG_ERR("USART2 transmit-complete timeout; refusing Stop2 entry");
-			rtc_sleep_disarm();
-			return -ETIMEDOUT;
+	bool usart_ue = (USART2->CR1 & USART_CR1_UE) != 0;
+	bool usart_te = (USART2->CR1 & USART_CR1_TE) != 0;
+
+	if (usart_ue && usart_te) {
+		uint32_t uart_flush_start_ms = k_uptime_get_32();
+		while (!LL_USART_IsActiveFlag_TC(USART2)) {
+			if ((uint32_t)(k_uptime_get_32() - uart_flush_start_ms) >= 1000U) {
+				uint32_t isr = USART2->ISR;
+				uint32_t cr1 = USART2->CR1;
+				uint32_t cr3 = USART2->CR3;
+				uint32_t brr = USART2->BRR;
+				bool tc_flag = (isr & USART_ISR_TC) != 0;
+				bool txe_flag = (isr & USART_ISR_TXE) != 0;
+				LOG_ERR("USART2 transmit-complete timeout; refusing Stop2 entry (ISR=0x%08X, CR1=0x%08X, CR3=0x%08X, BRR=0x%08X, TC=%d, TXE=%d, UE=%d, TE=%d)",
+				        (unsigned int)isr, (unsigned int)cr1, (unsigned int)cr3, (unsigned int)brr,
+				        tc_flag, txe_flag, usart_ue, usart_te);
+				rtc_sleep_disarm();
+				return -ETIMEDOUT;
+			}
+			k_busy_wait(10);
 		}
-		k_busy_wait(10);
 	}
 
 	/*
 	 * =========================================================================
 	 * STRICT RTC-ONLY WAKE SOURCE ENFORCEMENT
 	 * =========================================================================
-	 * 1. Disable USART2 wake-from-stop and interrupts so UART RX cannot wake MCU.
-	 * 2. Disable all STM32 PWR wakeup pins (WKUP1..WKUP5).
-	 * 3. Mask all EXTI lines except EXTI Line 20 (RTC Wakeup Timer).
-	 * 4. Mask all NVIC interrupts except RTC_WKUP_IRQn.
-	 * 5. Suspend SysTick.
+	 * 1. Suspend console UART RX interrupts and ring buffer.
+	 * 2. Disable USART2 wake-from-stop and interrupts so UART RX cannot wake MCU.
+	 * 3. Disable all STM32 PWR wakeup pins (WKUP1..WKUP5).
+	 * 4. Mask all EXTI lines except EXTI Line 20 (RTC Wakeup Timer).
+	 * 5. Mask all NVIC interrupts except RTC_WKUP_IRQn.
+	 * 6. Suspend SysTick.
 	 * =========================================================================
 	 */
+	console_async_suspend();
+	ble_comm_suspend();
 	LL_USART_DisableInStopMode(USART2);
 	LL_USART_DisableIT_WKUP(USART2);
 	LL_USART_ClearFlag_WKUP(USART2);
-	(void)USART2->RDR;
-	USART2->ICR = 0xFFFFFFFF;
+	LL_USART_ClearFlag_ORE(USART2);
+	LL_USART_ClearFlag_FE(USART2);
+	LL_USART_ClearFlag_NE(USART2);
+	LL_USART_ClearFlag_PE(USART2);
+	LL_USART_ClearFlag_IDLE(USART2);
+
+	if (LL_USART_IsActiveFlag_RXNE(USART2)) {
+		(void)USART2->RDR;
+	}
 
 	LL_PWR_DisableWakeUpPin(LL_PWR_WAKEUP_PIN1 | LL_PWR_WAKEUP_PIN2 | LL_PWR_WAKEUP_PIN3 |
 	                        LL_PWR_WAKEUP_PIN4 | LL_PWR_WAKEUP_PIN5);
@@ -278,9 +375,10 @@ int rtc_sleep_enter_stop2(uint32_t seconds)
 	uint32_t saved_systick_ctrl = SysTick->CTRL;
 	SysTick->CTRL &= ~(SysTick_CTRL_ENABLE_Msk | SysTick_CTRL_TICKINT_Msk);
 	SCB->ICSR |= SCB_ICSR_PENDSTCLR_Msk;
+	SCB->ICSR |= SCB_ICSR_PENDSVCLR_Msk;
 
 	/* Configure STM32L4 Power controller for Stop 2 Mode */
-	LL_PWR_EnableBkUpAccess();
+	rtc_access_enable();
 	LL_PWR_ClearFlag_WU();
 #if STM32_SYSCLK_SRC_MSI
 	LL_RCC_SetClkAfterWakeFromStop(LL_RCC_STOP_WAKEUPCLOCK_MSI);
@@ -296,62 +394,120 @@ int rtc_sleep_enter_stop2(uint32_t seconds)
 	LL_LPM_EnableDeepSleep();
 
 	/* Clear pending flags immediately prior to entering Stop 2 */
-	LL_RTC_DisableWriteProtection(RTC);
+	rtc_write_protect_disable();
 	LL_RTC_ClearFlag_WUT(RTC);
-	LL_RTC_EnableWriteProtection(RTC);
+	rtc_write_protect_enable();
 	LL_EXTI_ClearFlag_0_31(LL_EXTI_LINE_20);
 	LL_EXTI_ClearFlag_0_31(LL_EXTI_LINE_13);
 	NVIC_ClearPendingIRQ(RTC_WKUP_IRQn);
 
+	/* Verify RTC Wakeup Timer is armed before WFI */
+	if (!LL_RTC_WAKEUP_IsEnabled(RTC)) {
+		LOG_ERR("Stop 2 aborted: RTC Wakeup Timer is not enabled");
+		LL_LPM_EnableSleep();
+		rtc_sleep_disarm();
+		return -EIO;
+	}
+
 	/*
 	 * =========================================================================
 	 * ENTER STM32L476 STOP 2 LOW-POWER MODE
-	 * High-speed clocks (PLL, HSI, HSE) are halted.
-	 * VCORE regulator operates in low-power mode. SRAM1 & SRAM2 are retained.
-	 * ONLY RTC (LSE/LSI) on EXTI Line 20 can wake the core.
-	 * MCU core current through JP6 (IDD) drops to ultra-low Stop 2 level.
 	 * =========================================================================
 	 */
-	__DSB();
-	__WFI();
-	__ISB();
+	__disable_irq();
+	bool pre_wake_event = (LL_RTC_IsActiveFlag_WUT(RTC) != 0) ||
+	                      (NVIC_GetPendingIRQ(RTC_WKUP_IRQn) != 0);
+	if (!pre_wake_event) {
+		__DSB();
+		__WFI();
+		__ISB();
+	}
 
 	/*
 	 * =========================================================================
 	 * WAKE-UP SEQUENCE FROM STOP 2 MODE (STRICT RTC WAKE RECOVERY)
+	 * Inspect hardware status BEFORE enabling interrupts or taking any ISR!
 	 * =========================================================================
 	 */
-	/* 1. Clear SLEEPDEEP bit in Cortex-M4 SCR */
+	bool rtc_wut_flag = (LL_RTC_IsActiveFlag_WUT(RTC) != 0);
+	bool exti20_flag = (LL_EXTI_IsActiveFlag_0_31(LL_EXTI_LINE_20) != 0);
+	bool nvic_rtc_flag = (NVIC_GetPendingIRQ(RTC_WKUP_IRQn) != 0);
+
+	uint32_t exti_pr1_snap = EXTI->PR1;
+	uint32_t exti_pr2_snap = EXTI->PR2;
+	uint32_t pwr_sr1_snap = PWR->SR1;
+	uint32_t nvic_ispr0_snap = NVIC->ISPR[0];
+	uint32_t nvic_ispr1_snap = NVIC->ISPR[1];
+	uint32_t nvic_ispr2_snap = NVIC->ISPR[2];
+
+	/* Clear SLEEPDEEP bit in Cortex-M4 SCR */
 	LL_LPM_EnableSleep();
 
-	/* 2. Restore SysTick */
+	/* Enable interrupts: vectors immediately to rtc_wkup_isr() if pending */
+	__enable_irq();
+
+	/* Determine wake status */
+	int wake_rc = 0;
+	if (rtc_wut_flag || exti20_flag || nvic_rtc_flag || pre_wake_event || (last_wake_source == RTC_WAKE_TIMER)) {
+		last_wake_source = RTC_WAKE_TIMER;
+		wake_rc = 0;
+	} else {
+		LOG_WRN("Unexpected wake event: RTC WUT flag not asserted EXTI_PR1=0x%08X, PR2=0x%08X, PWR_SR1=0x%08X, NVIC_ISPR=[0x%08X, 0x%08X, 0x%08X]",
+		        exti_pr1_snap, exti_pr2_snap, pwr_sr1_snap, nvic_ispr0_snap, nvic_ispr1_snap, nvic_ispr2_snap);
+		last_wake_source = RTC_WAKE_NONE;
+		wake_rc = -EIO;
+	}
+
+	/* Re-enable PWR clock and Backup domain access after Stop 2 */
+	rtc_access_enable();
+
+	/* Re-initialize 72 MHz PLL clock tree via Zephyr clock control */
+	int clk_ret = stm32_clock_control_init(NULL);
+	if (clk_ret != 0 || LL_RCC_GetSysClkSource() != LL_RCC_SYS_CLKSOURCE_STATUS_PLL) {
+		LOG_ERR("Clock restoration failed after Stop 2 (ret=%d, src=0x%02X)",
+		        clk_ret, LL_RCC_GetSysClkSource());
+		wake_rc = -EIO;
+	}
+
+	/* Restore SysTick and compensate kernel uptime ticks */
 	SysTick->CTRL = saved_systick_ctrl;
+	if (seconds > 0 && wake_rc == 0) {
+		uint64_t elapsed_ticks = (uint64_t)seconds * CONFIG_SYS_CLOCK_TICKS_PER_SEC;
+		while (elapsed_ticks > 0) {
+			uint32_t chunk_ticks = (elapsed_ticks > (UINT32_MAX / 4))
+			                           ? (UINT32_MAX / 4)
+			                           : (uint32_t)elapsed_ticks;
+			sys_clock_announce(chunk_ticks);
+			elapsed_ticks -= chunk_ticks;
+		}
+	}
 
-	/* 3. Re-initialize 72 MHz PLL clock tree via Zephyr clock control */
-	stm32_clock_control_init(NULL);
-
-	/* 4. Restore NVIC interrupt enable configuration */
+	/* Restore NVIC interrupt enable configuration */
 	NVIC->ISER[0] = saved_nvic_iser[0];
 	NVIC->ISER[1] = saved_nvic_iser[1];
 	NVIC->ISER[2] = saved_nvic_iser[2];
 
-	/* 5. Restore EXTI mask configuration */
+	/* Restore EXTI mask configuration */
 	EXTI->IMR1 = saved_exti_imr1;
 	EXTI->EMR1 = saved_exti_emr1;
 	EXTI->IMR2 = saved_exti_imr2;
 	EXTI->EMR2 = saved_exti_emr2;
 
-	/* 6. Disarm RTC Wakeup Timer and clear pending flags */
+	/* Restore console UART RX interrupts after Stop 2 wakeup */
+	console_async_resume();
+	ble_comm_resume();
+
+	/* Disarm RTC Wakeup Timer and clear pending flags */
 	rtc_sleep_disarm();
-	LL_RTC_DisableWriteProtection(RTC);
+	rtc_write_protect_disable();
 	LL_RTC_ClearFlag_WUT(RTC);
-	LL_RTC_EnableWriteProtection(RTC);
+	rtc_write_protect_enable();
 	LL_EXTI_ClearFlag_0_31(LL_EXTI_LINE_20);
 	LL_EXTI_ClearFlag_0_31(LL_EXTI_LINE_13);
 	NVIC_ClearPendingIRQ(RTC_WKUP_IRQn);
+	LL_PWR_ClearFlag_WU();
 
-	last_wake_source = RTC_WAKE_TIMER;
-	return 0;
+	return wake_rc;
 }
 
 int rtc_sleep_wait(uint32_t timeout_seconds)

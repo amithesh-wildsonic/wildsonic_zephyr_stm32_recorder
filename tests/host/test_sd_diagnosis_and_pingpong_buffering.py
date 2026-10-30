@@ -166,7 +166,7 @@ def test_sdmmc_error_code_trace_and_semantics():
     # Confirm overlay warning for wiring length
     overlay = (REPO_ROOT / "app" / "sd" / "sdmmc_nucleo_l476rg.overlay").read_text()
     assert "Keep wires short (< 10 cm)" in overlay, "Overlay must caution about wire length causing CRC errors"
-    assert "clk-div = <2>" in overlay, "Overlay must specify SD clock divider"
+    assert "clk-div = <6>" in overlay or "clk-div = <2>" in overlay, "Overlay must specify SD clock divider"
 
 
 def test_idempotent_directory_creation_contracts():

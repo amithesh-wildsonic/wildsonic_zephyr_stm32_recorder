@@ -41,6 +41,7 @@ else()
     src/console.c
     src/config_store.c
     src/led_indicator.c
+    src/ble_comm.c
   )
   target_sources_ifdef(CONFIG_WILDSONIC_VERBOSE_LOGS app PRIVATE src/psram_benchmark.c)
   zephyr_include_directories(src)

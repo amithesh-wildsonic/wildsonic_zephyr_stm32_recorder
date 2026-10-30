@@ -380,11 +380,17 @@ int config_store_write_status_file(const char *path)
 
 	int rc = fs_open(&file, path, FS_O_CREATE | FS_O_WRITE);
 	if (rc != 0) {
+		LOG_ERR("config_store_write_status_file: fs_open failed (%d)", rc);
 		return rc;
 	}
 
 	/* Truncate if already exists */
-	fs_truncate(&file, 0);
+	rc = fs_truncate(&file, 0);
+	if (rc != 0) {
+		LOG_ERR("config_store_write_status_file: fs_truncate failed (%d)", rc);
+		fs_close(&file);
+		return rc;
+	}
 
 	char buf[256];
 	struct wildsonic_config *cfg = console_get_config();
@@ -392,63 +398,60 @@ int config_store_write_status_file(const char *path)
 	struct schedule_config scfg;
 	scheduler_get_config(&scfg);
 
-	snprintf(buf, sizeof(buf), "sampling_frequency=%u\n", cfg ? cfg->sampling_rate : 192000);
-	fs_write(&file, buf, strlen(buf));
+#define STATUS_WRITE_LINE(fmt, ...) do { \
+		int n = snprintf(buf, sizeof(buf), fmt, ##__VA_ARGS__); \
+		if (n > 0) { \
+			ssize_t w = fs_write(&file, buf, (size_t)n); \
+			if (w != (ssize_t)n) { \
+				int err_code = (w < 0) ? (int)w : -EIO; \
+				LOG_ERR("config_store_write_status_file: write failed (%d)", err_code); \
+				fs_close(&file); \
+				return err_code; \
+			} \
+		} \
+	} while (0)
 
-	snprintf(buf, sizeof(buf), "bits_per_sample=%u\n", cfg ? cfg->audio_sampling_width : 16);
-	fs_write(&file, buf, strlen(buf));
-
-	snprintf(buf, sizeof(buf), "number_of_channels=%u\n", cfg ? cfg->num_audio_channels : 1);
-	fs_write(&file, buf, strlen(buf));
-
-	snprintf(buf, sizeof(buf), "mic_gain=%d\n", cfg ? cfg->mic_gain_times_ten : 0);
-	fs_write(&file, buf, strlen(buf));
-
-	snprintf(buf, sizeof(buf), "lower_cutoff_frequency=%u\n", cfg ? cfg->lower_cutoff_frequency : 80);
-	fs_write(&file, buf, strlen(buf));
-
-	snprintf(buf, sizeof(buf), "upper_cutoff_frequency=%u\n", cfg ? cfg->upper_cutoff_frequency : 20000);
-	fs_write(&file, buf, strlen(buf));
-
-	snprintf(buf, sizeof(buf), "record_length=%u\n", cfg ? cfg->recording_length : 20);
-	fs_write(&file, buf, strlen(buf));
-
-	snprintf(buf, sizeof(buf), "sleep_interval=%u\n", cfg ? cfg->sleep_pause_interval : 60);
-	fs_write(&file, buf, strlen(buf));
+	STATUS_WRITE_LINE("sampling_frequency=%u\n", cfg ? cfg->sampling_rate : 192000);
+	STATUS_WRITE_LINE("bits_per_sample=%u\n", cfg ? cfg->audio_sampling_width : 16);
+	STATUS_WRITE_LINE("number_of_channels=%u\n", cfg ? cfg->num_audio_channels : 1);
+	STATUS_WRITE_LINE("mic_gain=%d\n", cfg ? cfg->mic_gain_times_ten : 0);
+	STATUS_WRITE_LINE("lower_cutoff_frequency=%u\n", cfg ? cfg->lower_cutoff_frequency : 80);
+	STATUS_WRITE_LINE("upper_cutoff_frequency=%u\n", cfg ? cfg->upper_cutoff_frequency : 20000);
+	STATUS_WRITE_LINE("record_length=%u\n", cfg ? cfg->recording_length : 20);
+	STATUS_WRITE_LINE("sleep_interval=%u\n", cfg ? cfg->sleep_pause_interval : 60);
 
 	char date_buf[64];
 	scheduler_format_date_range(&scfg.start_date, &scfg.end_date, date_buf, sizeof(date_buf));
-	snprintf(buf, sizeof(buf), "date_range=%s, Note: The date range is inclusive of the start and end dates. 9999/99/99 means no date is selected.\n", date_buf);
-	fs_write(&file, buf, strlen(buf));
+	STATUS_WRITE_LINE("date_range=%s, Note: The date range is inclusive of the start and end dates. 9999/99/99 means no date is selected.\n", date_buf);
 
 	for (int i = 0; i < SCHEDULER_MAX_TIME_OF_DAY_RANGES; i++) {
 		if (scfg.tod_ranges[i].start_second != 0 || scfg.tod_ranges[i].end_second != 0) {
 			char tod_buf[32];
 			scheduler_format_time_of_day(&scfg.tod_ranges[i], tod_buf, sizeof(tod_buf));
-			snprintf(buf, sizeof(buf), "time_of_day_%d=%s\n", i, tod_buf);
-			fs_write(&file, buf, strlen(buf));
+			STATUS_WRITE_LINE("time_of_day_%d=%s\n", i, tod_buf);
 		}
 	}
 
 	char dow_buf[16];
 	scheduler_format_days_of_week(scfg.day_of_week_mask, dow_buf, sizeof(dow_buf));
-	snprintf(buf, sizeof(buf), "days_of_week=%s, Note: 1 means active and 0 means inactive. The days are in the order of Monday to Sunday.\n", dow_buf);
-	fs_write(&file, buf, strlen(buf));
+	STATUS_WRITE_LINE("days_of_week=%s, Note: 1 means active and 0 means inactive. The days are in the order of Monday to Sunday.\n", dow_buf);
 
 	char tz_buf[16];
 	scheduler_format_timezone(scfg.time_zone_offset, tz_buf, sizeof(tz_buf));
-	snprintf(buf, sizeof(buf), "time_zone=%s\n", tz_buf);
-	fs_write(&file, buf, strlen(buf));
+	STATUS_WRITE_LINE("time_zone=%s\n", tz_buf);
 
 	const char *fldr_str = (cfg && cfg->folder_structure == 1) ? "daily" :
 			       ((cfg && cfg->folder_structure == 2) ? "hourly" : "flat");
-	snprintf(buf, sizeof(buf), "folder_structure=%s\n", fldr_str);
-	fs_write(&file, buf, strlen(buf));
+	STATUS_WRITE_LINE("folder_structure=%s\n", fldr_str);
+	STATUS_WRITE_LINE("psram_staging=%s\n", (settings && settings->psram_staging_enabled) ? "enabled" : "disabled");
 
-	snprintf(buf, sizeof(buf), "psram_staging=%s\n", (settings && settings->psram_staging_enabled) ? "enabled" : "disabled");
-	fs_write(&file, buf, strlen(buf));
+#undef STATUS_WRITE_LINE
 
-	fs_close(&file);
+	rc = fs_close(&file);
+	if (rc != 0) {
+		LOG_ERR("config_store_write_status_file: fs_close failed (%d)", rc);
+		return rc;
+	}
 	printk("Configuration status file has been created\n");
 	return 0;
 #else
