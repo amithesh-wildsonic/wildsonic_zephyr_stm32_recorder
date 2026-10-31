@@ -316,18 +316,22 @@ def test_rtc_wake_followed_by_correctly_scheduled_recording():
     """Verify the 12-step shutdown sequence and post-wake recording dispatch ordering."""
     recorder_c = (APP_SRC / "recorder.c").read_text(encoding="utf-8")
 
-    # Strict ordering: audio_in_stop -> drain_queue -> psram_staging flush -> close file -> SD sync -> psram_sleep -> Stop 2
-    pos_audio_stop = recorder_c.find("audio_in_stop()")
-    pos_drain_queue = recorder_c.find("drain_queue()")
-    pos_staging_flush = recorder_c.find("psram_staging_flush_publish()")
-    pos_file_close = recorder_c.find("fs_close(sd_file_ptr)")
-    pos_sd_sync = recorder_c.find("disk_access_ioctl(\"SD\", DISK_IOCTL_CTRL_SYNC, NULL)")
-    pos_psram_sleep = recorder_c.find("psram_sleep()")
-    pos_stop2 = recorder_c.find("rtc_sleep_enter_stop2(seconds)")
-    pos_psram_wake = recorder_c.find("psram_wake()")
+    # Sleep only starts between closed recording sessions; queued data must not
+    # be drained/discarded or an open file closed as an implicit flush.
+    sleep_src = recorder_c.split("int recorder_sleep(", 1)[1].split("void recorder_get_active_progress", 1)[0]
+    pos_audio_stop = sleep_src.find("audio_in_stop()")
+    pos_pending_check = sleep_src.find("pending audio blocks remain")
+    pos_staging_flush = sleep_src.find("psram_staging_flush_publish()")
+    pos_open_file_guard = sleep_src.find("sd_file_ptr != NULL")
+    pos_sd_sync = sleep_src.find("disk_access_ioctl(\"SD\", DISK_IOCTL_CTRL_SYNC, NULL)")
+    pos_psram_sleep = sleep_src.find("psram_sleep()")
+    pos_stop2 = sleep_src.find("rtc_sleep_enter_stop2(seconds)")
+    pos_psram_wake = sleep_src.find("psram_wake()")
 
-    assert -1 < pos_audio_stop < pos_drain_queue < pos_staging_flush < pos_file_close < pos_sd_sync < pos_psram_sleep < pos_stop2 < pos_psram_wake, \
-        "Strict 12-step shutdown and wake sequence violated in recorder_sleep"
+    assert -1 < pos_audio_stop < pos_pending_check < pos_staging_flush < pos_open_file_guard < pos_sd_sync < pos_psram_sleep < pos_stop2 < pos_psram_wake, \
+        "Sleep must reject pending work and synchronize storage before Stop 2"
+    assert "drain_queue();" not in sleep_src[pos_audio_stop:pos_stop2]
+    assert "fs_close(sd_file_ptr)" not in sleep_src[pos_audio_stop:pos_stop2]
 
 
 def test_repeated_sleep_wake_cycles_lifecycle():

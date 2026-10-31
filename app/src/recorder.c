@@ -108,6 +108,22 @@ static volatile uint64_t sd_writer_failed_bytes = 0;
 static volatile uint32_t sd_writer_batch_count = 0;
 static volatile int sd_writer_err = 0;
 
+/* Bound final drain using observed fs_write throughput when it is slower than
+ * the 4 KiB/s fallback, with five seconds reserved for filesystem metadata. */
+static uint32_t writer_completion_timeout_ms(uint32_t pending_bytes) {
+  uint64_t service_bytes_per_sec = 4096ULL;
+  if (sd_writer_write_us_sum > 0 && sd_writer_bytes_written > 0) {
+    uint64_t observed = (sd_writer_bytes_written * 1000000ULL) /
+                        sd_writer_write_us_sum;
+    if (observed > 0 && observed < service_bytes_per_sec) {
+      service_bytes_per_sec = observed;
+    }
+  }
+  uint64_t timeout = 5000ULL +
+                     ((uint64_t)pending_bytes * 1000ULL / service_bytes_per_sec);
+  return (timeout > UINT32_MAX) ? UINT32_MAX : (uint32_t)timeout;
+}
+
 #ifdef CONFIG_AUDIO_PSRAM_STAGING
 static bool g_psram_staging_enabled = true;
 #else
@@ -583,6 +599,7 @@ int recorder_storage_recover(void) {
   if (recorder_is_active()) {
     return -EBUSY;
   }
+  s_storage_recovering = true;
   if (mounted) {
     int ret = fs_unmount(&mp);
     if (ret != 0) {
@@ -597,12 +614,18 @@ int recorder_storage_recover(void) {
   int ret = disk_access_init("SD");
   if (ret != 0) {
     LOG_ERR("Storage recovery: SDMMC reinitialization failed: %d", ret);
+    s_storage_state = STORAGE_STATE_FAULT;
+    s_storage_recovery_result = ret;
+    s_storage_recovering = false;
     return ret;
   }
 
   ret = fs_mount(&mp);
   if (ret != 0) {
     LOG_ERR("Storage recovery: filesystem remount failed: %d", ret);
+    s_storage_state = STORAGE_STATE_FAULT;
+    s_storage_recovery_result = ret;
+    s_storage_recovering = false;
     return ret;
   }
   mounted = true;
@@ -610,6 +633,13 @@ int recorder_storage_recover(void) {
   if (ret != 0) {
     LOG_WRN("Storage recovery: could not release temporary disk reference: %d", ret);
   }
+
+  s_storage_state = STORAGE_STATE_HEALTHY;
+  s_storage_recovery_result = 0;
+  sd_writer_err = 0;
+  psram_staging_reset();
+  s_storage_recovering = false;
+
   LOG_INF("Storage recovery: SDMMC reinitialized and filesystem remounted");
   return 0;
 }
@@ -619,9 +649,11 @@ static int next_filename(char *name, size_t len) {
 
   for (unsigned int n = 1; n < 10000; n++) {
     snprintf(name, len, "/SD:/REC%04u.WAV", n);
-    if (fs_stat(name, &ent) != 0) {
+    int ret = fs_stat(name, &ent);
+    if (ret == -ENOENT) {
       return 0; /* does not exist yet */
     }
+    if (ret != 0) return ret;
   }
   return -ENOSPC;
 }
@@ -677,8 +709,9 @@ static int generate_recording_filename(char *name, size_t len,
       time_t epoch = scheduler_calendar_to_epoch(&td) + tz_off;
       struct rtc_calendar_time loc_td;
       scheduler_epoch_to_calendar(epoch, &loc_td);
+      loc_td.subsec = td.subsec;
 
-      char dir[64] = "/SD:";
+      char dir[96] = "/SD:";
       if (folder_mode == 1) {
         snprintf(dir, sizeof(dir), "/SD:/%04u%02u%02u", loc_td.year, loc_td.month, loc_td.day);
         int d_ret = ensure_dir_exists(dir);
@@ -702,15 +735,19 @@ static int generate_recording_filename(char *name, size_t len,
         }
       }
 
-      for (unsigned int n = 1; n < 1000; n++) {
-        snprintf(name, len, "%s/WS_%04u%02u%02u_%02u%02u%02u_%02u.WAV",
-                 dir, loc_td.year, loc_td.month, loc_td.day, loc_td.hour, loc_td.min, loc_td.sec, n);
+      for (unsigned int step = 0; step < 1000; step++) {
+        uint16_t candidate_ms = (uint16_t)((loc_td.subsec + step) % 1000U);
+        snprintf(name, len, "%s/%04u%02u%02u_%02u%02u%02u_%03u.wav",
+                 dir, loc_td.year, loc_td.month, loc_td.day,
+                 loc_td.hour, loc_td.min, loc_td.sec, candidate_ms);
 #if defined(CONFIG_FILE_SYSTEM)
         struct fs_dirent ent;
-        if (fs_stat(name, &ent) != 0) {
+        int stat_ret = fs_stat(name, &ent);
+        if (stat_ret == -ENOENT) {
           *rtc_valid = true;
           return 0;
         }
+        if (stat_ret != 0) return stat_ret;
 #else
         *rtc_valid = true;
         return 0;
@@ -945,21 +982,68 @@ int recorder_verify_file(const char *path, uint32_t expected_rate,
 }
 
 static volatile bool recorder_abort_requested = false;
+static volatile enum recorder_stop_reason s_recorder_stop_reason = RECORDER_STOP_NONE;
 static volatile bool recorder_active = false;
 static volatile int s_recorder_last_error = 0;
 static volatile int s_recorder_last_sd_error = 0;
+static volatile int s_storage_recovery_result = 0;
 static struct rec_stats *s_active_stats_ptr = NULL;
 static char s_active_file_path[80] = {0};
 
+static volatile bool s_storage_recovering = false;
+enum recorder_storage_state {
+  STORAGE_STATE_HEALTHY = 0,
+  STORAGE_STATE_FAULT,
+};
+static volatile enum recorder_storage_state s_storage_state = STORAGE_STATE_HEALTHY;
+
+void recorder_set_stop_reason(enum recorder_stop_reason reason) {
+  s_recorder_stop_reason = reason;
+}
+
+enum recorder_stop_reason recorder_get_stop_reason(void) {
+  return s_recorder_stop_reason;
+}
+
+void recorder_request_stop_reason(enum recorder_stop_reason reason) {
+  s_recorder_stop_reason = reason;
+  recorder_abort_requested = true;
+}
+
 bool recorder_is_active(void) { return recorder_active; }
+
+bool recorder_is_shutdown_ready(void) {
+  if (recorder_active) {
+    return false;
+  }
+  if (sd_file_ptr != NULL) {
+    return false;
+  }
+  if (sd_bounce_buf != NULL) {
+    return false;
+  }
+  if (sd_writer_flush_req) {
+    return false;
+  }
+  if (s_storage_recovering) {
+    return false;
+  }
+  return true;
+}
 
 bool recorder_is_abort_requested(void) { return recorder_abort_requested; }
 
 int recorder_get_last_error(void) { return s_recorder_last_error; }
 
 int recorder_get_last_sd_error(void) { return s_recorder_last_sd_error; }
+int recorder_get_storage_recovery_result(void) { return s_storage_recovery_result; }
 
-void recorder_request_stop(void) { recorder_abort_requested = true; }
+void recorder_request_stop(void) {
+  if (s_recorder_stop_reason == RECORDER_STOP_NONE) {
+    s_recorder_stop_reason = RECORDER_STOP_USER;
+  }
+  recorder_abort_requested = true;
+}
 
 int recorder_sleep(uint32_t seconds, uint32_t *wake_recovery_us) {
   if (seconds == 0) {
@@ -969,7 +1053,7 @@ int recorder_sleep(uint32_t seconds, uint32_t *wake_recovery_us) {
     return 0;
   }
 
-  /* 1. Reject sleep if recording is active or any recording/file operation remains in progress */
+  /* 1. Reject sleep if recording is active or any recording/flush operation remains in progress */
   if (recorder_active || sd_writer_flush_req) {
     LOG_ERR("recorder_sleep rejected: active recording or file operation in progress");
     return -EBUSY;
@@ -982,33 +1066,54 @@ int recorder_sleep(uint32_t seconds, uint32_t *wake_recovery_us) {
     return stop_rc;
   }
 
-  /* 5. Drain pending audio blocks */
-  drain_queue();
+  /* Pending blocks are uncommitted audio; refuse sleep rather than discard. */
+  if (k_msgq_num_used_get(&filled_q) != 0 ||
+      k_msgq_num_used_get(&sd_block_q) != 0) {
+    LOG_ERR("recorder_sleep rejected: pending audio blocks remain");
+    return -EBUSY;
+  }
 
   /* 6-7. Flush PSRAM staging pipeline and ensure SD writer is completely idle */
   if (psram_staging_is_active() && psram_staging_occupied() > 0) {
+    if (s_storage_state == STORAGE_STATE_FAULT) {
+      LOG_ERR("recorder_sleep rejected: uncommitted dirty audio buffers remain while storage in fault");
+      return -EBUSY;
+    }
     psram_staging_flush_publish();
     sd_writer_flush_req = true;
     k_sem_give(&sd_writer_sem);
-    if (k_sem_take(&sd_writer_done_sem, K_MSEC(5000)) != 0) {
+    uint32_t timeout_ms = writer_completion_timeout_ms(psram_staging_occupied());
+    if (k_sem_take(&sd_writer_done_sem, K_MSEC(timeout_ms)) != 0) {
       LOG_ERR("recorder_sleep: timeout flushing staging pipeline to SD");
-      sd_writer_flush_req = false;
       return -ETIMEDOUT;
     }
     sd_writer_flush_req = false;
+    if (sd_writer_err != 0 || psram_staging_occupied() != 0) {
+      return (sd_writer_err != 0) ? sd_writer_err : -EIO;
+    }
   }
 
-  /* 8. Confirm all recording buffers committed; finalize/close any open recording file */
+  if (psram_staging_is_active()) {
+    struct psram_staging_stats ps;
+    psram_staging_get_stats(&ps);
+    if (ps.occupied_bytes != 0 || ps.in_flight_bytes != 0) return -EBUSY;
+  }
+
+  /* 8. Open file guard: sleep only between closed recording sessions */
   if (sd_file_ptr != NULL) {
-    fs_close(sd_file_ptr);
-    sd_file_ptr = NULL;
+    LOG_ERR("recorder_sleep rejected: file still open");
+    return -EBUSY;
   }
 
-  /* 9. Synchronize SD card and check the result */
-  int sd_sync_rc = disk_access_ioctl("SD", DISK_IOCTL_CTRL_SYNC, NULL);
-  if (sd_sync_rc != 0) {
-    LOG_ERR("recorder_sleep: SD card sync failed before sleep (%d)", sd_sync_rc);
-    return sd_sync_rc;
+  /* 9. Synchronize SD card and check the result IF storage is healthy */
+  if (s_storage_state == STORAGE_STATE_HEALTHY) {
+    int sd_sync_rc = disk_access_ioctl("SD", DISK_IOCTL_CTRL_SYNC, NULL);
+    if (sd_sync_rc != 0) {
+      LOG_ERR("recorder_sleep: SD card sync failed before sleep (%d)", sd_sync_rc);
+      s_storage_state = STORAGE_STATE_FAULT;
+      s_storage_recovery_result = sd_sync_rc;
+      return sd_sync_rc;
+    }
   }
 
   /* 10. Put SD card/controller into deepest supported safe idle state */
@@ -1045,11 +1150,15 @@ int recorder_sleep(uint32_t seconds, uint32_t *wake_recovery_us) {
     return psram_wake_rc;
   }
 
-  /* 14. Verify SD card is responsive and synchronized after wake */
-  int post_sd_rc = disk_access_ioctl("SD", DISK_IOCTL_CTRL_SYNC, NULL);
-  if (post_sd_rc != 0) {
-    LOG_ERR("recorder_sleep: post-wake SD card sync failed (%d)", post_sd_rc);
-    return post_sd_rc;
+  /* 14. Verify SD card is responsive and synchronized after wake IF storage healthy */
+  if (s_storage_state == STORAGE_STATE_HEALTHY) {
+    int post_sd_rc = disk_access_ioctl("SD", DISK_IOCTL_CTRL_SYNC, NULL);
+    if (post_sd_rc != 0) {
+      LOG_ERR("recorder_sleep: post-wake SD card sync failed (%d)", post_sd_rc);
+      s_storage_state = STORAGE_STATE_FAULT;
+      s_storage_recovery_result = post_sd_rc;
+      return post_sd_rc;
+    }
   }
 
   if (res == -EINTR) {
@@ -1110,6 +1219,10 @@ int recorder_record_session(uint32_t seconds, uint32_t cycle,
     memset(out, 0, sizeof(*out));
   }
   recorder_abort_requested = false;
+  s_recorder_stop_reason = RECORDER_STOP_NONE;
+  s_recorder_last_error = 0;
+  s_recorder_last_sd_error = 0;
+  s_storage_recovery_result = -EAGAIN; /* no recovery attempted this session */
   recorder_active = true;
   s_active_stats_ptr = &st;
   s_active_file_path[0] = '\0';
@@ -1140,7 +1253,8 @@ int recorder_record_session(uint32_t seconds, uint32_t cycle,
          (double)st.digital_gain);
 #endif
 
-  struct fs_file_t f;
+  /* Keep the file object alive if a blocked writer outlives this call. */
+  static struct fs_file_t f;
   static uint8_t hdr[WAV_HEADER_BYTES] __aligned(4);
   int ret;
 
@@ -1199,7 +1313,15 @@ int recorder_record_session(uint32_t seconds, uint32_t cycle,
     return ret;
   }
   fs_file_t_init(&f);
-  ret = fs_open(&f, st.file, FS_O_CREATE | FS_O_WRITE);
+  /* Firmware has one recording owner. Recheck immediately before open; the
+   * FatFs VFS does not expose O_EXCL, and CREATE alone opens existing files. */
+  struct fs_dirent existing;
+  ret = fs_stat(st.file, &existing);
+  if (ret == 0) {
+    ret = -EEXIST;
+  } else if (ret == -ENOENT) {
+    ret = fs_open(&f, st.file, FS_O_CREATE | FS_O_WRITE);
+  }
   if (ret) {
     LOG_ERR("open %s: %d", st.file, ret);
     led_indicator_set(LED_IND_ERROR);
@@ -1301,6 +1423,7 @@ int recorder_record_session(uint32_t seconds, uint32_t cycle,
   active_use_psram = use_psram;
   sd_file_ptr = &f;
   sd_writer_flush_req = false;
+  k_sem_reset(&sd_writer_done_sem);
   sd_writer_write_us_sum = 0;
   sd_writer_write_count = 0;
   sd_writer_worst_write_us = 0;
@@ -1382,8 +1505,28 @@ int recorder_record_session(uint32_t seconds, uint32_t cycle,
     /* a healthy source delivers a block every ~10 ms; 2 s means it died */
     if (k_msgq_get(&filled_q, &blk, K_SECONDS(2)) != 0) {
       LOG_ERR("no audio for 2 s");
-      err = -ETIMEDOUT;
-      break;
+      struct audio_dma_stats stalled = {0};
+      audio_in_get_dma_stats(&stalled);
+      LOG_ERR("ADC/DMA status: callbacks=%u errors=%u overruns=%u missed=%u",
+              stalled.callbacks, stalled.callback_errors, stalled.adc_overruns,
+              stalled.events_missed);
+      bool recovered = false;
+      for (uint32_t attempt = 0; attempt < 2 && !recovered; attempt++) {
+        st.adc_dma_recovery_attempts++;
+        (void)audio_in_stop();
+        int restart_rc = audio_in_start();
+        if (restart_rc == 0 && k_msgq_get(&filled_q, &blk, K_SECONDS(2)) == 0) {
+          recovered = true;
+          LOG_WRN("ADC/DMA acquisition resumed after attempt %u", attempt + 1U);
+        } else {
+          st.adc_dma_recovery_failures++;
+          LOG_ERR("ADC/DMA recovery attempt %u failed (%d)", attempt + 1U, restart_rc);
+        }
+      }
+      if (!recovered) {
+        err = -ETIMEDOUT;
+        break;
+      }
     }
     st.blocks_processed++;
     uint64_t t_block_arrival = k_cycle_get_64();
@@ -1409,6 +1552,16 @@ int recorder_record_session(uint32_t seconds, uint32_t cycle,
       uint32_t bytes_to_write = samples_in_block * SAMPLE_BYTES;
       if (use_psram) {
         int p_ret = psram_staging_push(blk, bytes_to_write, samples_in_block);
+        if (p_ret == -ENOBUFS) {
+          k_sem_give(&sd_writer_sem);
+          uint32_t free_pool = k_mem_slab_num_free_get(&pool);
+          if (free_pool > 2) {
+            /* Headroom exists in DMA pool: wait boundedly up to 5 ms for writer to release a batch buffer */
+            if (psram_staging_wait_free(5) == 0) {
+              p_ret = psram_staging_push(blk, bytes_to_write, samples_in_block);
+            }
+          }
+        }
         k_mem_slab_free(&pool, blk);
 
         if (p_ret == -ENOBUFS) {
@@ -1571,6 +1724,15 @@ int recorder_record_session(uint32_t seconds, uint32_t cycle,
         if (use_psram) {
           int p_ret = psram_staging_push(format_chunk_buf, chunk_bytes, chunk_len);
           if (p_ret == -ENOBUFS) {
+            k_sem_give(&sd_writer_sem);
+            uint32_t free_pool = k_mem_slab_num_free_get(&pool);
+            if (free_pool > 2) {
+              if (psram_staging_wait_free(5) == 0) {
+                p_ret = psram_staging_push(format_chunk_buf, chunk_bytes, chunk_len);
+              }
+            }
+          }
+          if (p_ret == -ENOBUFS) {
             st.psram_full_events++;
             st.psram_dropped_samples += (samples_in_block - off);
             err = -ENOBUFS;
@@ -1654,6 +1816,10 @@ int recorder_record_session(uint32_t seconds, uint32_t cycle,
       dma_stats.callback_interval_max_cycles);
   st.dma_dropped_blocks = (dma_stats.samples_lost + BLOCK_SAMPLES - 1U) /
                           BLOCK_SAMPLES;
+  if ((dma_stats.samples_lost != 0 || dma_stats.events_missed != 0 ||
+       dma_stats.callback_errors != 0 || dma_stats.adc_overruns != 0) && err == 0) {
+    err = -EIO;
+  }
 
   /* Signal SD writer thread to flush any remaining audio bytes/blocks */
   if (use_psram) {
@@ -1661,7 +1827,23 @@ int recorder_record_session(uint32_t seconds, uint32_t cycle,
   }
   sd_writer_flush_req = true;
   k_sem_give(&sd_writer_sem);
-  k_sem_take(&sd_writer_done_sem, K_FOREVER);
+  uint32_t pending_writer_bytes = use_psram
+      ? psram_staging_occupied()
+      : (uint32_t)k_msgq_num_used_get(&sd_block_q) * BLOCK_BYTES;
+  uint32_t completion_timeout_ms = writer_completion_timeout_ms(pending_writer_bytes);
+  if (k_sem_take(&sd_writer_done_sem, K_MSEC(completion_timeout_ms)) != 0) {
+    LOG_ERR("SD writer completion timeout after %u ms; retaining writer resources",
+            completion_timeout_ms);
+    st.err = -ETIMEDOUT;
+    st.writer_completion_timeouts++;
+    s_recorder_last_error = -ETIMEDOUT;
+    s_recorder_last_sd_error = -ETIMEDOUT;
+    s_active_stats_ptr = NULL;
+    if (out) *out = st;
+    /* The writer may still own the file and bounce buffer. Keep the recorder
+     * fault latched active so sleep, remount, new sessions, and reboot are blocked. */
+    return -ETIMEDOUT;
+  }
   sd_writer_flush_req = false;
 
   /* Release borrowed bounce buffer back to pool if allocated */
@@ -1692,7 +1874,7 @@ int recorder_record_session(uint32_t seconds, uint32_t cycle,
     psram_staging_get_stats(&pstat);
     st.psram_high_water_bytes = pstat.high_water_bytes;
     st.psram_full_events = pstat.full_buffer_events;
-    st.psram_dropped_samples = pstat.dropped_samples;
+    st.psram_dropped_samples += pstat.dropped_samples;
   }
 
   uint32_t psram_lost_blocks = st.psram_dropped_samples / BLOCK_SAMPLES;
@@ -1765,31 +1947,49 @@ int recorder_record_session(uint32_t seconds, uint32_t cycle,
 
   /* finalise: real length into the header, truncate any excess pre-allocated
    * space */
-  const uint32_t data_bytes = (uint32_t)st.bytes_written;
-
-  wav_fill_header(hdr, st.sample_rate, st.channels, st.sample_bits, data_bytes);
-  int finalize_ret = 0;
-  if (err == 0 && sd_writer_err == 0) {
+  if (sd_writer_err != 0 || st.sd_write_error != 0) {
+    /* Case B: SDMMC or filesystem write failure.
+     * The filesystem handle and storage media are in an error state.
+     * Do NOT call fs_seek(), fs_write() for a new header, fs_truncate(), or fs_sync()!
+     * Attempt one best-effort close only after the writer has relinquished ownership.
+     */
+    int close_ret = fs_close(&f);
+    if (close_ret != 0) {
+      LOG_WRN("Best-effort fs_close on failed storage handle returned: %d", close_ret);
+    }
+    st.wav_verified = false;
+    if (err == 0) {
+      err = (sd_writer_err != 0) ? sd_writer_err : st.sd_write_error;
+    }
+  } else {
+    /* Writer completion is established here. Finalize a valid partial WAV using
+     * only bytes whose writes completed successfully, while preserving err.
+     * (Case A: Storage is healthy. Either normal completion or acquisition failure). */
+    const uint32_t data_bytes = (uint32_t)st.bytes_written;
+    wav_fill_header(hdr, st.sample_rate, st.channels, st.sample_bits, data_bytes);
+    int finalize_ret = 0;
     finalize_ret = fs_seek(&f, 0, FS_SEEK_SET);
     if (finalize_ret == 0) {
       ssize_t header_written = fs_write(&f, hdr, WAV_HEADER_BYTES);
-      if (header_written != WAV_HEADER_BYTES)
+      if (header_written != WAV_HEADER_BYTES) {
         finalize_ret = (header_written < 0) ? (int)header_written : -EIO;
+      }
     }
-    if (finalize_ret == 0)
+    if (finalize_ret == 0) {
       finalize_ret = fs_truncate(&f, WAV_HEADER_BYTES + data_bytes);
-    if (finalize_ret == 0)
+    }
+    if (finalize_ret == 0) {
       finalize_ret = fs_sync(&f);
-  } else {
-    LOG_WRN("Skipping WAV header finalization due to previous storage error (%d)",
-            err != 0 ? err : sd_writer_err);
-  }
-  int close_ret = fs_close(&f);
-  if (finalize_ret == 0) finalize_ret = close_ret;
-  if (finalize_ret != 0 && err == 0) {
-    LOG_ERR("WAV finalize/sync/close failed: %d", finalize_ret);
-    err = finalize_ret;
-    if (st.sd_write_error == 0) st.sd_write_error = finalize_ret;
+    }
+    int close_ret = fs_close(&f);
+    if (finalize_ret == 0) {
+      finalize_ret = close_ret;
+    }
+    if (finalize_ret != 0 && err == 0) {
+      LOG_ERR("WAV finalize/sync/close failed: %d", finalize_ret);
+      err = finalize_ret;
+      if (st.sd_write_error == 0) st.sd_write_error = finalize_ret;
+    }
   }
 
   /* Verify exact frame count and byte count match configured recording target
@@ -1852,8 +2052,19 @@ int recorder_record_session(uint32_t seconds, uint32_t cycle,
     printk("  Pipeline: dma_err=%u, adc_ovr=%u, dsp_ovr=%u, psram_full=%u, sd_err=%d\n",
            st.dma_errors, st.adc_overruns, st.dsp_overruns, st.psram_full_events, st.sd_write_error);
 #endif
-    /* Cleanly unmount and remount storage to recover from SDMMC/FatFs timeout */
-    recorder_storage_recover();
+    /* Only storage faults justify unmount/remount; acquisition/PSRAM errors do
+     * not imply a bad SD card. Writer completion above establishes idle first. */
+    int storage_error = (sd_writer_err != 0) ? sd_writer_err : st.sd_write_error;
+    if (storage_error == -EIO || storage_error == -ETIMEDOUT ||
+        storage_error == -EBUSY) {
+      st.sd_recovery_attempts++;
+      s_storage_recovery_result = recorder_storage_recover();
+      st.sd_recovery_result = s_storage_recovery_result;
+      if (s_storage_recovery_result != 0) {
+        LOG_ERR("Storage recovery failed: %d", s_storage_recovery_result);
+      }
+      if (out) *out = st;
+    }
   } else {
     led_indicator_set(LED_IND_OFF);
   }

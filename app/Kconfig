@@ -287,6 +287,18 @@ config WILDSONIC_VERBOSE_LOGS
 	  matrices, per-session banners, and standby countdown messages.
 	  Enable this symbol for test and engineering builds.
 
+config LOG_DEFAULT_LEVEL_WRN
+	bool "Default log level WARNING"
+	default n
+	help
+	  Sets default logging level to WARNING (2).
+
+config LOG_DEFAULT_LEVEL_INF
+	bool "Default log level INFO"
+	default n
+	help
+	  Sets default logging level to INFO (3).
+
 # SD over SPI must use DMA (see sd/spi_*.overlay). Only takes effect when SPI is in use.
 config SPI_STM32_DMA
 	default y

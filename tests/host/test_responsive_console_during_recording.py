@@ -93,8 +93,11 @@ def test_safe_command_behavior_during_active_recording():
     # 1. APPLY returns BUSY
     assert "BUSY: Cannot commit to flash while recording is active" in c_text
 
-    # 2. SLEEP returns BUSY when recording is active
-    assert "BUSY: Cannot enter sleep while recording is active" in c_text
+    # 2. SLEEP sets the configured inter-session interval; it is not an
+    # immediate low-power transition and does not interrupt active recording.
+    sleep_handler = c_text.split("static void handle_sleep(", 1)[1].split("/* DATETIME handler */", 1)[0]
+    assert "scfg.sleep_interval = (uint32_t)val;" in sleep_handler
+    assert "recorder_sleep(" not in sleep_handler
 
     # 3. STOP_RECORDING requests stop and returns OK
     assert "OK: Stop recording requested" in c_text

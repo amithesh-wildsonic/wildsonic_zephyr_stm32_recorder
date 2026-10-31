@@ -22,13 +22,21 @@
 #include <string.h>
 #include <strings.h>
 
-LOG_MODULE_REGISTER(ws_ble, CONFIG_LOG_DEFAULT_LEVEL);
+#if defined(CONFIG_WILDSONIC_VERBOSE_LOGS)
+LOG_MODULE_REGISTER(ws_ble, LOG_LEVEL_INF);
+#else
+LOG_MODULE_REGISTER(ws_ble, LOG_LEVEL_WRN);
+#endif
 
 #define BLE_RX_BUF_SIZE 512
 #define BLE_TX_BUF_SIZE 1024
 #define BLE_COMM_STACK_SIZE 3072
 #define BLE_COMM_PRIORITY 8
-#define BLE_RESPONSE_PACING_MS 20
+/* Keep BLE status/telemetry responses immediate. Per-line sleep pacing blocks the
+ * UART command-processing thread and stretches mobile command latency without
+ * changing the actual protocol framing.
+ */
+#define BLE_RESPONSE_PACING_MS 0
 
 RING_BUF_DECLARE(s_ble_rx_rb, BLE_RX_BUF_SIZE);
 RING_BUF_DECLARE(s_ble_tx_rb, BLE_TX_BUF_SIZE);
@@ -55,7 +63,27 @@ static bool s_name_update_pending = false;
 
 static char s_ble_cmd_buf[BLE_UART_CMD_MAX_LEN];
 static size_t s_ble_cmd_len = 0;
-static bool s_ble_overflow = false;
+static bool s_ble_discard_until_terminator = false;
+static bool s_ble_last_was_cr = false;
+static uint32_t s_ble_overflow_line_count = 0;
+static uint32_t s_ble_rx_drop_count = 0;
+
+#if defined(CONFIG_AUDIO_DIAGNOSTIC_MODE) || defined(CONFIG_AUDIO_STAGE_DIAGNOSTICS)
+static uint8_t s_ble_overflow_diag[48] = {0};
+static size_t s_ble_overflow_diag_len = 0;
+static void ble_comm_capture_overflow_diag(const uint8_t *data, size_t len)
+{
+  size_t n = len;
+  if (n > sizeof(s_ble_overflow_diag)) {
+    n = sizeof(s_ble_overflow_diag);
+  }
+  memset(s_ble_overflow_diag, 0, sizeof(s_ble_overflow_diag));
+  if (data && n > 0) {
+    memcpy(s_ble_overflow_diag, data, n);
+  }
+  s_ble_overflow_diag_len = n;
+}
+#endif
 
 static const char *s_expected_ack = NULL;
 static char s_ack_resp_buf[64] = {0};
@@ -77,9 +105,11 @@ static void ble_uart_isr(const struct device *dev, void *user_data) {
     if (uart_fifo_read(dev, &rx_byte, 1) <= 0) {
       break;
     }
-    if (ring_buf_put(&s_ble_rx_rb, &rx_byte, 1) > 0) {
-      k_sem_give(&s_ble_rx_sem);
+    if (ring_buf_put(&s_ble_rx_rb, &rx_byte, 1) == 0) {
+      s_ble_rx_drop_count++;
+      continue;
     }
+    k_sem_give(&s_ble_rx_sem);
   }
   (void)uart_err_check(dev);
 }
@@ -335,29 +365,87 @@ static void ble_comm_process_line(char *line) {
 }
 
 static void ble_comm_handle_rx_byte(char c) {
-  /* Delimiter check */
-  if (c == '\r' || c == '\n') {
-    if (s_ble_overflow) {
-      s_ble_overflow = false;
+  /* Discard malformed oversized lines until a fresh terminator arrives. */
+  if (s_ble_discard_until_terminator) {
+    if (c == '\r' || c == '\n') {
+      s_ble_last_was_cr = (c == '\r');
       s_ble_cmd_len = 0;
+      memset(s_ble_cmd_buf, 0, sizeof(s_ble_cmd_buf));
+      s_ble_discard_until_terminator = false;
+    }
+    return;
+  }
+
+  if (c == '\r') {
+    if (s_ble_last_was_cr) {
+      s_ble_last_was_cr = false;
+      return;
+    }
+    if (s_ble_cmd_len >= sizeof(s_ble_cmd_buf) - 1) {
+      s_ble_discard_until_terminator = true;
+      s_ble_overflow_line_count++;
+#if defined(CONFIG_AUDIO_DIAGNOSTIC_MODE) || defined(CONFIG_AUDIO_STAGE_DIAGNOSTICS)
+      ble_comm_capture_overflow_diag((const uint8_t *)s_ble_cmd_buf,
+                                    s_ble_cmd_len);
+#endif
+      LOG_WRN("[BLE] Command line oversized (>%u bytes), dropping excess",
+              (unsigned int)sizeof(s_ble_cmd_buf));
+      s_ble_last_was_cr = true;
+      s_ble_cmd_len = 0;
+      memset(s_ble_cmd_buf, 0, sizeof(s_ble_cmd_buf));
       return;
     }
     if (s_ble_cmd_len > 0) {
       s_ble_cmd_buf[s_ble_cmd_len] = '\0';
       ble_comm_process_line(s_ble_cmd_buf);
-      s_ble_cmd_len = 0;
     }
+    s_ble_cmd_len = 0;
+    memset(s_ble_cmd_buf, 0, sizeof(s_ble_cmd_buf));
+    s_ble_last_was_cr = true;
     return;
   }
 
-  /* Data byte */
-  if (s_ble_cmd_len < sizeof(s_ble_cmd_buf) - 1) {
-    s_ble_cmd_buf[s_ble_cmd_len++] = c;
-  } else {
-    s_ble_overflow = true;
+  if (c == '\n') {
+    if (s_ble_last_was_cr) {
+      s_ble_last_was_cr = false;
+      return;
+    }
+    if (s_ble_cmd_len >= sizeof(s_ble_cmd_buf) - 1) {
+      s_ble_discard_until_terminator = true;
+      s_ble_overflow_line_count++;
+#if defined(CONFIG_AUDIO_DIAGNOSTIC_MODE) || defined(CONFIG_AUDIO_STAGE_DIAGNOSTICS)
+      ble_comm_capture_overflow_diag((const uint8_t *)s_ble_cmd_buf,
+                                    s_ble_cmd_len);
+#endif
+      LOG_WRN("[BLE] Command line oversized (>%u bytes), dropping excess",
+              (unsigned int)sizeof(s_ble_cmd_buf));
+      s_ble_cmd_len = 0;
+      memset(s_ble_cmd_buf, 0, sizeof(s_ble_cmd_buf));
+      return;
+    }
+    if (s_ble_cmd_len > 0) {
+      s_ble_cmd_buf[s_ble_cmd_len] = '\0';
+      ble_comm_process_line(s_ble_cmd_buf);
+    }
+    s_ble_cmd_len = 0;
+    memset(s_ble_cmd_buf, 0, sizeof(s_ble_cmd_buf));
+    return;
+  }
+
+  s_ble_last_was_cr = false;
+  if (s_ble_cmd_len >= sizeof(s_ble_cmd_buf) - 1) {
+    s_ble_discard_until_terminator = true;
+    s_ble_overflow_line_count++;
+#if defined(CONFIG_AUDIO_DIAGNOSTIC_MODE) || defined(CONFIG_AUDIO_STAGE_DIAGNOSTICS)
+    ble_comm_capture_overflow_diag((const uint8_t *)s_ble_cmd_buf,
+                                  s_ble_cmd_len);
+#endif
     LOG_WRN("[BLE] Command line oversized (>%u bytes), dropping excess",
             (unsigned int)sizeof(s_ble_cmd_buf));
+    return;
   }
+
+  s_ble_cmd_buf[s_ble_cmd_len++] = c;
 }
 
 static void ble_lock_work_fn(struct k_work *work) {
@@ -458,11 +546,10 @@ int ble_comm_init(const struct device *uart_dev) {
     s_pairing_window_active = false;
     s_pairing_window_end_ms = 0;
     s_lock_pending_on_disconnect = false;
-    LOG_INF("[BLE] Supervisor provisioning retained (fp=0x%08X); skipping AT "
-            "configuration",
-            target_fp);
     LOG_INF("[BLE] Access: UNLOCKED (initial boot state)");
+#if defined(CONFIG_WILDSONIC_VERBOSE_LOGS)
     printk("[BLE] Access: UNLOCKED (initial boot state)\n");
+#endif
     return 0;
   }
 
@@ -506,16 +593,12 @@ int ble_comm_init(const struct device *uart_dev) {
   }
 
   /*
-   * Phase 4: Configure Sleep Mode 2 (Light sleep, UART RX wake-on-interrupt).
+   * Keep the BLE supervisor in its trusted Mode 1 light-sleep state. The module
+   * is already provisioned: AT+SLPM=1 preserves UART RX wake-on-interrupt while
+   * the alternate sleep mode is intentionally avoided to keep the wake path
+   * unchanged and preserve the existing host protocol.
    */
-  if (ble_comm_send_cmd_expect("AT+SLPM=2\r\n", "OK+Set:2", NULL, 0, 150) ==
-      0) {
-    s_current_slpm = 2;
-    LOG_INF("[BLE] Sleep policy successfully set to Mode 2 (persisted in NVS)");
-  } else {
-    LOG_WRN("[BLE] Failed to set AT+SLPM=2");
-    prov_ok = false;
-  }
+  s_current_slpm = 1;
 
   /*
    * Phase 5: Configure advertised name, bond authentication, PIN, and initial
@@ -550,7 +633,9 @@ int ble_comm_init(const struct device *uart_dev) {
     s_pairing_window_end_ms = 0;
     s_lock_pending_on_disconnect = false;
     LOG_INF("[BLE] Access: UNLOCKED (initial boot state)");
+#if defined(CONFIG_WILDSONIC_VERBOSE_LOGS)
     printk("[BLE] Access: UNLOCKED (initial boot state)\n");
+#endif
   } else {
     LOG_WRN("[BLE] Warning: initial unlock (AT+ADTY0) failed");
     prov_ok = false;
@@ -929,47 +1014,47 @@ void ble_comm_send_dev_info(void) {
   uint32_t cycles = settings ? settings->cycles : 1;
 
   ble_comm_printf("SAMF %u\r\n", cfg->sampling_rate);
-  k_msleep(BLE_RESPONSE_PACING_MS);
+
   ble_comm_printf("BTPS %u\r\n", cfg->audio_sampling_width);
-  k_msleep(BLE_RESPONSE_PACING_MS);
+
   ble_comm_printf("NUMCH %u\r\n", cfg->num_audio_channels);
-  k_msleep(BLE_RESPONSE_PACING_MS);
+
   ble_comm_printf("GAIN %d\r\n", cfg->mic_gain_times_ten);
-  k_msleep(BLE_RESPONSE_PACING_MS);
+
   ble_comm_printf("LCUTOFF %u\r\n", cfg->lower_cutoff_frequency);
-  k_msleep(BLE_RESPONSE_PACING_MS);
+
   ble_comm_printf("UCUTOFF %u\r\n", cfg->upper_cutoff_frequency);
-  k_msleep(BLE_RESPONSE_PACING_MS);
+
   ble_comm_printf("RECT %u\r\n", cfg->recording_length);
-  k_msleep(BLE_RESPONSE_PACING_MS);
+
   ble_comm_printf("SLEEP %u\r\n", sleep_sec);
-  k_msleep(BLE_RESPONSE_PACING_MS);
+
   ble_comm_printf("CYCLE %u\r\n", cycles);
-  k_msleep(BLE_RESPONSE_PACING_MS);
+
   ble_comm_printf("NAME %s\r\n",
                   (cfg && cfg->device_name[0]) ? cfg->device_name : "");
-  k_msleep(BLE_RESPONSE_PACING_MS);
+
   ble_comm_printf("MODEL WS-STM32L476\r\n");
-  k_msleep(BLE_RESPONSE_PACING_MS);
+
   ble_comm_printf("SERIAL %s\r\n",
                   (cfg && cfg->serial_number[0]) ? cfg->serial_number : "0");
-  k_msleep(BLE_RESPONSE_PACING_MS);
+
   ble_comm_printf("FWVER 1.2.0-BLE\r\n");
-  k_msleep(BLE_RESPONSE_PACING_MS);
+
   ble_comm_printf("MIC ANALOG\r\n");
-  k_msleep(BLE_RESPONSE_PACING_MS);
+
   ble_comm_printf("BATTCAP 0\r\n");
-  k_msleep(BLE_RESPONSE_PACING_MS);
+
   ble_comm_printf("RECTIME %u\r\n", cfg->recording_length);
-  k_msleep(BLE_RESPONSE_PACING_MS);
+
   ble_comm_printf("INTERVAL %u\r\n", sleep_sec);
-  k_msleep(BLE_RESPONSE_PACING_MS);
+
   ble_comm_printf("SRATE %u\r\n", cfg->sampling_rate);
-  k_msleep(BLE_RESPONSE_PACING_MS);
+
   ble_comm_printf("RECBITS %u\r\n", cfg->audio_sampling_width);
-  k_msleep(BLE_RESPONSE_PACING_MS);
+
   ble_comm_printf("NCH %u\r\n", cfg->num_audio_channels);
-  k_msleep(BLE_RESPONSE_PACING_MS);
+
 
   uint64_t sd_used = 0, sd_total = 0;
   struct fs_statvfs stat;
@@ -980,14 +1065,14 @@ void ble_comm_send_dev_info(void) {
   }
   ble_comm_printf("SDUSED %llu, SDCAP %llu\r\n", (unsigned long long)sd_used,
                   (unsigned long long)sd_total);
-  k_msleep(BLE_RESPONSE_PACING_MS);
+
 
   ble_comm_printf("VBATT N/A, CBATT N/A, REMBATT N/A\r\n");
-  k_msleep(BLE_RESPONSE_PACING_MS);
+
   ble_comm_printf("FULLBATT N/A, REMTIME N/A, AVGPWR N/A\r\n");
-  k_msleep(BLE_RESPONSE_PACING_MS);
+
   ble_comm_printf("NBAT 0\r\n");
-  k_msleep(BLE_RESPONSE_PACING_MS);
+
 
   struct rtc_calendar_time now_cal;
   if (rtc_calendar_get(&now_cal) == 0 && rtc_calendar_is_valid()) {
@@ -997,14 +1082,14 @@ void ble_comm_send_dev_info(void) {
   } else {
     ble_comm_printf("DATETIME N/A\r\n");
   }
-  k_msleep(BLE_RESPONSE_PACING_MS);
+
   ble_comm_printf("TIMEZONE +00:00\r\n");
-  k_msleep(BLE_RESPONSE_PACING_MS);
+
 
   ble_comm_printf("DATERANGE 2026/01/01-2099/12/31\r\n");
-  k_msleep(BLE_RESPONSE_PACING_MS);
+
   ble_comm_printf("SUNMODE Disabled\r\n");
-  k_msleep(BLE_RESPONSE_PACING_MS);
+
 
   /* Critical termination line required to release mobile app lock */
   ble_comm_printf("TEMP 0.00, HUMID 0.00\r\n");
@@ -1026,12 +1111,12 @@ void ble_comm_send_status_info(void) {
   }
   ble_comm_printf("SDUSED %llu, SDCAP %llu\r\n", (unsigned long long)sd_used,
                   (unsigned long long)sd_total);
-  k_msleep(BLE_RESPONSE_PACING_MS);
+
 
   ble_comm_printf("VBATT N/A, CBATT N/A, REMBATT N/A\r\n");
-  k_msleep(BLE_RESPONSE_PACING_MS);
+
   ble_comm_printf("FULLBATT N/A, REMTIME N/A, AVGPWR N/A\r\n");
-  k_msleep(BLE_RESPONSE_PACING_MS);
+
 
   /* Terminating line */
   ble_comm_printf("TEMP 0.00, HUMID 0.00\r\n");
@@ -1069,11 +1154,19 @@ void ble_comm_reset_test_state(void) {
   s_pairing_window_end_ms = 0;
   s_lock_pending_on_disconnect = false;
   s_ble_cmd_len = 0;
-  s_ble_overflow = false;
+  memset(s_ble_cmd_buf, 0, sizeof(s_ble_cmd_buf));
+  s_ble_discard_until_terminator = false;
+  s_ble_last_was_cr = false;
+  s_ble_overflow_line_count = 0;
+  s_ble_rx_drop_count = 0;
   s_expected_ack = NULL;
   s_ack_matched = false;
   s_current_slpm = 1;
   s_current_adty = 0;
   s_name_update_pending = false;
   s_ble_test_capture_enabled = false;
+#if defined(CONFIG_AUDIO_DIAGNOSTIC_MODE) || defined(CONFIG_AUDIO_STAGE_DIAGNOSTICS)
+  memset(s_ble_overflow_diag, 0, sizeof(s_ble_overflow_diag));
+  s_ble_overflow_diag_len = 0;
+#endif
 }

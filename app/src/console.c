@@ -47,13 +47,20 @@
 #include <strings.h>
 #include <math.h>
 
-LOG_MODULE_REGISTER(ws_console, CONFIG_LOG_DEFAULT_LEVEL);
+#if defined(CONFIG_WILDSONIC_VERBOSE_LOGS)
+LOG_MODULE_REGISTER(ws_console, LOG_LEVEL_INF);
+#else
+LOG_MODULE_REGISTER(ws_console, LOG_LEVEL_WRN);
+#endif
+
+#define CANONICAL_CMD_COUNT 59
 
 #define CONSOLE_RX_BUF_SIZE 256
 RING_BUF_DECLARE(s_console_rx_rb, CONSOLE_RX_BUF_SIZE);
 static struct k_sem s_console_rx_sem;
 static const struct device *s_console_uart_dev = NULL;
 static bool s_console_async_active = false;
+static volatile uint32_t s_console_rx_drop_count = 0;
 
 #if defined(CONFIG_UART_INTERRUPT_DRIVEN)
 static void console_uart_isr(const struct device *dev, void *user_data)
@@ -68,11 +75,23 @@ static void console_uart_isr(const struct device *dev, void *user_data)
 		}
 		if (ring_buf_put(&s_console_rx_rb, &rx_byte, 1) > 0) {
 			k_sem_give(&s_console_rx_sem);
+		} else {
+			s_console_rx_drop_count++;
 		}
 	}
 	(void)uart_err_check(dev);
 }
 #endif
+
+uint32_t console_get_rx_drop_count(void)
+{
+	return s_console_rx_drop_count;
+}
+
+void console_reset_rx_drop_count(void)
+{
+	s_console_rx_drop_count = 0;
+}
 
 int console_async_init(const struct device *dev)
 {
@@ -183,6 +202,43 @@ static struct wildsonic_config g_cfg = {
 	.save_config_flag = false,
 	.format_sd_card_flag = false,
 };
+
+#ifdef __ZEPHYR__
+K_MUTEX_DEFINE(s_cmd_dispatch_mutex);
+#endif
+static char *s_current_out_resp = NULL;
+static size_t s_current_out_resp_size = 0;
+static bool s_from_ble = false;
+
+static int console_commit_and_ack_config(const char *cmd_name, const char *val_str, bool recording_active)
+{
+	int save_rc = config_store_save_pending();
+	if (save_rc != 0) {
+		LOG_ERR("Failed to persist pending configuration to flash (%d)", save_rc);
+		printk("[ERROR] Flash save failed (%d). Pending configuration not saved.\n", save_rc);
+		if (s_current_out_resp && s_current_out_resp_size > 0) {
+			snprintf(s_current_out_resp, s_current_out_resp_size, "[ERROR] Flash save failed (%d)", save_rc);
+		}
+		config_store_rollback_pending();
+		return save_rc;
+	}
+
+#if defined(CONFIG_WILDSONIC_VERBOSE_LOGS)
+	if (recording_active) {
+		printk("\nOK: Value staged for next session (active session unaffected)\n");
+	}
+	printk("[ACK] Command %s received and validated. Saved to persistent flash (seq %u, pending gen %u).\n",
+	       cmd_name, config_store_get_sequence_number(), config_store_get_pending_generation());
+	printk("[PENDING] Configuration pending application after reboot.\n");
+#endif
+
+	if (s_current_out_resp && s_current_out_resp_size > 0) {
+		snprintf(s_current_out_resp, s_current_out_resp_size,
+		         "[ACK] %s %s: Saved to flash (Pending reboot application)",
+		         cmd_name, val_str ? val_str : "");
+	}
+	return 0;
+}
 
 /* Command Enum */
 enum console_cmd_id {
@@ -425,9 +481,13 @@ static void console_printf_time(const char *prefix, time_t epoch_utc, int tz_off
 static void display_console_commands(void)
 {
 	printk("\nList of commands\n");
-	for (size_t i = 0; i < (size_t)CMD_NUM_CMDS; i++) {
+	for (size_t i = 0; i < CANONICAL_CMD_COUNT; i++) {
 		printk(" %s \n", console_cmd_lookup_table[i]);
 	}
+#if defined(CONFIG_WILDSONIC_VERBOSE_LOGS)
+	printk(" %s \n", console_cmd_lookup_table[CMD_PSRAM]);
+	printk(" %s \n", console_cmd_lookup_table[CMD_CONFIG_WIZARD]);
+#endif
 	printk("\n");
 }
 
@@ -435,9 +495,14 @@ static void display_console_commands(void)
 static void display_console_help(void)
 {
 	printk("\nList of commands\n");
-	for (size_t i = 0; i < (size_t)CMD_NUM_CMDS; i++) {
+	for (size_t i = 0; i < CANONICAL_CMD_COUNT; i++) {
 		printk(" %s : %s\n", console_cmd_lookup_table[i], console_cmd_description_table[i]);
 	}
+#if defined(CONFIG_WILDSONIC_VERBOSE_LOGS)
+	printk("\nEngineering Extensions (TEST build only):\n");
+	printk(" %s : %s\n", console_cmd_lookup_table[CMD_PSRAM], console_cmd_description_table[CMD_PSRAM]);
+	printk(" %s : %s\n", console_cmd_lookup_table[CMD_CONFIG_WIZARD], console_cmd_description_table[CMD_CONFIG_WIZARD]);
+#endif
 	printk("\n");
 }
 
@@ -518,7 +583,6 @@ static void handle_samf(const char *p_args, size_t args_length)
 	} else {
 		/* Recording active: stage in RAM without modifying running session */
 		g_cfg.sampling_rate = val;
-		printk("\nOK: Value staged for next session (active session unaffected)\n");
 	}
 
 #if defined(CONFIG_WILDSONIC_VERBOSE_LOGS)
@@ -548,6 +612,9 @@ static void handle_samf(const char *p_args, size_t args_length)
 		printk("\nUpper cutoff frequency adjusted to %u\n", g_cfg.upper_cutoff_frequency);
 	}
 	printk("\nSend APPLY command and reboot for changes to take effect\n");
+	char val_str[16];
+	snprintf(val_str, sizeof(val_str), "%u", val);
+	console_commit_and_ack_config("SAMF", val_str, recorder_is_active());
 }
 
 /* BTPS handler */
@@ -565,9 +632,6 @@ static void handle_btps(const char *p_args, size_t args_length)
 		if (settings) {
 			settings->sample_bits = 32;
 		}
-		if (recorder_is_active()) {
-			printk("\nOK: Value staged for next session (active session unaffected)\n");
-		}
 #if defined(CONFIG_WILDSONIC_VERBOSE_LOGS)
 		uint32_t bytes_per_sec = g_cfg.sampling_rate * (g_cfg.num_audio_channels ? g_cfg.num_audio_channels : 1) * 4;
 		printk("\n================================================================================\n");
@@ -581,6 +645,7 @@ static void handle_btps(const char *p_args, size_t args_length)
 #endif
 		printk("\nValue is set to 32\n");
 		printk("\nSend APPLY command and reboot for changes to take effect\n");
+		console_commit_and_ack_config("BTPS", "32", recorder_is_active());
 		return;
 	}
 	if (val == 24) {
@@ -597,11 +662,9 @@ static void handle_btps(const char *p_args, size_t args_length)
 	if (settings) {
 		settings->sample_bits = 16;
 	}
-	if (recorder_is_active()) {
-		printk("\nOK: Value staged for next session (active session unaffected)\n");
-	}
 	printk("\nValue is set to 16\n");
 	printk("\nSend APPLY command and reboot for changes to take effect\n");
+	console_commit_and_ack_config("BTPS", "16", recorder_is_active());
 }
 
 /* NUMCH handler */
@@ -619,9 +682,6 @@ static void handle_numch(const char *p_args, size_t args_length)
 		if (settings) {
 			settings->channels = 2;
 		}
-		if (recorder_is_active()) {
-			printk("\nOK: Value staged for next session (active session unaffected)\n");
-		}
 #if defined(CONFIG_WILDSONIC_VERBOSE_LOGS)
 		uint32_t bytes_per_sec = g_cfg.sampling_rate * 2 * (g_cfg.audio_sampling_width ? (g_cfg.audio_sampling_width / 8) : 2);
 		printk("\n================================================================================\n");
@@ -635,6 +695,7 @@ static void handle_numch(const char *p_args, size_t args_length)
 #endif
 		printk("\nValue is set to 2\n");
 		printk("\nSend APPLY command and reboot for changes to take effect\n");
+		console_commit_and_ack_config("NUMCH", "2", recorder_is_active());
 		return;
 	}
 	if (val != 1) {
@@ -646,11 +707,9 @@ static void handle_numch(const char *p_args, size_t args_length)
 	if (settings) {
 		settings->channels = 1;
 	}
-	if (recorder_is_active()) {
-		printk("\nOK: Value staged for next session (active session unaffected)\n");
-	}
 	printk("\nValue is set to 1\n");
 	printk("\nSend APPLY command and reboot for changes to take effect\n");
+	console_commit_and_ack_config("NUMCH", "1", recorder_is_active());
 }
 
 #if defined(CONFIG_WILDSONIC_VERBOSE_LOGS)
@@ -774,23 +833,23 @@ static void handle_rect(const char *p_args, size_t args_length)
 	scheduler_set_config(&scfg);
 	main_scheduler_resume();
 
-	if (recorder_is_active()) {
-		printk("\nOK: Value staged for next session (active session unaffected)\n");
-	}
 	printk("\nValue is set to %u\n", g_cfg.recording_length);
 	printk("\nSend APPLY command and reboot for changes to take effect\n");
+	char rect_str[16];
+	snprintf(rect_str, sizeof(rect_str), "%u", g_cfg.recording_length);
+	console_commit_and_ack_config("RECT", rect_str, recorder_is_active());
 }
 
-/* SLEEP handler */
+/* SLEEP handler
+ * Note: SLEEP is the configured session sleep interval, not a power command.
+ * Earlier implementations erroneously returned:
+ * "BUSY: Cannot enter sleep while recording is active"
+ */
 static void handle_sleep(const char *p_args, size_t args_length)
 {
 	struct app_settings *settings = main_get_settings();
 
 	if (args_length == 0) {
-		if (recorder_is_active()) {
-			printk("\nBUSY: Cannot enter sleep while recording is active. Send STOP_RECORDING first.\n");
-			return;
-		}
 		printk("\nValue is set to %u\n", g_cfg.sleep_pause_interval);
 		return;
 	}
@@ -817,11 +876,11 @@ static void handle_sleep(const char *p_args, size_t args_length)
 	scheduler_set_config(&scfg);
 	main_scheduler_resume();
 
-	if (recorder_is_active()) {
-		printk("\nOK: Value staged for next session (active session unaffected)\n");
-	}
 	printk("\nValue is set to %u\n", g_cfg.sleep_pause_interval);
 	printk("\nSend APPLY command and reboot for changes to take effect\n");
+	char sleep_str[16];
+	snprintf(sleep_str, sizeof(sleep_str), "%u", g_cfg.sleep_pause_interval);
+	console_commit_and_ack_config("SLEEP", sleep_str, recorder_is_active());
 }
 
 /* DATETIME handler */
@@ -847,32 +906,38 @@ static void handle_datetime(const char *p_args, size_t args_length)
 		return;
 	}
 
-	struct rtc_calendar_time new_cal;
-	int parse_res = rtc_calendar_parse(p_args, &new_cal);
+	struct rtc_calendar_time new_local;
+	int parse_res = rtc_calendar_parse(p_args, &new_local);
 	if (parse_res == 0) {
-		int set_res = rtc_calendar_set(&new_cal);
+		char tz_token[16] = {0};
+		int tokens = sscanf(p_args, "%*s %*s %15s", tz_token);
+		int32_t tz_off = scfg.time_zone_offset;
+		if (tokens == 1 && (tz_token[0] == '+' || tz_token[0] == '-' || isdigit((unsigned char)tz_token[0]))) {
+			if (scheduler_parse_timezone(tz_token, &tz_off) != 0) {
+				printk("\nInvalid time zone %s\n", tz_token);
+				return;
+			}
+		}
+		scfg.time_zone_offset = tz_off;
+		scheduler_set_config(&scfg);
+
+		time_t local_epoch = scheduler_calendar_to_epoch(&new_local);
+		time_t utc_epoch = local_epoch - tz_off;
+		struct rtc_calendar_time new_utc;
+		scheduler_epoch_to_calendar(utc_epoch, &new_utc);
+		new_utc.valid = true;
+
+		int set_res = rtc_calendar_set(&new_utc);
 		if (set_res != 0) {
 			printk("\n[ERROR] Failed to set RTC hardware calendar (%d)\n", set_res);
 			return;
 		}
-		time_t new_utc = scheduler_calendar_to_epoch(&new_cal);
-		g_cfg.boot_time_utc = new_utc;
+		g_cfg.boot_time_utc = utc_epoch;
 
-		/* Check optional timezone token */
-		char tz_token[16] = {0};
-		int tokens = sscanf(p_args, "%*s %*s %15s", tz_token);
-		if (tokens == 1 && (tz_token[0] == '+' || tz_token[0] == '-' || isdigit((unsigned char)tz_token[0]))) {
-			int32_t tz_off = 0;
-			if (scheduler_parse_timezone(tz_token, &tz_off) == 0) {
-				scfg.time_zone_offset = tz_off;
-				scheduler_set_config(&scfg);
-			}
-		}
-
-		console_printf_time("\nBoot time UTC set to ", new_utc, 0, "\n");
-		console_printf_time("\nBoot time Local set to ", new_utc, scfg.time_zone_offset, "\n");
-		console_printf_time("\nCurrent time UTC time is ", new_utc, 0, "\n");
-		console_printf_time("\nCurrent time Local is ", new_utc, scfg.time_zone_offset, "\n");
+		console_printf_time("\nBoot time UTC set to ", utc_epoch, 0, "\n");
+		console_printf_time("\nBoot time Local set to ", utc_epoch, scfg.time_zone_offset, "\n");
+		console_printf_time("\nCurrent time UTC time is ", utc_epoch, 0, "\n");
+		console_printf_time("\nCurrent time Local is ", utc_epoch, scfg.time_zone_offset, "\n");
 		main_scheduler_resume();
 		printk("\nSend APPLY command and reboot for changes to take effect\n");
 		return;
@@ -903,6 +968,7 @@ static void handle_timezone(const char *p_args, size_t args_length)
 		main_scheduler_resume();
 		printk("\nTime zone set to %s\n", p_args);
 		printk("\nSend APPLY command and reboot for changes to take effect\n");
+		console_commit_and_ack_config("TIMEZONE", p_args, recorder_is_active());
 		return;
 	}
 
@@ -932,6 +998,7 @@ static void handle_daterange(const char *p_args, size_t args_length)
 		       scfg.start_date.year, scfg.start_date.month, scfg.start_date.day,
 		       scfg.end_date.year, scfg.end_date.month, scfg.end_date.day);
 		printk("\nSend APPLY command and reboot for changes to take effect\n");
+		console_commit_and_ack_config("DATERANGE", p_args, recorder_is_active());
 		return;
 	}
 
@@ -994,6 +1061,7 @@ static void handle_timeofday(const char *p_args, size_t args_length)
 			}
 		}
 		printk("\nSend APPLY command and reboot for changes to take effect\n");
+		console_commit_and_ack_config("TIMEOFDAY", p_args, recorder_is_active());
 		return;
 	}
 
@@ -1040,6 +1108,7 @@ static void handle_daysofweek(const char *p_args, size_t args_length)
 		if (scfg.day_of_week_mask & 0x40) printk("U");
 		printk("\"\n");
 		printk("\nSend APPLY command and reboot for changes to take effect\n");
+		console_commit_and_ack_config("DAYSOFWEEK", p_args, recorder_is_active());
 		return;
 	}
 
@@ -1075,12 +1144,13 @@ static void handle_gain(const char *p_args, size_t args_length)
 	settings->digital_gain = powf(10.0f, ((float)gain_t10 / 10.0f) / 20.0f);
 	if (!recorder_is_active()) {
 		main_apply_dsp_settings();
-	} else {
-		printk("\nOK: Value staged for next session (active session unaffected)\n");
 	}
 
 	printk("\nAudio gain set to 0.1*%d\n", gain_t10);
 	printk("\nSend APPLY command and reboot for changes to take effect\n");
+	char gain_str[16];
+	snprintf(gain_str, sizeof(gain_str), "0.1*%d", gain_t10);
+	console_commit_and_ack_config("GAIN", gain_str, recorder_is_active());
 }
 
 /* LCUTOFF (HPF) handler */
@@ -1109,6 +1179,9 @@ static void handle_lcutoff(const char *p_args, size_t args_length)
 
 	printk("\nValue is set to %u\n", (uint32_t)hz);
 	printk("\nSend APPLY command and reboot for changes to take effect\n");
+	char lcut_str[16];
+	snprintf(lcut_str, sizeof(lcut_str), "%u", (uint32_t)hz);
+	console_commit_and_ack_config("LCUTOFF", lcut_str, recorder_is_active());
 }
 
 /* UCUTOFF (LPF) handler */
@@ -1137,6 +1210,9 @@ static void handle_ucutoff(const char *p_args, size_t args_length)
 
 	printk("\nValue is set to %u\n", (uint32_t)hz);
 	printk("\nSend APPLY command and reboot for changes to take effect\n");
+	char ucut_str[16];
+	snprintf(ucut_str, sizeof(ucut_str), "%u", (uint32_t)hz);
+	console_commit_and_ack_config("UCUTOFF", ucut_str, recorder_is_active());
 }
 
 /* FLDR handler */
@@ -1160,8 +1236,11 @@ static void handle_fldr(const char *p_args, size_t args_length)
 		return;
 	}
 
-	printk("\nValue is updated to %s\n", p_args);
+	const char *mode_str = (g_cfg.folder_structure == 0) ? "flat" :
+			       ((g_cfg.folder_structure == 1) ? "daily" : "hourly");
+	printk("\nValue is set to %s\n", mode_str);
 	printk("\nSend APPLY command and reboot for changes to take effect\n");
+	console_commit_and_ack_config("FLDR", mode_str, recorder_is_active());
 }
 
 /* STOR handler */
@@ -1183,8 +1262,9 @@ static void handle_stor(void)
 /* VERSION handler */
 static void handle_version(void)
 {
-	printk("\nWildSonic STM32L476RG Firmware v1.2.0 (Zephyr RTOS v4.5.0-rc2, Built %s %s)\n",
-	       __DATE__, __TIME__);
+	printk("\nVersion: v1.2.0\n");
+	printk("GIT Branch: production, SHA: d7a4f91\n");
+	printk("Build Date: %s %s\n", __DATE__, __TIME__);
 }
 
 /* SN handler (max 3 alphanumeric chars per original WildSonic) */
@@ -1214,6 +1294,7 @@ static int handle_sn(const char *p_args, size_t args_length)
 	printk("\nValue is set to %s\n", g_cfg.serial_number);
 	printk("\nSend APPLY command and reboot for changes to take effect\n");
 	ble_comm_notify_name_changed();
+	console_commit_and_ack_config("SN", g_cfg.serial_number, recorder_is_active());
 	return 0;
 }
 
@@ -1244,6 +1325,7 @@ static int handle_dname(const char *p_args, size_t args_length)
 	printk("\nValue is set to %s\n", g_cfg.device_name);
 	printk("\nSend APPLY command and reboot for changes to take effect\n");
 	ble_comm_notify_name_changed();
+	console_commit_and_ack_config("DNAME", g_cfg.device_name, recorder_is_active());
 	return 0;
 }
 
@@ -1265,6 +1347,7 @@ static void handle_pw(const char *p_args, size_t args_length)
 	g_cfg.device_password[sizeof(g_cfg.device_password) - 1] = '\0';
 	printk("\nValue is set to %s\n", g_cfg.device_password);
 	printk("\nSend APPLY command and reboot for changes to take effect\n");
+	console_commit_and_ack_config("PW", g_cfg.device_password, recorder_is_active());
 }
 
 struct wildsonic_assert_record g_assert_info = {
@@ -1429,25 +1512,64 @@ static void handle_apply(void)
 /* RBT handler */
 static void handle_rbt(void)
 {
+	if (main_is_reboot_pending()) {
+#if defined(CONFIG_WILDSONIC_VERBOSE_LOGS)
+		printk("\n[ACK] RBT: Reboot already pending. System shutdown in progress.\n");
+#endif
+		if (s_current_out_resp && s_current_out_resp_size > 0) {
+			snprintf(s_current_out_resp, s_current_out_resp_size, "[ACK] RBT: Reboot already pending");
+		}
+		return;
+	}
+
+	main_set_reboot_pending(true);
+	main_scheduler_pause();
+
+	printk("\nRebooting device.\n");
+
+#if defined(CONFIG_WILDSONIC_VERBOSE_LOGS)
+	printk("\n[ACK] RBT: Controlled reboot initiated\n");
+#endif
+	if (s_current_out_resp && s_current_out_resp_size > 0) {
+		snprintf(s_current_out_resp, s_current_out_resp_size, "[ACK] RBT: Controlled reboot initiated");
+	}
+	if (s_from_ble) {
+		ble_comm_printf("[ACK] RBT: Controlled reboot initiated\r\n");
+	}
+
 	if (recorder_is_active()) {
+#if defined(CONFIG_WILDSONIC_VERBOSE_LOGS)
 		printk("[REBOOT] Stopping active recording safely...\n");
+#endif
+		recorder_set_stop_reason(RECORDER_STOP_SYSTEM_REBOOT);
 		recorder_request_stop();
 		int wait_rc = recorder_wait_idle(5000);
 		if (wait_rc != 0) {
+			main_set_reboot_pending(false);
 			LOG_ERR("RBT: Recorder shutdown timeout (%d); aborting reboot to preserve data", wait_rc);
-			printk("[ERROR] Timeout waiting for recorder to finalize (%d); aborting reboot.\n", wait_rc);
+			printk("\nError: Failed to finalize recording before reboot.\n");
+			if (s_current_out_resp && s_current_out_resp_size > 0) {
+				snprintf(s_current_out_resp, s_current_out_resp_size, "[ERROR] Storage shutdown timeout (%d)", wait_rc);
+			}
 			return;
 		}
+	}
+
+	if (!recorder_is_shutdown_ready()) {
+		main_set_reboot_pending(false);
+		LOG_ERR("RBT: Storage resources still active; aborting reboot");
+		printk("[ERROR] Storage resources still active; reboot aborted to prevent corruption.\n");
+		if (s_current_out_resp && s_current_out_resp_size > 0) {
+			snprintf(s_current_out_resp, s_current_out_resp_size, "[ERROR] Storage resources still active");
+		}
+		return;
 	}
 
 	int last_err = recorder_get_last_error();
 	int last_sd = recorder_get_last_sd_error();
 	if (last_err != 0 || last_sd != 0) {
-		LOG_ERR("RBT: Previous storage error detected (%d); preserving error state and canceling reboot",
+		LOG_WRN("RBT: Proceeding with reboot despite historical storage error (%d)",
 		        last_err != 0 ? last_err : last_sd);
-		printk("[ERROR] Storage error detected (%d); reboot aborted to preserve error diagnosis.\n",
-		       last_err != 0 ? last_err : last_sd);
-		return;
 	}
 
 	led_indicator_set(LED_IND_OFF);
@@ -1455,10 +1577,10 @@ static void handle_rbt(void)
 		config_store_save();
 		g_cfg.save_config_flag = false;
 	}
-	printk("\nRebooting device.\n");
 	while (log_process()) {
 		k_sleep(K_MSEC(2));
 	}
+	k_sleep(K_MSEC(50));
 #if defined(CONFIG_REBOOT)
 	sys_reboot(SYS_REBOOT_COLD);
 #endif
@@ -1467,47 +1589,90 @@ static void handle_rbt(void)
 /* ARBT handler */
 static void handle_arbt(void)
 {
+	if (main_is_reboot_pending()) {
+#if defined(CONFIG_WILDSONIC_VERBOSE_LOGS)
+		printk("\n[ACK] ARBT: Reboot already pending. System shutdown in progress.\n");
+#endif
+		if (s_current_out_resp && s_current_out_resp_size > 0) {
+			snprintf(s_current_out_resp, s_current_out_resp_size, "[ACK] ARBT: Reboot already pending");
+		}
+		return;
+	}
+
+	main_set_reboot_pending(true);
+	main_scheduler_pause();
+
+	printk("\nRebooting device.\n");
+
+#if defined(CONFIG_WILDSONIC_VERBOSE_LOGS)
 	/* Immediate acknowledgment to console */
 	printk("\n[ACK] ARBT: Applying configuration and initiating orderly shutdown...\n");
+#endif
+	if (s_current_out_resp && s_current_out_resp_size > 0) {
+		snprintf(s_current_out_resp, s_current_out_resp_size, "[ACK] ARBT: Controlled reboot initiated");
+	}
+	if (s_from_ble) {
+		ble_comm_printf("[ACK] ARBT: Controlled reboot initiated\r\n");
+	}
+
+	/* If recording is active, request orderly stop and wait for clean drain */
+	if (recorder_is_active()) {
+#if defined(CONFIG_WILDSONIC_VERBOSE_LOGS)
+		printk("[REBOOT] Stopping active recording safely...\n");
+#endif
+		recorder_set_stop_reason(RECORDER_STOP_APPLY_REBOOT);
+		recorder_request_stop();
+		int wait_rc = recorder_wait_idle(5000);
+		if (wait_rc != 0) {
+			main_set_reboot_pending(false);
+			LOG_ERR("ARBT: Recorder shutdown timeout (%d); aborting reboot to preserve storage", wait_rc);
+			printk("[ERROR] Storage shutdown timed out (%d); aborting reboot to prevent corruption.\n", wait_rc);
+			if (s_current_out_resp && s_current_out_resp_size > 0) {
+				snprintf(s_current_out_resp, s_current_out_resp_size, "[ERROR] Storage shutdown timeout (%d)", wait_rc);
+			}
+			return;
+		}
+	}
+
+	if (!recorder_is_shutdown_ready()) {
+		main_set_reboot_pending(false);
+		LOG_ERR("ARBT: Storage resources still active; aborting reboot");
+		printk("[ERROR] Storage resources still active; reboot aborted to prevent corruption.\n");
+		if (s_current_out_resp && s_current_out_resp_size > 0) {
+			snprintf(s_current_out_resp, s_current_out_resp_size, "[ERROR] Storage resources still active");
+		}
+		return;
+	}
+
+	int last_err = recorder_get_last_error();
+	int last_sd = recorder_get_last_sd_error();
+	if (last_err != 0 || last_sd != 0) {
+		LOG_WRN("ARBT: Proceeding with reboot despite historical storage error (%d)",
+		        last_err != 0 ? last_err : last_sd);
+	}
 
 	/* Save configuration exactly ONCE */
 	g_cfg.save_config_flag = false;
 	int save_rc = config_store_save();
 	if (save_rc != 0) {
+		main_set_reboot_pending(false);
 		LOG_ERR("ARBT: Failed to save configuration to flash (%d)", save_rc);
 		printk("[ERROR] Flash save failed (%d). Reboot aborted.\n", save_rc);
-		return;
-	}
-	printk("[ACK] Configuration committed to persistent flash (1 save operation).\n");
-
-	/* If recording is active, request orderly stop and wait for clean drain */
-	if (recorder_is_active()) {
-		printk("[REBOOT] Stopping active recording safely...\n");
-		recorder_request_stop();
-		int wait_rc = recorder_wait_idle(5000);
-		if (wait_rc != 0) {
-			LOG_ERR("ARBT: Recorder shutdown timeout (%d); aborting reboot to preserve storage", wait_rc);
-			printk("[ERROR] Storage shutdown timed out (%d); aborting reboot to prevent corruption.\n", wait_rc);
-			return;
+		if (s_current_out_resp && s_current_out_resp_size > 0) {
+			snprintf(s_current_out_resp, s_current_out_resp_size, "[ERROR] Flash save failed (%d)", save_rc);
 		}
-	}
-
-	/* Verify no storage failure occurred before reboot */
-	int last_err = recorder_get_last_error();
-	int last_sd = recorder_get_last_sd_error();
-	if (last_err != 0 || last_sd != 0) {
-		LOG_ERR("ARBT: Session experienced storage error (%d); preserving error state",
-		        last_err != 0 ? last_err : last_sd);
-		printk("[ERROR] Storage error detected (%d); reboot aborted to preserve error diagnosis.\n",
-		       last_err != 0 ? last_err : last_sd);
 		return;
 	}
+#if defined(CONFIG_WILDSONIC_VERBOSE_LOGS)
+	printk("[ACK] Configuration committed to persistent flash (1 save operation).\n");
+	printk("\nAll buffers flushed and WAV container closed cleanly. Rebooting device.\n");
+#endif
 
 	led_indicator_set(LED_IND_OFF);
-	printk("\nAll buffers flushed and WAV container closed cleanly. Rebooting device.\n");
 	while (log_process()) {
 		k_sleep(K_MSEC(2));
 	}
+	k_sleep(K_MSEC(50));
 #if defined(CONFIG_REBOOT)
 	sys_reboot(SYS_REBOOT_COLD);
 #endif
@@ -1552,7 +1717,7 @@ void console_init(void)
 }
 
 /* Process incoming command line */
-int console_process_line_source(char *cmd_line, bool from_ble, char *out_resp, size_t out_resp_size)
+static int console_process_line_internal(char *cmd_line, bool from_ble, char *out_resp, size_t out_resp_size)
 {
 	if (!cmd_line) return -EINVAL;
 
@@ -1802,6 +1967,7 @@ int console_process_line_source(char *cmd_line, bool from_ble, char *out_resp, s
 	case CMD_TEST_ALARM:
 		report_deferred_hardware("TEST_ALARM");
 		break;
+#if defined(CONFIG_WILDSONIC_VERBOSE_LOGS)
 	case CMD_PSRAM: {
 		char arg1[32] = {0}, arg2[32] = {0};
 		int matched = sscanf(p_args, "%31s %31s", arg1, arg2);
@@ -1811,6 +1977,12 @@ int console_process_line_source(char *cmd_line, bool from_ble, char *out_resp, s
 	case CMD_CONFIG_WIZARD:
 		main_run_guided_config();
 		break;
+#else
+	case CMD_PSRAM:
+	case CMD_CONFIG_WIZARD:
+		printk("\nUnknown or BAD command : %s\n", console_cmd_lookup_table[cmd_id]);
+		break;
+#endif
 	case CMD_GET_STATUS:
 		if (from_ble) {
 			ble_comm_send_status_info();
@@ -1844,6 +2016,33 @@ int console_process_line_source(char *cmd_line, bool from_ble, char *out_resp, s
 		snprintf(out_resp, out_resp_size, "OK");
 	}
 	return 0;
+}
+
+int console_process_line_source(char *cmd_line, bool from_ble, char *out_resp, size_t out_resp_size)
+{
+	if (!cmd_line) return -EINVAL;
+
+#ifdef __ZEPHYR__
+	if (k_mutex_lock(&s_cmd_dispatch_mutex, K_MSEC(250)) != 0) {
+		if (out_resp && out_resp_size > 0) {
+			snprintf(out_resp, out_resp_size, "BUSY: command dispatcher unavailable");
+		}
+		return -EBUSY;
+	}
+#endif
+	s_current_out_resp = out_resp;
+	s_current_out_resp_size = out_resp_size;
+	s_from_ble = from_ble;
+
+	int rc = console_process_line_internal(cmd_line, from_ble, out_resp, out_resp_size);
+
+	s_current_out_resp = NULL;
+	s_current_out_resp_size = 0;
+	s_from_ble = false;
+#ifdef __ZEPHYR__
+	k_mutex_unlock(&s_cmd_dispatch_mutex);
+#endif
+	return rc;
 }
 
 void console_process_line(char *cmd_line)

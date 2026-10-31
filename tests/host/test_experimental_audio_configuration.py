@@ -365,17 +365,17 @@ def test_high_rate_experimental_accounting_matrix():
         assert calc_bytes == exp_bytes
 
 
-def test_pipeline_failure_preservation_and_skip_wav_finalization():
-    """Verify that on PSRAM full (-ENOBUFS) or SD write failure, recording aborts cleanly and skips WAV finalization."""
+def test_pipeline_failure_preservation_and_partial_wav_finalization():
+    """Verify failed capture preserves its error and attempts a valid partial WAV finalization."""
     src_rec = (APP_SRC / "recorder.c").read_text(encoding="utf-8")
 
     # Error handling and abort
     assert "err = -ENOBUFS;" in src_rec
-    assert "LOG_WRN(\"PSRAM staging buffer full!" in src_rec
+    assert "PSRAM staging buffer full!" in src_rec
 
-    # Must skip WAV finalization if error occurred
-    assert "if (err == 0 && sd_writer_err == 0)" in src_rec
-    assert "LOG_WRN(\"Skipping WAV header finalization due to previous storage error (%d)\"" in src_rec
+    # The file is finalized from confirmed bytes after writer completion.
+    assert "Finalize a valid partial WAV using" in src_rec
+    assert "finalize_ret = fs_seek(&f, 0, FS_SEEK_SET);" in src_rec
 
     # File verification must be skipped if error occurred
     assert "if (err == 0 && !recorder_abort_requested && st.bytes_written > 0)" in src_rec

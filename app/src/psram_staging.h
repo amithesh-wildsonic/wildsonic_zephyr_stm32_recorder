@@ -39,7 +39,7 @@ struct psram_batch_buf_info {
 	uint32_t batch_id;
 };
 
-#define PSRAM_MAX_BATCH_BUFFERS 4U
+#define PSRAM_MAX_BATCH_BUFFERS 32U
 
 struct psram_staging_stats {
 	bool active;
@@ -91,7 +91,8 @@ void psram_staging_set_active(bool active);
  * @param src Pointer to processed audio block in internal SRAM.
  * @param bytes Number of PCM bytes in block.
  * @param samples Number of audio samples in block.
- * @return 0 on success, -ENOBUFS if buffer full, negative errno on hardware error.
+ * @return 0 on success, -EBUSY for a transient in-flight transfer, -ENOBUFS
+ *         when capacity is exhausted, or another negative errno on hardware error.
  */
 int psram_staging_push(const void *src, uint32_t bytes, uint32_t samples);
 
@@ -180,6 +181,14 @@ int psram_staging_get_batch_info(uint32_t buffer_idx, struct psram_batch_buf_inf
  * @return 0 on success, or 1 if no partially filled buffer needed publishing.
  */
 int psram_staging_flush_publish(void);
+
+/**
+ * @brief Wait for at least one batch buffer to become free.
+ *
+ * @param timeout_ms Maximum time to wait in milliseconds.
+ * @return 0 on success (buffer became free), -ETIMEDOUT on timeout.
+ */
+int psram_staging_wait_free(uint32_t timeout_ms);
 
 #ifdef __cplusplus
 }

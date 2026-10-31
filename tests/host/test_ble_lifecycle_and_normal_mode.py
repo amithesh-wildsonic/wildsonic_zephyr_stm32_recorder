@@ -250,12 +250,12 @@ def test_correct_ws0_transparent_mode_configuration():
 
 
 def test_slpm1_light_sleep_persistence():
-    """Verify Mode 1 sleep is configured and query is supported."""
+    """Verify Mode 1 sleep persistence remains valid without forcing a legacy AT+SLPM=1 probe path."""
     c_src = BLE_COMM_C.read_text(encoding="utf-8")
-    assert 'AT+SLPM=1\\r\\n' in c_src
-    assert 'OK+Set:1' in c_src
+    assert 's_current_slpm = 1;' in c_src
     assert 'AT+SLPM=2' not in c_src
     assert 'AT+SLPM=3' not in c_src
+    assert 'AT+SLPM=1\\r\\n' not in c_src
 
 
 def test_at_sleep_final_provisioning_transaction_and_ok_sleep_handling():
@@ -426,14 +426,103 @@ def test_missing_and_delayed_acks_handling():
 
 
 def test_uart_rx_overflow_and_tx_capture_saturation_resilience():
-    """Verify oversized RX lines are dropped safely without memory corruption."""
+    """Verify oversized RX lines are dropped safely, once per malformed line, without memory corruption."""
     c_src = BLE_COMM_C.read_text(encoding="utf-8")
     handle_pos = c_src.find("static void ble_comm_handle_rx_byte(")
     handle_fn = c_src[handle_pos:c_src.find("static void ble_lock_work_fn", handle_pos)]
 
-    assert "s_ble_overflow = true;" in handle_fn
-    assert "s_ble_overflow = false;" in handle_fn
+    assert "s_ble_discard_until_terminator = true;" in handle_fn
+    assert "s_ble_discard_until_terminator = false;" in handle_fn
+    assert "s_ble_overflow_line_count++;" in handle_fn
+    assert "s_ble_rx_drop_count++;" in c_src
     assert "s_ble_cmd_len = 0;" in handle_fn
+    assert "ring_buf_put(&s_ble_rx_rb, &rx_byte, 1) == 0" in c_src
+
+
+def test_ble_line_parser_behaviour_contract():
+    """Verify malformed oversized lines are discarded exactly once until a terminator, without dispatching partial commands."""
+    max_len = 127
+    accepted = []
+    overflow_events = 0
+    discard = False
+    last_was_cr = False
+    line = ""
+
+    def feed(data: str):
+        nonlocal accepted, overflow_events, discard, last_was_cr, line
+        for ch in data:
+            if discard:
+                if ch == '\r' or ch == '\n':
+                    if ch == '\r':
+                        last_was_cr = True
+                    else:
+                        last_was_cr = False
+                    discard = False
+                    line = ""
+                continue
+
+            if ch == '\r':
+                if last_was_cr:
+                    last_was_cr = False
+                    continue
+                if line:
+                    accepted.append(line)
+                    line = ""
+                last_was_cr = True
+                continue
+
+            if ch == '\n':
+                if last_was_cr:
+                    last_was_cr = False
+                    continue
+                if line:
+                    accepted.append(line)
+                    line = ""
+                continue
+
+            last_was_cr = False
+            if len(line) >= max_len:
+                discard = True
+                overflow_events += 1
+                line = ""
+                continue
+            line += ch
+
+    # Normal short command is accepted.
+    feed("GET_STATUS_INFO\r\n")
+    assert accepted == ["GET_STATUS_INFO"]
+
+    # A line that hits max length is treated as malformed and discarded once.
+    feed("A" * (max_len + 1) + "\r")
+    assert overflow_events == 1
+    assert accepted == ["GET_STATUS_INFO"]
+
+    # A line with excess bytes before termination increments once and discards the rest.
+    feed("A" * (max_len + 5) + "\n")
+    assert overflow_events == 2
+    assert accepted == ["GET_STATUS_INFO"]
+
+    # A valid command can still arrive after an overflow line.
+    feed("Z" * 10 + "\r\n")
+    assert accepted == ["GET_STATUS_INFO", "Z" * 10]
+
+    # Empty lines and CRLF normalization should not produce bogus commands.
+    feed("\r\n\n")
+    assert accepted == ["GET_STATUS_INFO", "Z" * 10]
+
+    # The parser should not dispatch partial command fragments.
+    feed("SHORT\nLONG\r\n")
+    assert accepted[-2:] == ["SHORT", "LONG"]
+
+    # CRLF followed by a clean line after an oversized frame should not cause duplication.
+    feed("A" * (max_len + 1) + "\r\nDIRTY\r\n")
+    assert overflow_events == 3
+    assert accepted[-1] == "DIRTY"
+
+    # A sequence of malformed lines should produce exactly one warning each.
+    feed("OK\r\n" + ("A" * (max_len + 1)) + "\nVALID\r\n")
+    assert accepted[-2:] == ["OK", "VALID"]
+    assert overflow_events >= 4
 
 
 def test_reconnect_after_disconnect_without_stm32_reboot():

@@ -112,6 +112,16 @@ void console_async_suspend(void);
  */
 void console_async_resume(void);
 
+/**
+ * @brief Get total number of console UART RX bytes dropped due to ring buffer overflow.
+ */
+uint32_t console_get_rx_drop_count(void);
+
+/**
+ * @brief Reset console UART RX overflow counter.
+ */
+void console_reset_rx_drop_count(void);
+
 struct wildsonic_assert_record {
 	bool asserted;
 	const char *file;

@@ -4,7 +4,11 @@
 #include <zephyr/logging/log.h>
 #include <errno.h>
 
-LOG_MODULE_REGISTER(sched_ret, CONFIG_LOG_DEFAULT_LEVEL);
+#if defined(CONFIG_WILDSONIC_VERBOSE_LOGS)
+LOG_MODULE_REGISTER(sched_ret, LOG_LEVEL_INF);
+#else
+LOG_MODULE_REGISTER(sched_ret, LOG_LEVEL_WRN);
+#endif
 
 #if defined(CONFIG_SOC_SERIES_STM32L4X)
 #include <stm32l4xx_ll_pwr.h>
@@ -114,9 +118,6 @@ int scheduler_retention_save(time_t end_utc)
 	bkp_write(REG_TS_LOW, low);
 	bkp_write(REG_TS_HIGH, high);
 	bkp_write(REG_CKSUM, cksum);
-
-	LOG_INF("Retained session end UTC: %lld (low=0x%08X, high=0x%08X, cksum=0x%08X)",
-	        (long long)end_utc, low, high, cksum);
 	return 0;
 }
 
@@ -186,7 +187,6 @@ int ble_retention_save_fingerprint(uint32_t fingerprint)
 	bkp_write(REG_BLE_FP, fingerprint);
 	bkp_write(REG_BLE_CKSUM, cksum);
 
-	LOG_INF("Retained BLE provisioning fingerprint: 0x%08X (cksum=0x%08X)", fingerprint, cksum);
 	return 0;
 }
 

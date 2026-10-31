@@ -32,6 +32,7 @@
 #include "psram_staging.h"
 #include "recorder.h"
 #include "rtc_calendar.h"
+#include "rtc_sleep.h"
 #include "scheduler.h"
 #include "main.h"
 #include "console.h"
@@ -45,7 +46,11 @@
 #include "psram_benchmark.h"
 #endif
 
+#if defined(CONFIG_WILDSONIC_VERBOSE_LOGS)
 LOG_MODULE_REGISTER(main, LOG_LEVEL_INF);
+#else
+LOG_MODULE_REGISTER(main, LOG_LEVEL_WRN);
+#endif
 
 #define SAMPLE_BYTES (CONFIG_AUDIO_SAMPLE_BITS / 8)
 #define CONSOLE_LINE_MAX 128
@@ -235,7 +240,7 @@ static const char *mode_to_string(enum recorder_mode m) {
 
 uint32_t g_boot_csr = 0;
 
-static void print_reset_reason(void) {
+static void __maybe_unused print_reset_reason(void) {
   uint32_t csr = g_boot_csr ? g_boot_csr : RCC->CSR;
   printk("  MCU Reset Reason  : [0x%08X] ", (unsigned int)csr);
   bool known = false;
@@ -289,7 +294,6 @@ static void print_banner(void) {
   printk("Version: %s\n", "v1.2.0");
   printk("GIT Branch: %s, SHA: %s\n", "production", "d7a4f91");
   printk("Build Date: %s %s\n", __DATE__, __TIME__);
-  print_reset_reason();
 #endif
 }
 
@@ -1233,8 +1237,17 @@ static void run_scheduled_recording(void) {
     last_end_time_local = interval.start_time_utc + scfg.time_zone_offset + interval.duration_seconds;
 
     if (ret != 0 || st.err != 0) {
-      printk("\n[Schedule session %u failed (error %d). Halting schedule.]\n",
-             cycle, (ret != 0) ? ret : st.err);
+      int failure = (ret != 0) ? ret : st.err;
+      last_end_time_local = interval.start_time_utc + scfg.time_zone_offset + interval.duration_seconds;
+      bool storage_recovery_ok = recorder_get_last_sd_error() == 0 ||
+                                 recorder_get_storage_recovery_result() == 0;
+      if ((failure == -EIO || failure == -ETIMEDOUT || failure == -ENOBUFS || failure == -EBUSY) &&
+          storage_recovery_ok && !recorder_is_active()) {
+        printk("\n[Schedule session %u failed (%d); skipping this opportunity and continuing.]\n",
+               cycle, failure);
+        continue;
+      }
+      printk("\n[Schedule session %u failed with non-recoverable error %d.]\n", cycle, failure);
       break;
     }
 
@@ -1262,6 +1275,7 @@ static void run_scheduled_recording(void) {
  * ============================================================================== */
 
 static bool s_schedule_paused = false;
+static volatile bool s_reboot_pending = false;
 static uint32_t s_schedule_cycle = 1;
 static time_t s_last_end_time_local = 0;
 static time_t s_last_evaluated_window_utc = 0;
@@ -1269,6 +1283,9 @@ static bool s_rtc_uninit_logged = false;
 static bool s_no_window_logged = false;
 
 void main_scheduler_resume(void) {
+  if (main_is_reboot_pending()) {
+    return;
+  }
   if (s_schedule_paused) {
     s_schedule_paused = false;
     s_last_evaluated_window_utc = 0;
@@ -1282,7 +1299,9 @@ void main_scheduler_resume(void) {
 void main_scheduler_pause(void) {
   if (!s_schedule_paused) {
     s_schedule_paused = true;
-    printk("[SCHEDULER] Scheduled recording paused.\n");
+    if (!main_is_reboot_pending()) {
+      printk("[SCHEDULER] Scheduled recording paused.\n");
+    }
   }
 }
 
@@ -1350,13 +1369,27 @@ static void recorder_thread_fn(void *p1, void *p2, void *p3) {
 #endif
 
       if (recorder_is_abort_requested()) {
-        printk("[SCHEDULER] Recording aborted by user stop request.\n");
-        printk("[SCHEDULER] Scheduled recording paused. Enter commands or press Enter to resume.\n\n> ");
+        if (!main_is_reboot_pending() && recorder_get_stop_reason() == RECORDER_STOP_USER) {
+          printk("[SCHEDULER] Recording aborted by user stop request.\n");
+          printk("[SCHEDULER] Scheduled recording paused. Enter commands or press Enter to resume.\n\n> ");
+        }
         s_schedule_paused = true;
       } else if (s_rec_last_result != 0 || s_rec_last_stats.err != 0) {
-        printk("[SCHEDULER] Session %u encountered error (%d). Pausing schedule.\n\n> ",
-               s_rec_req.cycle, (s_rec_last_result != 0) ? s_rec_last_result : s_rec_last_stats.err);
-        s_schedule_paused = true;
+        int failure = (s_rec_last_result != 0) ? s_rec_last_result : s_rec_last_stats.err;
+        time_t failed_end_utc = s_rec_req.start_time_utc + s_rec_req.duration_sec;
+        s_last_end_time_local = failed_end_utc + s_rec_req.tz_offset;
+        s_last_evaluated_window_utc = 0;
+        /* Do not update scheduler_retention_save on failed sessions: preserve last successful end */
+
+        s_schedule_cycle++;
+        if (settings.cycles > 0 && s_schedule_cycle > settings.cycles) {
+          printk("\n[SCHEDULER] Configured target cycles (%u) completed.\n\n> ", settings.cycles);
+          s_schedule_paused = true;
+        } else {
+          printk("[SCHEDULER] Session %u failed (%d); recording opportunity skipped, schedule remains active for next window.\n\n> ",
+                 s_rec_req.cycle, failure);
+          s_schedule_paused = false;
+        }
       } else {
         time_t end_utc = s_rec_req.start_time_utc + s_rec_req.duration_sec;
         s_last_end_time_local = end_utc + s_rec_req.tz_offset;
@@ -1386,8 +1419,19 @@ bool main_is_scheduler_paused(void) {
   return s_schedule_paused;
 }
 
+bool main_is_reboot_pending(void) {
+  return s_reboot_pending;
+}
+
+void main_set_reboot_pending(bool pending) {
+  s_reboot_pending = pending;
+  if (pending) {
+    s_schedule_paused = true;
+  }
+}
+
 void main_scheduler_service_step(void) {
-  if (s_schedule_paused || s_rec_busy || recorder_is_active()) {
+  if (s_reboot_pending || s_schedule_paused || s_rec_busy || recorder_is_active()) {
     return;
   }
 
@@ -1766,6 +1810,29 @@ int main(void) {
   /* Clear the hardware reset flags only AFTER logging them */
   LL_RCC_ClearResetFlags();
 
+  /* Initialize RTC Wakeup Timer & Calendar */
+  int rtc_sleep_rc = rtc_sleep_init();
+  if (rtc_sleep_rc == 0) {
+    printk("\nRTC Wakeup Timer initialized\n");
+  } else {
+    LOG_ERR("RTC Wakeup Timer initialization failed: %d", rtc_sleep_rc);
+  }
+
+  int rtc_cal_rc = rtc_calendar_init();
+  if (rtc_cal_rc == 0) {
+    if (rtc_calendar_is_valid()) {
+      struct rtc_calendar_time cur;
+      if (rtc_calendar_get(&cur) == 0) {
+        printk("RTC calendar online: %04u-%02u-%02u %02u:%02u:%02u.%03u\n\n",
+               cur.year, cur.month, cur.day, cur.hour, cur.min, cur.sec, cur.subsec);
+      }
+    } else {
+      printk("RTC calendar is uninitialized. Set time with DATETIME command.\n\n");
+    }
+  } else {
+    LOG_ERR("RTC calendar initialization failed: %d", rtc_cal_rc);
+  }
+
 #ifdef CONFIG_PSRAM_TEST_ENABLE
   /* 1. Independent External PSRAM Bring-up & Multi-Pass Memory Test */
   struct psram_test_report psram_report;
@@ -1836,7 +1903,18 @@ int main(void) {
            ret);
     return ret;
   }
+
+  int rate_rc = audio_in_set_rate(settings.sample_rate);
+  if (rate_rc != 0) {
+    LOG_WRN("Configured sample rate %u could not be applied to hardware (%d), using %u",
+            settings.sample_rate, rate_rc, audio_in_rate());
+  }
+  settings.sample_rate = audio_in_rate();
+  apply_dsp_settings();
+
+  printk("Audio peripheral initialized\n");
   printk("SD card initialized successfully\n");
+  printk("\n");
 
   scheduler_init();
   scheduler_retention_init();
@@ -1849,8 +1927,10 @@ int main(void) {
     struct rtc_calendar_time cal;
     scheduler_epoch_to_calendar(retained_end_utc, &cal);
     rtc_calendar_format(&cal, buf, sizeof(buf));
+#if defined(CONFIG_WILDSONIC_VERBOSE_LOGS)
     printk("[SCHEDULER] Restored previous session end from RTC backup: %s UTC (timestamp=%lld)\n",
            buf, (long long)retained_end_utc);
+#endif
   } else {
     s_last_end_time_local = 0;
   }
@@ -1867,16 +1947,12 @@ int main(void) {
   config_store_init();
   config_store_import_sd();
 
-  int rate_rc = audio_in_set_rate(settings.sample_rate);
-  if (rate_rc != 0) {
-    LOG_WRN("Configured sample rate %u could not be applied to hardware (%d), using %u",
-            settings.sample_rate, rate_rc, audio_in_rate());
+  if (settings.sample_rate != audio_in_rate()) {
+    audio_in_set_rate(settings.sample_rate);
+    apply_dsp_settings();
   }
-  settings.sample_rate = audio_in_rate();
-  apply_dsp_settings();
 
-  printk("Audio peripheral initialized\n");
-
+#if defined(CONFIG_WILDSONIC_VERBOSE_LOGS)
   char last_folder[64] = {0};
   char last_file[48] = {0};
   if (recorder_scan_last_file(last_folder, sizeof(last_folder), last_file, sizeof(last_file)) == 0) {
@@ -1888,6 +1964,7 @@ int main(void) {
   } else {
     printk("No recording files detected on SD card\n");
   }
+#endif
 
   if (rtc_calendar_is_valid()) {
     struct rtc_calendar_time cur_cal;
@@ -1900,6 +1977,7 @@ int main(void) {
       int tz_h = abs_tz / 3600;
       int tz_m = (abs_tz % 3600) / 60;
 
+      printk("\n");
       printk("Current time UTC time is %04u-%02u-%02u %02u:%02u:%02u.000 +00:00\n",
              cur_cal.year, cur_cal.month, cur_cal.day,
              cur_cal.hour, cur_cal.min, cur_cal.sec);
@@ -1912,11 +1990,11 @@ int main(void) {
              loc_cal.hour, loc_cal.min, loc_cal.sec,
              tz_sign, tz_h, tz_m);
     }
-  } else {
-    printk("RTC calendar is uninitialized. Set time with DATETIME command.\n");
   }
 
+  printk("\n");
   printk("System initialization complete\n");
+  printk("\n");
 #if defined(CONFIG_WILDSONIC_VERBOSE_LOGS)
   print_settings();
 #endif
