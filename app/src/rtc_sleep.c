@@ -8,7 +8,11 @@
 #include <zephyr/logging/log.h>
 #include <zephyr/drivers/timer/system_timer.h>
 
+#if defined(CONFIG_WILDSONIC_VERBOSE_LOGS)
 LOG_MODULE_REGISTER(rtc_sleep, LOG_LEVEL_INF);
+#else
+LOG_MODULE_REGISTER(rtc_sleep, LOG_LEVEL_WRN);
+#endif
 
 #if defined(CONFIG_SOC_SERIES_STM32L4X)
 

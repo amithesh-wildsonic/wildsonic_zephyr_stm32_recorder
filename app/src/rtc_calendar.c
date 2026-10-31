@@ -15,7 +15,11 @@
 #include <stm32_ll_rcc.h>
 #include <stm32_ll_rtc.h>
 
+#if defined(CONFIG_WILDSONIC_VERBOSE_LOGS)
 LOG_MODULE_REGISTER(rtc_calendar, LOG_LEVEL_INF);
+#else
+LOG_MODULE_REGISTER(rtc_calendar, LOG_LEVEL_WRN);
+#endif
 
 #endif /* CONFIG_SOC_SERIES_STM32L4X */
 
@@ -66,6 +70,9 @@ int rtc_calendar_validate(const struct rtc_calendar_time *t)
 		return -EINVAL;
 	}
 	if (t->hour > 23 || t->min > 59 || t->sec > 59) {
+		return -EINVAL;
+	}
+	if (t->subsec > 999) {
 		return -EINVAL;
 	}
 	return 0;
@@ -119,6 +126,24 @@ int rtc_calendar_parse(const char *str, struct rtc_calendar_time *t)
 
 #if defined(CONFIG_SOC_SERIES_STM32L4X)
 
+static uint16_t rtc_calendar_extract_millis_from_rtc(void)
+{
+	uint32_t pred_s = RTC->PRER & 0x7FFFU;
+	if (pred_s == 0U) {
+		return 0U;
+	}
+	uint32_t ss = RTC->SSR & 0xFFFFU;
+	if (ss > pred_s) {
+		ss = pred_s;
+	}
+	uint64_t ms = (((uint64_t)pred_s - (uint64_t)ss) * 1000ULL + ((uint64_t)pred_s / 2ULL)) /
+	              ((uint64_t)pred_s + 1ULL);
+	if (ms > 999ULL) {
+		ms = 999ULL;
+	}
+	return (uint16_t)ms;
+}
+
 int rtc_calendar_get(struct rtc_calendar_time *t)
 {
 	if (!t) {
@@ -133,11 +158,7 @@ int rtc_calendar_get(struct rtc_calendar_time *t)
 		return init_rc;
 	}
 
-	/*
-	 * In STM32L4, RTC_ISR_INITS flag indicates if calendar registers
-	 * have been written at least once. If INITS == 0, time has never been configured.
-	 */
-	if (!LL_RTC_IsActiveFlag_INITS(RTC)) {
+	if (!LL_RCC_IsEnabledRTC() || !LL_RTC_IsActiveFlag_INITS(RTC)) {
 		t->valid = false;
 		return -ENODATA;
 	}
@@ -153,6 +174,7 @@ int rtc_calendar_get(struct rtc_calendar_time *t)
 	t->hour  = __LL_RTC_CONVERT_BCD2BIN(__LL_RTC_GET_HOUR(tr));
 	t->min   = __LL_RTC_CONVERT_BCD2BIN(__LL_RTC_GET_MINUTE(tr));
 	t->sec   = __LL_RTC_CONVERT_BCD2BIN(__LL_RTC_GET_SECOND(tr));
+	t->subsec = rtc_calendar_extract_millis_from_rtc();
 
 	t->year  = 2000 + __LL_RTC_CONVERT_BCD2BIN(__LL_RTC_GET_YEAR(dr));
 	t->month = __LL_RTC_CONVERT_BCD2BIN(__LL_RTC_GET_MONTH(dr));
@@ -257,19 +279,27 @@ int rtc_calendar_set(const struct rtc_calendar_time *t)
 	return 0;
 }
 
+static bool s_calendar_initialized = false;
+
 int rtc_calendar_init(void)
 {
+	if (s_calendar_initialized) {
+		return 0;
+	}
 	int rc = rtc_sleep_init();
 	if (rc != 0) {
 		LOG_ERR("rtc_calendar_init failed: rtc_sleep_init returned %d", rc);
 		return rc;
 	}
+	s_calendar_initialized = true;
 	LL_PWR_EnableBkUpAccess();
-	if (LL_RTC_IsActiveFlag_INITS(RTC)) {
+	if (LL_RCC_IsEnabledRTC() && LL_RTC_IsActiveFlag_INITS(RTC)) {
 		struct rtc_calendar_time cur;
-		if (rtc_calendar_get(&cur) == 0) {
-			LOG_INF("RTC calendar online: %04u-%02u-%02u %02u:%02u:%02u",
-			        cur.year, cur.month, cur.day, cur.hour, cur.min, cur.sec);
+		if (rtc_calendar_get(&cur) == 0 && rtc_calendar_validate(&cur) == 0) {
+			LOG_INF("RTC calendar online: %04u-%02u-%02u %02u:%02u:%02u.%03u",
+			        cur.year, cur.month, cur.day, cur.hour, cur.min, cur.sec, cur.subsec);
+		} else {
+			LOG_WRN("RTC calendar INITS set but the field validation failed; calendar treated as invalid");
 		}
 	} else {
 		LOG_INF("RTC calendar online: uninitialized / unset");
@@ -282,7 +312,14 @@ bool rtc_calendar_is_valid(void)
 	if (rtc_sleep_init() != 0) {
 		return false;
 	}
-	return (LL_RTC_IsActiveFlag_INITS(RTC) != 0);
+	if (!LL_RCC_IsEnabledRTC() || !LL_RTC_IsActiveFlag_INITS(RTC)) {
+		return false;
+	}
+	struct rtc_calendar_time cal;
+	if (rtc_calendar_get(&cal) != 0) {
+		return false;
+	}
+	return (rtc_calendar_validate(&cal) == 0);
 }
 
 #else /* !CONFIG_SOC_SERIES_STM32L4X */
@@ -328,10 +365,14 @@ int rtc_calendar_generate_filename(char *name, size_t len, const struct rtc_cale
 	if (!name || !t || len < 32) {
 		return -EINVAL;
 	}
+	if (rtc_calendar_validate(t) != 0) {
+		return -EINVAL;
+	}
 
-	for (unsigned int n = 1; n < 100; n++) {
-		snprintf(name, len, "/SD:/WS_%04u%02u%02u_%02u%02u%02u_%02u.WAV",
-		         t->year, t->month, t->day, t->hour, t->min, t->sec, n);
+	for (unsigned int step = 0; step < 1000; step++) {
+		uint16_t candidate_ms = (uint16_t)((t->subsec + step) % 1000U);
+		snprintf(name, len, "/SD:/%04u%02u%02u_%02u%02u%02u_%03u.wav",
+		         t->year, t->month, t->day, t->hour, t->min, t->sec, candidate_ms);
 
 #if defined(CONFIG_FILE_SYSTEM)
 		struct fs_dirent ent;

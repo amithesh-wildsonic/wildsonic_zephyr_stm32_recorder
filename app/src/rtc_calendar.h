@@ -20,6 +20,7 @@ struct rtc_calendar_time {
 	uint8_t hour;    /* 0 .. 23 */
 	uint8_t min;     /* 0 .. 59 */
 	uint8_t sec;     /* 0 .. 59 */
+	uint16_t subsec; /* 0 .. 999; RTC subsecond milliseconds, when available */
 	bool valid;      /* true if calendar has been initialized/set */
 };
 
@@ -97,9 +98,10 @@ int rtc_calendar_format(const struct rtc_calendar_time *t, char *buf, size_t len
 int rtc_calendar_parse(const char *str, struct rtc_calendar_time *t);
 
 /**
- * @brief Generate collision-free timestamped filename: /SD:/WS_YYYYMMDD_HHMMSS_NN.WAV
+ * @brief Generate collision-free timestamped filename: /SD:/YYYYMMDD_HHMMSS_mmm.wav
  *
- * Searches NN from 01 to 99 to ensure no existing file is overwritten.
+ * Uses the recorded RTC subsecond field when available and walks through the
+ * millisecond bucket to avoid overwriting an existing file.
  *
  * @param name Output string buffer.
  * @param len Size of output buffer (must be >= 32 bytes).

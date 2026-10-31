@@ -6,7 +6,11 @@
 #include <zephyr/drivers/gpio.h>
 #include <zephyr/logging/log.h>
 
+#if defined(CONFIG_WILDSONIC_VERBOSE_LOGS)
+LOG_MODULE_REGISTER(led_ind, LOG_LEVEL_INF);
+#else
 LOG_MODULE_REGISTER(led_ind, LOG_LEVEL_WRN);
+#endif
 
 #if DT_NODE_HAS_STATUS(DT_ALIAS(led0), okay)
 static const struct gpio_dt_spec s_led = GPIO_DT_SPEC_GET(DT_ALIAS(led0), gpios);

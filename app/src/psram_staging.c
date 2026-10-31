@@ -54,6 +54,7 @@ static uint32_t drops = 0;
 
 #if defined(__ZEPHYR__)
 static struct k_spinlock staging_lock;
+static struct k_sem s_staging_free_sem;
 #define STAGING_LOCK()   k_spinlock_key_t key = k_spin_lock(&staging_lock)
 #define STAGING_UNLOCK() k_spin_unlock(&staging_lock, key)
 #else
@@ -130,6 +131,9 @@ int psram_staging_init(uint32_t capacity_bytes, uint32_t batch_size_bytes)
 	batch_bufs[0].state = BATCH_STATE_FILLING;
 	batch_bufs[0].batch_id = ++batch_seq_counter;
 	staging_active = true;
+#if defined(__ZEPHYR__)
+	k_sem_init(&s_staging_free_sem, 0, PSRAM_MAX_BATCH_BUFFERS);
+#endif
 	STAGING_UNLOCK();
 
 	LOG_INF("PSRAM ping-pong batch buffer initialized: %u buffers x %u KB = %u KB total",
@@ -225,8 +229,8 @@ int psram_staging_push(const void *src, uint32_t bytes, uint32_t samples)
 		return -ENODEV;
 	}
 	if (write_in_flight) {
-		/* Enforce exactly one producer without blocking while QSPI is active. */
-		drops += samples;
+		/* Temporary producer contention: caller still owns the source block and
+		 * may retry after the current physical transfer completes. */
 		STAGING_UNLOCK();
 		return -EBUSY;
 	}
@@ -240,9 +244,8 @@ int psram_staging_push(const void *src, uint32_t bytes, uint32_t samples)
 	} else if (cur->state != BATCH_STATE_FILLING) {
 		/* Both ping-pong buffers occupied (READY or WRITING); producer cannot overwrite */
 		full_events++;
-		drops += samples;
 		STAGING_UNLOCK();
-		LOG_WRN("PSRAM staging buffer full! Dropped %u samples (%u bytes overflow)", samples, bytes);
+		LOG_WRN("PSRAM staging busy at capacity: rejected %u samples (%u bytes)", samples, bytes);
 		return -ENOBUFS;
 	}
 
@@ -250,11 +253,27 @@ int psram_staging_push(const void *src, uint32_t bytes, uint32_t samples)
 	uint32_t space_in_cur = (cur->capacity_bytes > cur->filled_bytes) ?
 	                        (cur->capacity_bytes - cur->filled_bytes) : 0;
 	uint32_t available = (buf_capacity > used) ? (buf_capacity - used) : 0;
+
+	/* If current batch buffer cannot fit the incoming chunk, but has data and the next buffer is FREE,
+	 * advance to the next buffer without rejecting! */
+	if (bytes > space_in_cur && cur->filled_bytes > 0) {
+		uint32_t next_fill = (active_fill_idx + 1U) % num_batch_buffers;
+		if (batch_bufs[next_fill].state == BATCH_STATE_FREE && available >= bytes) {
+			cur->state = BATCH_STATE_READY;
+			active_fill_idx = next_fill;
+			cur = &batch_bufs[active_fill_idx];
+			cur->state = BATCH_STATE_FILLING;
+			cur->filled_bytes = 0;
+			cur->committed_bytes = 0;
+			cur->batch_id = ++batch_seq_counter;
+			space_in_cur = cur->capacity_bytes;
+		}
+	}
+
 	if (bytes > space_in_cur || bytes > available) {
 		full_events++;
-		drops += samples;
 		STAGING_UNLOCK();
-		LOG_WRN("PSRAM staging buffer full! Dropped %u samples (%u bytes overflow)", samples, bytes);
+		LOG_WRN("PSRAM staging capacity unavailable: rejected %u samples (%u bytes)", samples, bytes);
 		return -ENOBUFS;
 	}
 
@@ -393,16 +412,23 @@ int psram_staging_commit(uint32_t bytes_committed)
 	count_occupied -= bytes_committed;
 	total_flushed += bytes_committed;
 
+	bool buffer_freed = false;
 	/* When entire batch buffer has been committed to SD, release to FREE */
 	if (drain->committed_bytes >= drain->filled_bytes) {
 		if (drain->state == BATCH_STATE_WRITING || active_drain_idx != active_fill_idx) {
 			drain->state = BATCH_STATE_FREE;
 			drain->filled_bytes = 0;
 			drain->committed_bytes = 0;
+			buffer_freed = true;
 		}
 		active_drain_idx = (active_drain_idx + 1U) % num_batch_buffers;
 	}
 	STAGING_UNLOCK();
+#if defined(__ZEPHYR__)
+	if (buffer_freed) {
+		k_sem_give(&s_staging_free_sem);
+	}
+#endif
 	return 0;
 }
 
@@ -426,6 +452,16 @@ int psram_staging_flush_publish(void)
 	}
 	STAGING_UNLOCK();
 	return 1;
+}
+
+int psram_staging_wait_free(uint32_t timeout_ms)
+{
+#if defined(__ZEPHYR__)
+	return k_sem_take(&s_staging_free_sem, K_MSEC(timeout_ms));
+#else
+	ARG_UNUSED(timeout_ms);
+	return 0;
+#endif
 }
 
 uint32_t psram_staging_get_buffer_count(void)

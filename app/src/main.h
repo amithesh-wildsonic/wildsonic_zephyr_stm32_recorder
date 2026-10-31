@@ -48,6 +48,8 @@ void main_scheduler_service_step(void);
 void main_scheduler_resume(void);
 void main_scheduler_pause(void);
 bool main_is_scheduler_paused(void);
+bool main_is_reboot_pending(void);
+void main_set_reboot_pending(bool pending);
 
 
 

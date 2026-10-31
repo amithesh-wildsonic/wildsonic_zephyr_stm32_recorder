@@ -33,6 +33,13 @@ struct rec_stats {
   int sd_write_error;
   uint64_t sd_failed_samples;
   uint32_t adc_overruns;
+  uint32_t adc_dma_recovery_attempts;
+  uint32_t adc_dma_recovery_failures;
+  uint32_t psram_busy_retries;
+  uint32_t psram_full_wait_ms;
+  uint32_t sd_recovery_attempts;
+  int32_t sd_recovery_result;
+  uint32_t writer_completion_timeouts;
   uint32_t dma_errors;
   uint32_t acquisition_events_missed;
   uint32_t acquisition_samples_processed;
@@ -106,14 +113,29 @@ int recorder_record_cycle(uint32_t seconds, uint32_t cycle,
 int recorder_record_session(uint32_t seconds, uint32_t cycle,
                             enum recorder_mode mode, struct rec_stats *out);
 
+/* Classification of session termination reason */
+enum recorder_stop_reason {
+  RECORDER_STOP_NONE = 0,
+  RECORDER_STOP_USER,
+  RECORDER_STOP_APPLY_REBOOT,
+  RECORDER_STOP_SYSTEM_REBOOT,
+  RECORDER_STOP_ERROR
+};
+
+void recorder_set_stop_reason(enum recorder_stop_reason reason);
+enum recorder_stop_reason recorder_get_stop_reason(void);
+void recorder_request_stop_reason(enum recorder_stop_reason reason);
+
 /* Request immediate safe stop of ongoing recording (finalizes WAV header
  * cleanly) */
 void recorder_request_stop(void);
 bool recorder_is_active(void);
+bool recorder_is_shutdown_ready(void);
 bool recorder_is_abort_requested(void);
 int recorder_wait_idle(uint32_t timeout_ms);
 int recorder_get_last_error(void);
 int recorder_get_last_sd_error(void);
+int recorder_get_storage_recovery_result(void);
 void recorder_get_active_progress(uint64_t *samples_written, uint64_t *expected_samples);
 void recorder_get_active_file(char *out_buf, size_t max_len);
 

@@ -75,10 +75,11 @@ def test_recorder_captures_rich_sdmmc_diagnostics_on_write_error():
     assert "Batch %u interrupted: wrote %u of %u bytes to SD before failure (%d)" in rec_c
 
 
-def test_storage_error_preserves_error_code_and_skips_wav_finalization():
-    """Verify WAV header is never finalized and error is not converted to success on write failure."""
+def test_storage_error_preserves_error_code_and_finalizes_partial_wav():
+    """Verify error remains visible while the confirmed portion gets a partial WAV header."""
     rec_c = RECORDER_C.read_text(encoding="utf-8")
-    assert "Skipping WAV header finalization due to previous storage error (%d)" in rec_c
+    assert "Finalize a valid partial WAV" in rec_c
+    assert "finalize_ret = fs_seek(&f, 0, FS_SEEK_SET);" in rec_c
     assert "st.wav_verified = false;" in rec_c
     assert "s_recorder_last_error = err;" in rec_c
     assert "s_recorder_last_sd_error = st.sd_write_error;" in rec_c
@@ -155,9 +156,10 @@ def test_arbt_waits_for_recorder_and_aborts_on_timeout_or_error():
     assert "recorder_request_stop();" in arbt_body
     assert "recorder_wait_idle(5000)" in arbt_body
     assert "Storage shutdown timed out" in arbt_body
+    assert "recorder_is_shutdown_ready()" in arbt_body
     assert "recorder_get_last_error()" in arbt_body
     assert "recorder_get_last_sd_error()" in arbt_body
-    assert "reboot aborted to preserve error diagnosis" in arbt_body
+    assert "Proceeding with reboot despite historical storage error" in arbt_body
 
 
 def test_handle_apply_rejects_active_recording():

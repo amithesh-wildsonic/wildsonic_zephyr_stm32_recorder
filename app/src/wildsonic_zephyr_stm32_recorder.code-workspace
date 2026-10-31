@@ -14,6 +14,7 @@
 	],
 	"settings": {
 		"terminal.integrated.stickyScroll.enabled": false,
-		"stm32cube-ide-clangd.path": "cube"
+		"stm32cube-ide-clangd.path": "cube",
+		"powershell.cwd": "wildsonic_zephyr_stm32_recorder"
 	}
 }

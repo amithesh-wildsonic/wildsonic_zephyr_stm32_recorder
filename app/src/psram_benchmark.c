@@ -11,7 +11,11 @@
 #include <zephyr/kernel.h>
 #include <zephyr/logging/log.h>
 #include <zephyr/sys/time_units.h>
-LOG_MODULE_REGISTER(psram_bench, CONFIG_LOG_DEFAULT_LEVEL);
+#if defined(CONFIG_WILDSONIC_VERBOSE_LOGS)
+LOG_MODULE_REGISTER(psram_bench, LOG_LEVEL_INF);
+#else
+LOG_MODULE_REGISTER(psram_bench, LOG_LEVEL_WRN);
+#endif
 #else
 #include <stdio.h>
 #include <time.h>

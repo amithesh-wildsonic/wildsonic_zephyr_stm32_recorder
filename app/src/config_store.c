@@ -25,7 +25,11 @@
 #include <zephyr/fs/fs.h>
 #include <zephyr/logging/log.h>
 
-LOG_MODULE_REGISTER(ws_config_store, CONFIG_LOG_DEFAULT_LEVEL);
+#if defined(CONFIG_WILDSONIC_VERBOSE_LOGS)
+LOG_MODULE_REGISTER(ws_config_store, LOG_LEVEL_INF);
+#else
+LOG_MODULE_REGISTER(ws_config_store, LOG_LEVEL_WRN);
+#endif
 #if defined(PARTITION_ID)
 #define STORAGE_PARTITION_ID PARTITION_ID(storage_partition)
 #else
@@ -41,6 +45,14 @@ LOG_MODULE_REGISTER(ws_config_store, CONFIG_LOG_DEFAULT_LEVEL);
 
 static int s_active_slot = -1; /* 0 or 1, or -1 if uninitialized */
 static uint32_t s_seq = 0;
+static uint32_t s_pending_gen = 0;
+static uint32_t s_applied_gen = 0;
+static bool s_has_pending = false;
+static struct wildsonic_persisted_config s_last_valid_applied_record;
+static bool s_has_last_valid_applied = false;
+
+static void unpack_record_to_system(const struct wildsonic_persisted_config *rec);
+static void pack_system_to_record(struct wildsonic_persisted_config *rec);
 
 uint32_t config_store_calc_checksum(const struct wildsonic_persisted_config *cfg)
 {
@@ -63,6 +75,29 @@ int config_store_get_active_slot(void)
 uint32_t config_store_get_sequence_number(void)
 {
 	return s_seq;
+}
+
+bool config_store_has_pending(void)
+{
+	return s_has_pending;
+}
+
+uint32_t config_store_get_pending_generation(void)
+{
+	return s_pending_gen;
+}
+
+uint32_t config_store_get_applied_generation(void)
+{
+	return s_applied_gen;
+}
+
+void config_store_rollback_pending(void)
+{
+	if (s_has_last_valid_applied) {
+		unpack_record_to_system(&s_last_valid_applied_record);
+		s_has_pending = false;
+	}
 }
 
 void config_store_load_defaults(void)
@@ -258,7 +293,34 @@ static void pack_system_to_record(struct wildsonic_persisted_config *rec)
 	}
 	rec->num_tod_ranges = count;
 
+	rec->pending_apply = s_has_pending ? 1 : 0;
+	rec->pending_generation = s_pending_gen;
+	rec->applied_generation = s_applied_gen;
+
 	rec->checksum = config_store_calc_checksum(rec);
+}
+
+static bool config_record_is_valid(const struct wildsonic_persisted_config *rec)
+{
+	if (!rec) return false;
+	if (rec->magic != CONFIG_STORE_MAGIC) return false;
+	if (config_store_calc_checksum(rec) != rec->checksum) return false;
+
+	uint32_t act = 0, div = 0;
+	int err = 0;
+	if (!audio_in_is_rate_supported(rec->sampling_rate, &act, &div, &err)) {
+		return false;
+	}
+	if (rec->audio_sampling_width != 16 && rec->audio_sampling_width != 32) {
+		return false;
+	}
+	if (rec->num_audio_channels != 1 && rec->num_audio_channels != 2) {
+		return false;
+	}
+	if (rec->recording_length == 0 || rec->recording_length > 86400) {
+		return false;
+	}
+	return true;
 }
 
 int config_store_init(void)
@@ -291,36 +353,93 @@ int config_store_init(void)
 
 	flash_area_close(fa);
 
+	struct wildsonic_persisted_config *primary = NULL;
+	struct wildsonic_persisted_config *fallback = NULL;
+	int primary_slot = -1;
+
 	if (valid0 && valid1) {
-		/* Choose highest sequence number handling wrapping */
 		int32_t diff = (int32_t)(slot0.sequence_number - slot1.sequence_number);
 		if (diff >= 0) {
-			s_active_slot = 0;
-			s_seq = slot0.sequence_number;
-			unpack_record_to_system(&slot0);
+			primary = &slot0;
+			fallback = &slot1;
+			primary_slot = 0;
 		} else {
-			s_active_slot = 1;
-			s_seq = slot1.sequence_number;
-			unpack_record_to_system(&slot1);
+			primary = &slot1;
+			fallback = &slot0;
+			primary_slot = 1;
 		}
-		LOG_INF("Loaded config from flash slot %d (seq: %u)", s_active_slot, s_seq);
-		return 0;
 	} else if (valid0) {
-		s_active_slot = 0;
-		s_seq = slot0.sequence_number;
-		unpack_record_to_system(&slot0);
-		LOG_INF("Loaded config from flash slot 0 (seq: %u)", s_seq);
-		return 0;
+		primary = &slot0;
+		fallback = NULL;
+		primary_slot = 0;
 	} else if (valid1) {
-		s_active_slot = 1;
-		s_seq = slot1.sequence_number;
-		unpack_record_to_system(&slot1);
-		LOG_INF("Loaded config from flash slot 1 (seq: %u)", s_seq);
-		return 0;
+		primary = &slot1;
+		fallback = NULL;
+		primary_slot = 1;
+	}
+
+	if (primary) {
+		s_active_slot = primary_slot;
+		s_seq = primary->sequence_number;
+
+		if (primary->pending_apply) {
+			LOG_INF("Pending configuration detected in flash slot %d (seq: %u, gen: %u)",
+			        primary_slot, primary->sequence_number, primary->pending_generation);
+
+			if (config_record_is_valid(primary)) {
+				unpack_record_to_system(primary);
+				s_applied_gen = primary->pending_generation;
+				s_pending_gen = primary->pending_generation;
+				s_has_pending = false;
+				s_last_valid_applied_record = *primary;
+				s_last_valid_applied_record.pending_apply = 0;
+				s_last_valid_applied_record.applied_generation = s_applied_gen;
+				s_has_last_valid_applied = true;
+
+				/* Clear pending marker in flash atomically by committing applied state */
+				(void)config_store_save();
+				LOG_INF("Applied pending configuration to active runtime (applied gen: %u)", s_applied_gen);
+				return 0;
+			} else {
+				LOG_ERR("Pending configuration validation failed! Falling back to last known valid applied configuration.");
+				if (fallback && config_record_is_valid(fallback) && !fallback->pending_apply) {
+					unpack_record_to_system(fallback);
+					s_applied_gen = fallback->applied_generation;
+					s_pending_gen = fallback->applied_generation;
+					s_has_pending = false;
+					s_last_valid_applied_record = *fallback;
+					s_has_last_valid_applied = true;
+					LOG_INF("Recovered using fallback flash slot (seq: %u, applied gen: %u)",
+					        fallback->sequence_number, s_applied_gen);
+					return 0;
+				} else {
+					LOG_WRN("No valid fallback configuration available; loading factory defaults");
+					config_store_load_defaults();
+					s_applied_gen = 0;
+					s_pending_gen = 0;
+					s_has_pending = false;
+					return 0;
+				}
+			}
+		} else {
+			/* Standard applied configuration */
+			unpack_record_to_system(primary);
+			s_applied_gen = primary->applied_generation;
+			s_pending_gen = primary->pending_generation;
+			s_has_pending = false;
+			s_last_valid_applied_record = *primary;
+			s_has_last_valid_applied = true;
+			LOG_INF("Loaded config from flash slot %d (seq: %u, applied gen: %u)",
+			        s_active_slot, s_seq, s_applied_gen);
+			return 0;
+		}
 	} else {
 		/* Neither valid: load factory defaults */
 		s_active_slot = -1;
 		s_seq = 0;
+		s_applied_gen = 0;
+		s_pending_gen = 0;
+		s_has_pending = false;
 		config_store_load_defaults();
 		LOG_INF("No valid flash configuration found. Loaded factory defaults.");
 		return 0;
@@ -333,9 +452,16 @@ int config_store_init(void)
 
 int config_store_save(void)
 {
+	s_has_pending = false;
+	s_applied_gen = s_pending_gen;
 	s_seq++;
 	struct wildsonic_persisted_config rec;
 	pack_system_to_record(&rec);
+	rec.pending_apply = 0;
+	rec.applied_generation = s_applied_gen;
+	rec.pending_generation = s_pending_gen;
+	rec.sequence_number = s_seq;
+	rec.checksum = config_store_calc_checksum(&rec);
 
 #ifdef __ZEPHYR__
 	const struct flash_area *fa = NULL;
@@ -374,12 +500,91 @@ int config_store_save(void)
 
 	flash_area_close(fa);
 	s_active_slot = target_slot;
-	LOG_INF("Saved config to flash slot %d (seq: %u)", s_active_slot, s_seq);
+	s_last_valid_applied_record = rec;
+	s_has_last_valid_applied = true;
+	LOG_INF("Saved config to flash slot %d (seq: %u, applied gen: %u)", s_active_slot, s_seq, s_applied_gen);
+	return 0;
+#else
+	s_active_slot = (s_active_slot == 0) ? 1 : 0;
+	s_last_valid_applied_record = rec;
+	s_has_last_valid_applied = true;
+	return 0;
+#endif
+}
+
+int config_store_save_pending(void)
+{
+	s_has_pending = true;
+	s_pending_gen++;
+	s_seq++;
+	struct wildsonic_persisted_config rec;
+	pack_system_to_record(&rec);
+	rec.pending_apply = 1;
+	rec.pending_generation = s_pending_gen;
+	rec.applied_generation = s_applied_gen;
+	rec.sequence_number = s_seq;
+	rec.checksum = config_store_calc_checksum(&rec);
+
+#ifdef __ZEPHYR__
+	const struct flash_area *fa = NULL;
+	int rc = flash_area_open(STORAGE_PARTITION_ID, &fa);
+	if (rc != 0) {
+		LOG_ERR("Failed to open storage partition for write: %d", rc);
+		s_pending_gen--;
+		s_seq--;
+		return rc;
+	}
+
+	int target_slot = (s_active_slot == 0) ? 1 : 0;
+	off_t target_offset = target_slot * CONFIG_STORE_SLOT_SIZE;
+
+	rc = flash_area_erase(fa, target_offset, CONFIG_STORE_SLOT_SIZE);
+	if (rc != 0) {
+		LOG_ERR("flash_area_erase failed on slot %d: %d", target_slot, rc);
+		flash_area_close(fa);
+		s_pending_gen--;
+		s_seq--;
+		return rc;
+	}
+
+	rc = flash_area_write(fa, target_offset, &rec, sizeof(rec));
+	if (rc != 0) {
+		LOG_ERR("flash_area_write failed on slot %d: %d", target_slot, rc);
+		flash_area_close(fa);
+		s_pending_gen--;
+		s_seq--;
+		return rc;
+	}
+
+	/* Verify write by reading back and checking checksum */
+	struct wildsonic_persisted_config verify;
+	rc = flash_area_read(fa, target_offset, &verify, sizeof(verify));
+	if (rc != 0 || verify.magic != CONFIG_STORE_MAGIC ||
+	    verify.checksum != rec.checksum || memcmp(&verify, &rec, sizeof(rec)) != 0) {
+		LOG_ERR("Verification failed for slot %d", target_slot);
+		flash_area_close(fa);
+		s_pending_gen--;
+		s_seq--;
+		return -EIO;
+	}
+
+	flash_area_close(fa);
+	s_active_slot = target_slot;
+	LOG_INF("Saved pending config to flash slot %d (seq: %u, pending gen: %u)",
+	        s_active_slot, s_seq, s_pending_gen);
 	return 0;
 #else
 	s_active_slot = (s_active_slot == 0) ? 1 : 0;
 	return 0;
 #endif
+}
+
+int config_store_apply_pending(void)
+{
+	if (!s_has_pending) {
+		return 0;
+	}
+	return config_store_save();
 }
 
 int config_store_write_status_file(const char *path)
@@ -620,10 +825,12 @@ int config_store_import_sd(void)
 
 	/* Rename config.ini to config.bak (or unlink if rename fails) */
 	fs_unlink(bak_path);
-	if (fs_rename(ini_path, bak_path) != 0) {
+	if (fs_rename(ini_path, bak_path) == 0) {
+		printk("Configuration file has been archived to config.bak\n");
+	} else {
 		fs_unlink(ini_path);
+		printk("Configuration file has been deleted\n");
 	}
-	printk("Configuration file has been deleted\n");
 
 	config_store_write_status_file(status_path);
 	return 0;

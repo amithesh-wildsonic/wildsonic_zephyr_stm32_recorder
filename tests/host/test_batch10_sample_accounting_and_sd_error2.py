@@ -185,9 +185,9 @@ def test_source_code_preserves_first_error_and_skips_wav_finalization():
     assert "if (sd_writer_err != 0 && err == 0)" in rec_c
     assert "err = sd_writer_err;" in rec_c
 
-    # 2. Skips WAV finalization on error
-    assert "if (err == 0 && sd_writer_err == 0)" in rec_c
-    assert "LOG_WRN(\"Skipping WAV header finalization due to previous storage error (%d)\"" in rec_c
+    # 2. Finalizes only confirmed PCM bytes even for partial/error files.
+    assert "/* Writer completion is established here. Finalize a valid partial WAV" in rec_c
+    assert "finalize_ret = fs_seek(&f, 0, FS_SEEK_SET);" in rec_c
 
     # 3. Closes file safely
     assert "fs_close(&f);" in rec_c
