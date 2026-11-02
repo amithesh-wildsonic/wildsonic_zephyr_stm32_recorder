@@ -30,6 +30,7 @@
 #include "ble_comm.h"
 #include "dsp.h"
 #include "sd_benchmark.h"
+#include "solar_calculator.h"
 
 #include <zephyr/kernel.h>
 #include <zephyr/sys/reboot.h>
@@ -213,6 +214,16 @@ static struct wildsonic_config g_cfg = {
 	.boot_time_utc = 0,
 	.save_config_flag = false,
 	.format_sd_card_flag = false,
+	.location_lat_e7 = SCHEDULER_INVALID_LOCATION_COORDINATE,
+	.location_lon_e7 = SCHEDULER_INVALID_LOCATION_COORDINATE,
+	.latitude_e7 = SCHEDULER_INVALID_LOCATION_COORDINATE,
+	.longitude_e7 = SCHEDULER_INVALID_LOCATION_COORDINATE,
+	.sun_recording_mode = 0,
+	.sunrise_interval_before = 0,
+	.sunrise_interval_after = 0,
+	.sunset_interval_before = 0,
+	.sunset_interval_after = 0,
+	.sunrise_sunset_rounding = 0,
 };
 
 #ifdef __ZEPHYR__
@@ -1582,6 +1593,422 @@ static void handle_assert(void)
 	}
 }
 
+/* ==============================================================================
+ * Location and Solar Scheduling Command Handlers
+ * ============================================================================== */
+
+static void print_current_location(void)
+{
+	struct schedule_config scfg;
+	scheduler_get_config(&scfg);
+
+	if (scfg.latitude_e7 == SCHEDULER_INVALID_LOCATION_COORDINATE ||
+	    scfg.longitude_e7 == SCHEDULER_INVALID_LOCATION_COORDINATE) {
+		printk("Current_Location: Not set\n");
+		return;
+	}
+
+	printk("Current_Location: %.7f, %.7f\n",
+	       (double)scfg.latitude_e7 / (double)SCHEDULER_LOCATION_COORDINATE_SCALE,
+	       (double)scfg.longitude_e7 / (double)SCHEDULER_LOCATION_COORDINATE_SCALE);
+}
+
+static bool parse_location_coordinates(const char *p_args, size_t args_length,
+                                       double *out_lat, double *out_lon)
+{
+	if (!p_args || args_length == 0 || args_length >= 128) {
+		return false;
+	}
+
+	char buf[128];
+	memcpy(buf, p_args, args_length);
+	buf[args_length] = '\0';
+
+	char *cursor = buf;
+	while (isspace((unsigned char)*cursor)) {
+		cursor++;
+	}
+	if (*cursor == '\0') {
+		return false;
+	}
+
+	char *end_ptr = NULL;
+	double lat = strtod(cursor, &end_ptr);
+	if (end_ptr == cursor || !isfinite(lat)) {
+		return false;
+	}
+
+	cursor = end_ptr;
+	while (isspace((unsigned char)*cursor)) {
+		cursor++;
+	}
+	if (*cursor == '\0') {
+		return false;
+	}
+
+	double lon = strtod(cursor, &end_ptr);
+	if (end_ptr == cursor || !isfinite(lon)) {
+		return false;
+	}
+
+	while (isspace((unsigned char)*end_ptr)) {
+		end_ptr++;
+	}
+	if (*end_ptr != '\0') {
+		return false;
+	}
+
+	if (out_lat) *out_lat = lat;
+	if (out_lon) *out_lon = lon;
+	return true;
+}
+
+static void handle_loc(const char *p_args, size_t args_length)
+{
+	struct schedule_config scfg;
+	scheduler_get_config(&scfg);
+
+	if (!p_args || args_length == 0) {
+		print_current_location();
+		s_last_cmd_status = 0;
+		return;
+	}
+
+	if (args_length == 5 && strncmp(p_args, "CLEAR", 5) == 0) {
+		scfg.latitude_e7 = SCHEDULER_INVALID_LOCATION_COORDINATE;
+		scfg.longitude_e7 = SCHEDULER_INVALID_LOCATION_COORDINATE;
+		g_cfg.latitude_e7 = SCHEDULER_INVALID_LOCATION_COORDINATE;
+		g_cfg.longitude_e7 = SCHEDULER_INVALID_LOCATION_COORDINATE;
+		g_cfg.location_lat_e7 = SCHEDULER_INVALID_LOCATION_COORDINATE;
+		g_cfg.location_lon_e7 = SCHEDULER_INVALID_LOCATION_COORDINATE;
+		scheduler_set_config(&scfg);
+		g_cfg.save_config_flag = true;
+		printk("\nLocation cleared\n");
+		print_current_location();
+		printk("\nSend APPLY command and reboot for changes to take effect\n");
+		s_last_cmd_status = 0;
+		return;
+	}
+
+	double lat = 0.0, lon = 0.0;
+	if (!parse_location_coordinates(p_args, args_length, &lat, &lon)) {
+		printk("\nInvalid location. Use: LOC <latitude> <longitude>\n");
+		print_current_location();
+		s_last_cmd_status = -EINVAL;
+		return;
+	}
+
+	if (lat < -90.0 || lat > 90.0 || lon < -180.0 || lon > 180.0) {
+		printk("\nInvalid location range. Latitude [-90,90], Longitude [-180,180]\n");
+		print_current_location();
+		s_last_cmd_status = -ERANGE;
+		return;
+	}
+
+	const double scaled_lat = lat * (double)SCHEDULER_LOCATION_COORDINATE_SCALE;
+	const double scaled_lon = lon * (double)SCHEDULER_LOCATION_COORDINATE_SCALE;
+	const int32_t lat_e7 = (scaled_lat >= 0.0) ?
+		(int32_t)floor(scaled_lat + 0.5) : (int32_t)ceil(scaled_lat - 0.5);
+	const int32_t lon_e7 = (scaled_lon >= 0.0) ?
+		(int32_t)floor(scaled_lon + 0.5) : (int32_t)ceil(scaled_lon - 0.5);
+
+	scfg.latitude_e7 = lat_e7;
+	scfg.longitude_e7 = lon_e7;
+	g_cfg.latitude_e7 = lat_e7;
+	g_cfg.longitude_e7 = lon_e7;
+	g_cfg.location_lat_e7 = lat_e7;
+	g_cfg.location_lon_e7 = lon_e7;
+	scheduler_set_config(&scfg);
+	g_cfg.save_config_flag = true;
+
+	printk("\nLocation set to %.7f, %.7f\n", lat, lon);
+	printk("\nSend APPLY command and reboot for changes to take effect\n");
+	s_last_cmd_status = 0;
+}
+
+static void handle_sun(const char *p_args, size_t args_length)
+{
+	struct schedule_config scfg;
+	scheduler_get_config(&scfg);
+
+	if (scfg.latitude_e7 == SCHEDULER_INVALID_LOCATION_COORDINATE ||
+	    scfg.longitude_e7 == SCHEDULER_INVALID_LOCATION_COORDINATE) {
+		printk("\nLocation is not set. Use: LOC <latitude> <longitude>\n");
+		s_last_cmd_status = -EINVAL;
+		return;
+	}
+
+	int year = 0, month = 0, day = 0;
+
+	if (!p_args || args_length == 0) {
+		struct rtc_calendar_time cur_cal;
+		if (rtc_calendar_get(&cur_cal) != 0 || !rtc_calendar_is_valid()) {
+			printk("\nRTC is not set. Use: SUN [YYYY/MM/DD]\n");
+			s_last_cmd_status = -EINVAL;
+			return;
+		}
+		time_t epoch_utc = scheduler_calendar_to_epoch(&cur_cal);
+		time_t local_epoch = epoch_utc + scfg.time_zone_offset;
+		struct rtc_calendar_time local_cal;
+		scheduler_epoch_to_calendar(local_epoch, &local_cal);
+		year = local_cal.year;
+		month = local_cal.month;
+		day = local_cal.day;
+	} else {
+		char date_buf[32];
+		if (args_length >= sizeof(date_buf)) {
+			printk("\nInvalid date. Use: SUN [YYYY/MM/DD]\n");
+			s_last_cmd_status = -EINVAL;
+			return;
+		}
+		memcpy(date_buf, p_args, args_length);
+		date_buf[args_length] = '\0';
+
+		if (sscanf(date_buf, "%d/%d/%d", &year, &month, &day) != 3 ||
+		    year < 1970 || year > 2099 || month < 1 || month > 12 || day < 1 || day > 31) {
+			printk("\nInvalid date. Use: SUN [YYYY/MM/DD]\n");
+			s_last_cmd_status = -EINVAL;
+			return;
+		}
+	}
+
+	const double julian_date = solar_compute_julian_date(year, month, day, 0.0);
+	const double lat = (double)scfg.latitude_e7 / (double)SCHEDULER_LOCATION_COORDINATE_SCALE;
+	const double lon = (double)scfg.longitude_e7 / (double)SCHEDULER_LOCATION_COORDINATE_SCALE;
+
+	uint32_t sunrise_sec = 0, sunset_sec = 0;
+	if (!solar_compute_sunrise_sunset_seconds(julian_date, lat, lon, scfg.time_zone_offset,
+	                                         &sunrise_sec, &sunset_sec)) {
+		printk("\nSunrise/sunset is not available for this date and location\n");
+		s_last_cmd_status = -EDOM;
+		return;
+	}
+
+	printk("\nSun date: %04d/%02d/%02d\n", year, month, day);
+	printk("Julian date: %.2f\n", julian_date);
+	printk("Sunrise time: %02u:%02u:%02u\n",
+	       sunrise_sec / 3600, (sunrise_sec / 60) % 60, sunrise_sec % 60);
+	printk("Sunset time: %02u:%02u:%02u\n",
+	       sunset_sec / 3600, (sunset_sec / 60) % 60, sunset_sec % 60);
+	s_last_cmd_status = 0;
+}
+
+static void handle_sunmode(const char *p_args, size_t args_length)
+{
+	struct schedule_config scfg;
+	scheduler_get_config(&scfg);
+
+	if (args_length == 0 || !p_args) {
+		switch (scfg.sun_recording_mode) {
+		case SUN_MODE_SUNRISE:
+			printk("\nSun recording mode: Sunrise\n");
+			break;
+		case SUN_MODE_SUNSET:
+			printk("\nSun recording mode: Sunset\n");
+			break;
+		case SUN_MODE_SUNRISE_AND_SUNSET:
+			printk("\nSun recording mode: Sunrise and Sunset\n");
+			break;
+		case SUN_MODE_SUNRISE_TO_SUNSET:
+			printk("\nSun recording mode: Sunrise to Sunset\n");
+			break;
+		case SUN_MODE_SUNSET_TO_SUNRISE:
+			printk("\nSun recording mode: Sunset to Sunrise\n");
+			break;
+		default:
+			printk("\nSun recording mode: Disabled\n");
+			break;
+		}
+		s_last_cmd_status = 0;
+		return;
+	}
+
+	static const struct {
+		const char *label;
+		enum sun_recording_mode mode;
+	} sun_mode_table[] = {
+		{"Sunrise and Sunset", SUN_MODE_SUNRISE_AND_SUNSET},
+		{"Sunrise to Sunset", SUN_MODE_SUNRISE_TO_SUNSET},
+		{"Sunset to Sunrise", SUN_MODE_SUNSET_TO_SUNRISE},
+		{"Sunrise", SUN_MODE_SUNRISE},
+		{"Sunset", SUN_MODE_SUNSET},
+		{"Disabled", SUN_MODE_DISABLED},
+	};
+
+	for (size_t i = 0; i < ARRAY_SIZE(sun_mode_table); i++) {
+		size_t label_len = strlen(sun_mode_table[i].label);
+		if (args_length == label_len && strncmp(p_args, sun_mode_table[i].label, label_len) == 0) {
+			scfg.sun_recording_mode = sun_mode_table[i].mode;
+			g_cfg.sun_recording_mode = (uint8_t)sun_mode_table[i].mode;
+
+			if (scfg.sun_recording_mode == SUN_MODE_DISABLED) {
+				scfg.sunrise_interval_before = 0;
+				scfg.sunrise_interval_after = 0;
+				scfg.sunset_interval_before = 0;
+				scfg.sunset_interval_after = 0;
+				scfg.sunrise_sunset_rounding = 0;
+
+				g_cfg.sunrise_interval_before = 0;
+				g_cfg.sunrise_interval_after = 0;
+				g_cfg.sunset_interval_before = 0;
+				g_cfg.sunset_interval_after = 0;
+				g_cfg.sunrise_sunset_rounding = 0;
+			}
+			scheduler_set_config(&scfg);
+			g_cfg.save_config_flag = true;
+
+			printk("\nSun recording mode set to: %s\n", sun_mode_table[i].label);
+			printk("\nSend APPLY command and reboot for changes to take effect\n");
+			s_last_cmd_status = 0;
+			return;
+		}
+	}
+
+	printk("\nInvalid sun recording mode: %.*s\n", (int)args_length, p_args);
+	printk("Valid modes: Sunrise, Sunset, Sunrise and Sunset, Sunrise to Sunset, Sunset to Sunrise, Disabled\n");
+	s_last_cmd_status = -EINVAL;
+}
+
+static void handle_sunrisebef(const char *p_args, size_t args_length)
+{
+	struct schedule_config scfg;
+	scheduler_get_config(&scfg);
+
+	if (args_length == 0 || !p_args) {
+		printk("\nValue is set to %u\n", scfg.sunrise_interval_before);
+		s_last_cmd_status = 0;
+		return;
+	}
+
+	uint32_t val = 0;
+	if (parse_strict_u32(p_args, args_length, &val) != 0) {
+		printk("\nInvalid value %.*s\n", (int)args_length, p_args);
+		printk("\nValue is set to %u\n", scfg.sunrise_interval_before);
+		s_last_cmd_status = -EINVAL;
+		return;
+	}
+
+	scfg.sunrise_interval_before = val;
+	g_cfg.sunrise_interval_before = val;
+	scheduler_set_config(&scfg);
+	g_cfg.save_config_flag = true;
+	printk("\nValue is set to %u\n", val);
+	printk("\nSend APPLY command and reboot for changes to take effect\n");
+	s_last_cmd_status = 0;
+}
+
+static void handle_sunriseaft(const char *p_args, size_t args_length)
+{
+	struct schedule_config scfg;
+	scheduler_get_config(&scfg);
+
+	if (args_length == 0 || !p_args) {
+		printk("\nValue is set to %u\n", scfg.sunrise_interval_after);
+		s_last_cmd_status = 0;
+		return;
+	}
+
+	uint32_t val = 0;
+	if (parse_strict_u32(p_args, args_length, &val) != 0) {
+		printk("\nInvalid value %.*s\n", (int)args_length, p_args);
+		printk("\nValue is set to %u\n", scfg.sunrise_interval_after);
+		s_last_cmd_status = -EINVAL;
+		return;
+	}
+
+	scfg.sunrise_interval_after = val;
+	g_cfg.sunrise_interval_after = val;
+	scheduler_set_config(&scfg);
+	g_cfg.save_config_flag = true;
+	printk("\nValue is set to %u\n", val);
+	printk("\nSend APPLY command and reboot for changes to take effect\n");
+	s_last_cmd_status = 0;
+}
+
+static void handle_sunsetbef(const char *p_args, size_t args_length)
+{
+	struct schedule_config scfg;
+	scheduler_get_config(&scfg);
+
+	if (args_length == 0 || !p_args) {
+		printk("\nValue is set to %u\n", scfg.sunset_interval_before);
+		s_last_cmd_status = 0;
+		return;
+	}
+
+	uint32_t val = 0;
+	if (parse_strict_u32(p_args, args_length, &val) != 0) {
+		printk("\nInvalid value %.*s\n", (int)args_length, p_args);
+		printk("\nValue is set to %u\n", scfg.sunset_interval_before);
+		s_last_cmd_status = -EINVAL;
+		return;
+	}
+
+	scfg.sunset_interval_before = val;
+	g_cfg.sunset_interval_before = val;
+	scheduler_set_config(&scfg);
+	g_cfg.save_config_flag = true;
+	printk("\nValue is set to %u\n", val);
+	printk("\nSend APPLY command and reboot for changes to take effect\n");
+	s_last_cmd_status = 0;
+}
+
+static void handle_sunsetaft(const char *p_args, size_t args_length)
+{
+	struct schedule_config scfg;
+	scheduler_get_config(&scfg);
+
+	if (args_length == 0 || !p_args) {
+		printk("\nValue is set to %u\n", scfg.sunset_interval_after);
+		s_last_cmd_status = 0;
+		return;
+	}
+
+	uint32_t val = 0;
+	if (parse_strict_u32(p_args, args_length, &val) != 0) {
+		printk("\nInvalid value %.*s\n", (int)args_length, p_args);
+		printk("\nValue is set to %u\n", scfg.sunset_interval_after);
+		s_last_cmd_status = -EINVAL;
+		return;
+	}
+
+	scfg.sunset_interval_after = val;
+	g_cfg.sunset_interval_after = val;
+	scheduler_set_config(&scfg);
+	g_cfg.save_config_flag = true;
+	printk("\nValue is set to %u\n", val);
+	printk("\nSend APPLY command and reboot for changes to take effect\n");
+	s_last_cmd_status = 0;
+}
+
+static void handle_sunround(const char *p_args, size_t args_length)
+{
+	struct schedule_config scfg;
+	scheduler_get_config(&scfg);
+
+	if (args_length == 0 || !p_args) {
+		printk("\nValue is set to %u\n", scfg.sunrise_sunset_rounding);
+		s_last_cmd_status = 0;
+		return;
+	}
+
+	uint32_t val = 0;
+	if (parse_strict_u32(p_args, args_length, &val) != 0) {
+		printk("\nInvalid value %.*s\n", (int)args_length, p_args);
+		printk("\nValue is set to %u\n", scfg.sunrise_sunset_rounding);
+		s_last_cmd_status = -EINVAL;
+		return;
+	}
+
+	scfg.sunrise_sunset_rounding = val;
+	g_cfg.sunrise_sunset_rounding = val;
+	scheduler_set_config(&scfg);
+	g_cfg.save_config_flag = true;
+	printk("\nValue is set to %u\n", val);
+	printk("\nSend APPLY command and reboot for changes to take effect\n");
+	s_last_cmd_status = 0;
+}
+
 /* DEFAULT handler */
 static void handle_default(void)
 {
@@ -1735,7 +2162,10 @@ static void handle_rbt(void)
 	}
 
 	main_set_reboot_pending(true);
+	main_set_shutdown_stage(SHUTDOWN_STAGE_REQUESTED);
+
 	main_scheduler_pause();
+	main_set_shutdown_stage(SHUTDOWN_STAGE_SCHEDULER_STOPPED);
 
 	printk("\nRebooting device.\n");
 
@@ -1752,9 +2182,16 @@ static void handle_rbt(void)
 #endif
 		recorder_set_stop_reason(RECORDER_STOP_SYSTEM_REBOOT);
 		recorder_request_stop();
+		main_set_shutdown_stage(SHUTDOWN_STAGE_ADC_DMA_STOPPED);
+
+		main_set_shutdown_stage(SHUTDOWN_STAGE_AUDIO_QUEUES_DRAINED);
+		main_set_shutdown_stage(SHUTDOWN_STAGE_PSRAM_READER_DRAINED);
+		main_set_shutdown_stage(SHUTDOWN_STAGE_SD_WRITER_DRAINED);
+
 		int wait_rc = recorder_wait_idle(5000);
 		if (wait_rc != 0) {
 			main_set_reboot_pending(false);
+			main_set_shutdown_stage(SHUTDOWN_STAGE_IDLE);
 			LOG_ERR("RBT: Recorder shutdown timeout (%d); aborting reboot to preserve data", wait_rc);
 			printk("\nError: Failed to finalize recording before reboot.\n");
 			if (s_current_out_resp && s_current_out_resp_size > 0) {
@@ -1763,10 +2200,18 @@ static void handle_rbt(void)
 			s_last_cmd_status = -ETIMEDOUT;
 			return;
 		}
+		main_set_shutdown_stage(SHUTDOWN_STAGE_WAV_FINALIZED);
+	} else {
+		main_set_shutdown_stage(SHUTDOWN_STAGE_ADC_DMA_STOPPED);
+		main_set_shutdown_stage(SHUTDOWN_STAGE_AUDIO_QUEUES_DRAINED);
+		main_set_shutdown_stage(SHUTDOWN_STAGE_PSRAM_READER_DRAINED);
+		main_set_shutdown_stage(SHUTDOWN_STAGE_SD_WRITER_DRAINED);
+		main_set_shutdown_stage(SHUTDOWN_STAGE_WAV_FINALIZED);
 	}
 
 	if (!recorder_is_shutdown_ready()) {
 		main_set_reboot_pending(false);
+		main_set_shutdown_stage(SHUTDOWN_STAGE_IDLE);
 		LOG_ERR("RBT: Storage resources still active; aborting reboot");
 		printk("[ERROR] Storage resources still active; reboot aborted to prevent corruption.\n");
 		if (s_current_out_resp && s_current_out_resp_size > 0) {
@@ -1785,13 +2230,16 @@ static void handle_rbt(void)
 
 	led_indicator_set(LED_IND_OFF);
 	if (g_cfg.save_config_flag) {
+		main_set_shutdown_stage(SHUTDOWN_STAGE_CONFIG_PERSISTED);
 		config_store_save();
 		g_cfg.save_config_flag = false;
 	}
+	main_set_shutdown_stage(SHUTDOWN_STAGE_REBOOT_READY);
 	while (log_process()) {
 		k_sleep(K_MSEC(2));
 	}
 	k_sleep(K_MSEC(50));
+	main_set_shutdown_stage(SHUTDOWN_STAGE_SYSTEM_RESET);
 #if defined(CONFIG_REBOOT)
 	sys_reboot(SYS_REBOOT_COLD);
 #endif
@@ -1813,7 +2261,10 @@ static void handle_arbt(void)
 	}
 
 	main_set_reboot_pending(true);
+	main_set_shutdown_stage(SHUTDOWN_STAGE_REQUESTED);
+
 	main_scheduler_pause();
+	main_set_shutdown_stage(SHUTDOWN_STAGE_SCHEDULER_STOPPED);
 
 	printk("\nRebooting device.\n");
 
@@ -1832,9 +2283,16 @@ static void handle_arbt(void)
 #endif
 		recorder_set_stop_reason(RECORDER_STOP_APPLY_REBOOT);
 		recorder_request_stop();
+		main_set_shutdown_stage(SHUTDOWN_STAGE_ADC_DMA_STOPPED);
+
+		main_set_shutdown_stage(SHUTDOWN_STAGE_AUDIO_QUEUES_DRAINED);
+		main_set_shutdown_stage(SHUTDOWN_STAGE_PSRAM_READER_DRAINED);
+		main_set_shutdown_stage(SHUTDOWN_STAGE_SD_WRITER_DRAINED);
+
 		int wait_rc = recorder_wait_idle(5000);
 		if (wait_rc != 0) {
 			main_set_reboot_pending(false);
+			main_set_shutdown_stage(SHUTDOWN_STAGE_IDLE);
 			LOG_ERR("ARBT: Recorder shutdown timeout (%d); aborting reboot to preserve storage", wait_rc);
 			printk("[ERROR] Storage shutdown timed out (%d); aborting reboot to prevent corruption.\n", wait_rc);
 			if (s_current_out_resp && s_current_out_resp_size > 0) {
@@ -1843,10 +2301,18 @@ static void handle_arbt(void)
 			s_last_cmd_status = -ETIMEDOUT;
 			return;
 		}
+		main_set_shutdown_stage(SHUTDOWN_STAGE_WAV_FINALIZED);
+	} else {
+		main_set_shutdown_stage(SHUTDOWN_STAGE_ADC_DMA_STOPPED);
+		main_set_shutdown_stage(SHUTDOWN_STAGE_AUDIO_QUEUES_DRAINED);
+		main_set_shutdown_stage(SHUTDOWN_STAGE_PSRAM_READER_DRAINED);
+		main_set_shutdown_stage(SHUTDOWN_STAGE_SD_WRITER_DRAINED);
+		main_set_shutdown_stage(SHUTDOWN_STAGE_WAV_FINALIZED);
 	}
 
 	if (!recorder_is_shutdown_ready()) {
 		main_set_reboot_pending(false);
+		main_set_shutdown_stage(SHUTDOWN_STAGE_IDLE);
 		LOG_ERR("ARBT: Storage resources still active; aborting reboot");
 		printk("[ERROR] Storage resources still active; reboot aborted to prevent corruption.\n");
 		if (s_current_out_resp && s_current_out_resp_size > 0) {
@@ -1864,10 +2330,12 @@ static void handle_arbt(void)
 	}
 
 	/* Save configuration exactly ONCE */
+	main_set_shutdown_stage(SHUTDOWN_STAGE_CONFIG_PERSISTED);
 	g_cfg.save_config_flag = false;
 	int save_rc = config_store_save();
 	if (save_rc != 0) {
 		main_set_reboot_pending(false);
+		main_set_shutdown_stage(SHUTDOWN_STAGE_IDLE);
 		LOG_ERR("ARBT: Failed to save configuration to flash (%d)", save_rc);
 		printk("[ERROR] Flash save failed (%d). Reboot aborted.\n", save_rc);
 		if (s_current_out_resp && s_current_out_resp_size > 0) {
@@ -1881,11 +2349,13 @@ static void handle_arbt(void)
 	printk("\nAll buffers flushed and WAV container closed cleanly. Rebooting device.\n");
 #endif
 
+	main_set_shutdown_stage(SHUTDOWN_STAGE_REBOOT_READY);
 	led_indicator_set(LED_IND_OFF);
 	while (log_process()) {
 		k_sleep(K_MSEC(2));
 	}
 	k_sleep(K_MSEC(50));
+	main_set_shutdown_stage(SHUTDOWN_STAGE_SYSTEM_RESET);
 #if defined(CONFIG_REBOOT)
 	sys_reboot(SYS_REBOOT_COLD);
 #endif
@@ -2164,28 +2634,28 @@ static int console_process_line_internal(char *cmd_line, bool from_ble, char *ou
 		report_deferred_hardware("ENVSTS");
 		break;
 	case CMD_LOCATION:
-		report_deferred_hardware("LOC");
+		handle_loc(p_args, args_len);
 		break;
 	case CMD_SUN:
-		report_deferred_hardware("SUN");
+		handle_sun(p_args, args_len);
 		break;
 	case CMD_SUN_RECORDING_MODE:
-		report_deferred_hardware("SUNMODE");
+		handle_sunmode(p_args, args_len);
 		break;
 	case CMD_SUNRISE_INTERVAL_BEFORE:
-		report_deferred_hardware("SUNRISEBEF");
+		handle_sunrisebef(p_args, args_len);
 		break;
 	case CMD_SUNRISE_INTERVAL_AFTER:
-		report_deferred_hardware("SUNRISEAFT");
+		handle_sunriseaft(p_args, args_len);
 		break;
 	case CMD_SUNSET_INTERVAL_BEFORE:
-		report_deferred_hardware("SUNSETBEF");
+		handle_sunsetbef(p_args, args_len);
 		break;
 	case CMD_SUNSET_INTERVAL_AFTER:
-		report_deferred_hardware("SUNSETAFT");
+		handle_sunsetaft(p_args, args_len);
 		break;
 	case CMD_SUNRISE_SUNSET_ROUNDING:
-		report_deferred_hardware("SUNROUND");
+		handle_sunround(p_args, args_len);
 		break;
 	case CMD_DEFAULT:
 		handle_default();

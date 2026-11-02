@@ -1453,7 +1453,37 @@ void main_set_reboot_pending(bool pending) {
   }
 }
 
+static volatile enum system_shutdown_stage s_shutdown_stage = SHUTDOWN_STAGE_IDLE;
+
+void main_set_shutdown_stage(enum system_shutdown_stage stage) {
+  s_shutdown_stage = stage;
+}
+
+enum system_shutdown_stage main_get_shutdown_stage(void) {
+  return s_shutdown_stage;
+}
+
+const char *main_get_shutdown_stage_name(enum system_shutdown_stage stage) {
+  switch (stage) {
+  case SHUTDOWN_STAGE_IDLE: return "IDLE";
+  case SHUTDOWN_STAGE_REQUESTED: return "SHUTDOWN_REQUESTED";
+  case SHUTDOWN_STAGE_SCHEDULER_STOPPED: return "SCHEDULER_STOPPED";
+  case SHUTDOWN_STAGE_ADC_DMA_STOPPED: return "ADC_DMA_STOPPED";
+  case SHUTDOWN_STAGE_AUDIO_QUEUES_DRAINED: return "AUDIO_QUEUES_DRAINED";
+  case SHUTDOWN_STAGE_PSRAM_READER_DRAINED: return "PSRAM_READER_DRAINED";
+  case SHUTDOWN_STAGE_SD_WRITER_DRAINED: return "SD_WRITER_DRAINED";
+  case SHUTDOWN_STAGE_WAV_FINALIZED: return "WAV_FINALIZED";
+  case SHUTDOWN_STAGE_CONFIG_PERSISTED: return "CONFIG_PERSISTED";
+  case SHUTDOWN_STAGE_REBOOT_READY: return "REBOOT_READY";
+  case SHUTDOWN_STAGE_SYSTEM_RESET: return "SYSTEM_RESET";
+  default: return "UNKNOWN";
+  }
+}
+
 static void dispatch_recording_session(const struct schedule_interval *interval, int32_t tz_offset) {
+  if (main_is_reboot_pending()) {
+    return;
+  }
   struct rtc_calendar_time cur_time;
   if (rtc_calendar_get(&cur_time) != 0 || !rtc_calendar_is_valid()) {
     return;

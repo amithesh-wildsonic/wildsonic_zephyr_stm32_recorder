@@ -39,6 +39,8 @@ struct wildsonic_config {
 	uint32_t transmission_mode;
 	int32_t location_lat_e7;
 	int32_t location_lon_e7;
+	int32_t latitude_e7;
+	int32_t longitude_e7;
 	uint32_t sms_frequency;
 	uint16_t low_battery_threshold;
 	uint8_t sun_recording_mode;

@@ -1,5 +1,6 @@
 /* SPDX-License-Identifier: Apache-2.0 */
 #include "scheduler.h"
+#include "solar_calculator.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -369,14 +370,31 @@ int scheduler_calculate_next(
 		if (found_day_range) {
 			time_t found_time_range_start = 0;
 			time_t found_time_range_end = 0;
+			const struct schedule_tod_range *active_tod_ranges = cfg->tod_ranges;
+			struct schedule_tod_range sun_tod_ranges[SCHEDULER_MAX_TIME_OF_DAY_RANGES];
+			uint32_t num_sun_ranges = 0;
 
-			found_time_range = scheduler_find_tod_interval(
-				cfg->tod_ranges,
-				SCHEDULER_MAX_TIME_OF_DAY_RANGES,
-				found_day_range_start,
-				found_day_range_end,
-				&found_time_range_start,
-				&found_time_range_end);
+			if (cfg->sun_recording_mode != SUN_MODE_DISABLED) {
+				struct rtc_calendar_time day_cal;
+				scheduler_epoch_to_calendar(found_day_range_start, &day_cal);
+				if (solar_compute_tod_ranges_for_date(cfg, (int)day_cal.year, (int)day_cal.month, (int)day_cal.day,
+				                                     sun_tod_ranges, &num_sun_ranges) && num_sun_ranges > 0) {
+					active_tod_ranges = sun_tod_ranges;
+				} else {
+					/* Solar calculation failed (polar day/night or unset coordinates); skip solar window */
+					active_tod_ranges = NULL;
+				}
+			}
+
+			if (active_tod_ranges) {
+				found_time_range = scheduler_find_tod_interval(
+					active_tod_ranges,
+					SCHEDULER_MAX_TIME_OF_DAY_RANGES,
+					found_day_range_start,
+					found_day_range_end,
+					&found_time_range_start,
+					&found_time_range_end);
+			}
 
 			if (found_time_range) {
 				active_start_time_local = found_time_range_start;
@@ -741,6 +759,15 @@ void scheduler_reset_defaults(void)
 	g_schedule_cfg.record_length = 60;
 	g_schedule_cfg.sleep_interval = 60;
 
+	g_schedule_cfg.latitude_e7 = SCHEDULER_INVALID_LOCATION_COORDINATE;
+	g_schedule_cfg.longitude_e7 = SCHEDULER_INVALID_LOCATION_COORDINATE;
+	g_schedule_cfg.sun_recording_mode = SUN_MODE_DISABLED;
+	g_schedule_cfg.sunrise_sunset_rounding = 0;
+	g_schedule_cfg.sunrise_interval_before = 0;
+	g_schedule_cfg.sunrise_interval_after = 0;
+	g_schedule_cfg.sunset_interval_before = 0;
+	g_schedule_cfg.sunset_interval_after = 0;
+
 	scheduler_reset_tod_ranges(g_schedule_cfg.tod_ranges, SCHEDULER_MAX_TIME_OF_DAY_RANGES);
 	g_scheduler_initialized = true;
 }
@@ -777,6 +804,9 @@ bool scheduler_has_active_constraints(void)
 	}
 
 	if (g_schedule_cfg.start_date.year > 0 || g_schedule_cfg.end_date.year > 0) {
+		return true;
+	}
+	if (g_schedule_cfg.sun_recording_mode != SUN_MODE_DISABLED) {
 		return true;
 	}
 	if (g_schedule_cfg.day_of_week_mask != SCHEDULER_FULL_WEEK_MASK) {
