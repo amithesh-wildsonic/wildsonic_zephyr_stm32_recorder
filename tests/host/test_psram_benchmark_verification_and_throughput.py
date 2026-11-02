@@ -224,7 +224,8 @@ def test_diagnostic_memory_range_isolation():
 
     staging_h = (SRC_DIR / "psram_staging.h").read_text(encoding="utf-8")
     assert "PSRAM_STAGING_BASE_ADDR                0x00000000U" in staging_h
-    assert "PSRAM_STAGING_DEFAULT_CAPACITY_BYTES   (1024U * 1024U)" in staging_h
+    assert "PSRAM_AUDIO_BUFFER_BYTES   (3U * 1024U * 1024U)" in staging_h
+    assert "PSRAM_STAGING_DEFAULT_CAPACITY_BYTES   PSRAM_AUDIO_BUFFER_BYTES" in staging_h
 
 
 def test_production_build_excludes_benchmark_commands():

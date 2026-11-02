@@ -33,6 +33,20 @@ struct wildsonic_config {
 	time_t boot_time_utc;
 	bool save_config_flag;
 	bool format_sd_card_flag;
+
+	/* Timezone and preserved settings */
+	int32_t time_zone_offset;
+	uint32_t transmission_mode;
+	int32_t location_lat_e7;
+	int32_t location_lon_e7;
+	uint32_t sms_frequency;
+	uint16_t low_battery_threshold;
+	uint8_t sun_recording_mode;
+	uint8_t sunrise_interval_before;
+	uint8_t sunrise_interval_after;
+	uint8_t sunset_interval_before;
+	uint8_t sunset_interval_after;
+	uint8_t sunrise_sunset_rounding;
 };
 
 /**

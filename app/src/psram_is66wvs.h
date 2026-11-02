@@ -45,9 +45,9 @@
 #define PSRAM_DIAG_TEST_BASE_ADDR      0x00300000U
 #define PSRAM_DIAG_TEST_MAX_ADDR       0x003FFFFFU
 
-/* Safe hardware burst limits respecting IS66WVS tCEM (4.0 us max at 18 MHz) */
+/* Safe hardware burst limits: 1024-byte full-page Quad I/O; 4-byte SPI */
 #define PSRAM_IS66WVS_SAFE_BURST_BYTES_SPI   4
-#define PSRAM_IS66WVS_SAFE_BURST_BYTES_QUAD  16
+#define PSRAM_IS66WVS_SAFE_BURST_BYTES_QUAD  1024
 #define PSRAM_IS66WVS_SAFE_BURST_BYTES       PSRAM_IS66WVS_SAFE_BURST_BYTES_SPI
 
 #define PSRAM_ISSI_MFID                0x9D

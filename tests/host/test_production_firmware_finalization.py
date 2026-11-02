@@ -303,9 +303,9 @@ def test_eleven_step_low_power_state_machine_contracts():
     # Step 6: RTC Wakeup Timer
     assert "RTC_WKUP_IRQn" in src_sleep
 
-    # Step 7: Wake peripherals
+    # Step 7: Wake peripherals & verify idle
     assert "psram_wake()" in src_rec
-    assert 'disk_access_ioctl("SD", DISK_IOCTL_CTRL_SYNC' in src_rec
+    assert "recorder_sd_verify_idle()" in src_rec
 
     # Step 8: Acquisition & DSP pipeline
     assert "audio_in_start()" in src_rec

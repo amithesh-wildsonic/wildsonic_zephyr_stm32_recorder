@@ -79,6 +79,11 @@ int rtc_calendar_get(struct rtc_calendar_time *t);
 int rtc_calendar_set(const struct rtc_calendar_time *t);
 
 /**
+ * @brief Log TEST snapshot of RTC registers, calendar state and remaining sleep interval.
+ */
+void rtc_calendar_log_snapshot(const char *phase, int64_t target_utc);
+
+/**
  * @brief Format date/time into standard string "YYYY-MM-DD HH:MM:SS".
  *
  * @param t Date/time structure.

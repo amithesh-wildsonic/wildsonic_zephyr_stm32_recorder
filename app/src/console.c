@@ -28,6 +28,8 @@
 #include "psram_is66wvs.h"
 #include "audio_format.h"
 #include "ble_comm.h"
+#include "dsp.h"
+#include "sd_benchmark.h"
 
 #include <zephyr/kernel.h>
 #include <zephyr/sys/reboot.h>
@@ -179,7 +181,17 @@ void console_async_resume(void)
 			(void)USART2->RDR;
 		}
 #endif
+		struct uart_config ucfg = {
+			.baudrate = 115200,
+			.parity = UART_CFG_PARITY_NONE,
+			.stop_bits = UART_CFG_STOP_BITS_1,
+			.data_bits = UART_CFG_DATA_BITS_8,
+			.flow_ctrl = UART_CFG_FLOW_CTRL_NONE,
+		};
+		(void)uart_configure(s_console_uart_dev, &ucfg);
+
 #if defined(CONFIG_UART_INTERRUPT_DRIVEN)
+		uart_irq_callback_user_data_set(s_console_uart_dev, console_uart_isr, NULL);
 		uart_irq_rx_enable(s_console_uart_dev);
 #endif
 	}
@@ -440,7 +452,7 @@ static const char *console_cmd_description_table[] = {
 	"I2C debugging scan, read/write command",
 	"Reset RTC time to 2025-01-01 00:00:00 UTC",
 	"Configure custom/default alarm sequence (GPIO 1.7 + RTC)",
-	"Configure PSRAM circular staging buffer (on, off, status, burst)",
+	"Configure PSRAM circular staging buffer (on, off, status, burst, mode)",
 	"Run guided interactive configuration wizard",
 	"Get current system, scheduler, and recording status",
 	"Get hardware platform and firmware device information",
@@ -539,6 +551,62 @@ static enum console_cmd_id console_cmd_lookup_func(const char *cmd, size_t lengt
 	return CMD_NUM_CMDS;
 }
 
+static int s_last_cmd_status = 0;
+
+static int parse_strict_u32(const char *str, size_t len, uint32_t *out_val)
+{
+	if (!str || len == 0) return -EINVAL;
+	while (len > 0 && isspace((unsigned char)*str)) {
+		str++;
+		len--;
+	}
+	while (len > 0 && isspace((unsigned char)str[len - 1])) {
+		len--;
+	}
+	if (len == 0) return -EINVAL;
+
+	char buf[32];
+	if (len >= sizeof(buf)) return -EINVAL;
+	memcpy(buf, str, len);
+	buf[len] = '\0';
+
+	char *endptr = NULL;
+	errno = 0;
+	unsigned long v = strtoul(buf, &endptr, 10);
+	if (endptr == buf || *endptr != '\0' || errno == ERANGE || v > UINT32_MAX) {
+		return -EINVAL;
+	}
+	*out_val = (uint32_t)v;
+	return 0;
+}
+
+__maybe_unused static int parse_strict_i32(const char *str, size_t len, int32_t *out_val)
+{
+	if (!str || len == 0) return -EINVAL;
+	while (len > 0 && isspace((unsigned char)*str)) {
+		str++;
+		len--;
+	}
+	while (len > 0 && isspace((unsigned char)str[len - 1])) {
+		len--;
+	}
+	if (len == 0) return -EINVAL;
+
+	char buf[32];
+	if (len >= sizeof(buf)) return -EINVAL;
+	memcpy(buf, str, len);
+	buf[len] = '\0';
+
+	char *endptr = NULL;
+	errno = 0;
+	long v = strtol(buf, &endptr, 10);
+	if (endptr == buf || *endptr != '\0' || errno == ERANGE || v < INT32_MIN || v > INT32_MAX) {
+		return -EINVAL;
+	}
+	*out_val = (int32_t)v;
+	return 0;
+}
+
 /* SAMF handler */
 static void handle_samf(const char *p_args, size_t args_length)
 {
@@ -546,10 +614,19 @@ static void handle_samf(const char *p_args, size_t args_length)
 
 	if (args_length == 0) {
 		printk("\nValue is set to %u\n", g_cfg.sampling_rate);
+		s_last_cmd_status = 0;
 		return;
 	}
 
-	uint32_t val = (uint32_t)strtoul(p_args, NULL, 10);
+	uint32_t raw_val = 0;
+	if (parse_strict_u32(p_args, args_length, &raw_val) != 0) {
+		printk("\nInvalid value %.*s\n", (int)args_length, p_args);
+		printk("\nValue is set to %u\n", g_cfg.sampling_rate);
+		s_last_cmd_status = -EINVAL;
+		return;
+	}
+
+	uint32_t val = raw_val;
 	if (val == 16) val = 16000;
 	else if (val == 32) val = 32000;
 	else if (val == 44) val = 44100;
@@ -564,8 +641,9 @@ static void handle_samf(const char *p_args, size_t args_length)
 	uint32_t act = 0, div = 0;
 	int err = 0;
 	if (!audio_in_is_rate_supported(val, &act, &div, &err)) {
-		printk("\nInvalid value %s\n", p_args);
+		printk("\nInvalid value %.*s\n", (int)args_length, p_args);
 		printk("\nValue is set to %u\n", g_cfg.sampling_rate);
+		s_last_cmd_status = -EINVAL;
 		return;
 	}
 
@@ -575,10 +653,13 @@ static void handle_samf(const char *p_args, size_t args_length)
 		if (rc != 0) {
 			printk("\nUnsupported sample rate: %u Hz (error %d)\n", val, rc);
 			printk("\nValue is set to %u\n", g_cfg.sampling_rate);
+			s_last_cmd_status = rc;
 			return;
 		}
 		g_cfg.sampling_rate = val;
-		settings->sample_rate = audio_in_rate();
+		if (settings) {
+			settings->sample_rate = audio_in_rate();
+		}
 		main_apply_dsp_settings();
 	} else {
 		/* Recording active: stage in RAM without modifying running session */
@@ -603,9 +684,13 @@ static void handle_samf(const char *p_args, size_t args_length)
 #endif
 
 	printk("\nValue is set to %u\n", val);
-	if (g_cfg.upper_cutoff_frequency == (old_rate / 2)) {
-		g_cfg.upper_cutoff_frequency = val / 2;
-		settings->lpf_cutoff_hz = val / 2;
+	if (g_cfg.upper_cutoff_frequency == (old_rate / 2) ||
+	    g_cfg.upper_cutoff_frequency >= ((val * 49) / 100)) {
+		uint32_t safe_cutoff = dsp_validate_lpf_cutoff(val, (val * 45) / 100);
+		g_cfg.upper_cutoff_frequency = safe_cutoff;
+		if (settings) {
+			settings->lpf_cutoff_hz = safe_cutoff;
+		}
 		if (!recorder_is_active()) {
 			main_apply_dsp_settings();
 		}
@@ -614,7 +699,7 @@ static void handle_samf(const char *p_args, size_t args_length)
 	printk("\nSend APPLY command and reboot for changes to take effect\n");
 	char val_str[16];
 	snprintf(val_str, sizeof(val_str), "%u", val);
-	console_commit_and_ack_config("SAMF", val_str, recorder_is_active());
+	s_last_cmd_status = console_commit_and_ack_config("SAMF", val_str, recorder_is_active());
 }
 
 /* BTPS handler */
@@ -624,9 +709,18 @@ static void handle_btps(const char *p_args, size_t args_length)
 
 	if (args_length == 0) {
 		printk("\nValue is set to %u\n", g_cfg.audio_sampling_width);
+		s_last_cmd_status = 0;
 		return;
 	}
-	int val = atoi(p_args);
+
+	uint32_t val = 0;
+	if (parse_strict_u32(p_args, args_length, &val) != 0) {
+		printk("\nInvalid value %.*s\n", (int)args_length, p_args);
+		printk("\nValue is set to %u\n", g_cfg.audio_sampling_width);
+		s_last_cmd_status = -EINVAL;
+		return;
+	}
+
 	if (val == 32) {
 		g_cfg.audio_sampling_width = 32;
 		if (settings) {
@@ -645,17 +739,19 @@ static void handle_btps(const char *p_args, size_t args_length)
 #endif
 		printk("\nValue is set to 32\n");
 		printk("\nSend APPLY command and reboot for changes to take effect\n");
-		console_commit_and_ack_config("BTPS", "32", recorder_is_active());
+		s_last_cmd_status = console_commit_and_ack_config("BTPS", "32", recorder_is_active());
 		return;
 	}
 	if (val == 24) {
-		printk("\n[DEFERRED] Bits per sample %d requires future hardware (STM32U585/external I2S codec).\n", val);
+		printk("\n[DEFERRED] Bits per sample %d requires future hardware (STM32U585/external I2S codec).\n", (int)val);
 		printk("\nValue is set to %u\n", g_cfg.audio_sampling_width);
+		s_last_cmd_status = -ENOTSUP;
 		return;
 	}
 	if (val != 16) {
-		printk("\nInvalid value %s\n", p_args);
+		printk("\nInvalid value %.*s\n", (int)args_length, p_args);
 		printk("\nValue is set to %u\n", g_cfg.audio_sampling_width);
+		s_last_cmd_status = -EINVAL;
 		return;
 	}
 	g_cfg.audio_sampling_width = 16;
@@ -664,7 +760,7 @@ static void handle_btps(const char *p_args, size_t args_length)
 	}
 	printk("\nValue is set to 16\n");
 	printk("\nSend APPLY command and reboot for changes to take effect\n");
-	console_commit_and_ack_config("BTPS", "16", recorder_is_active());
+	s_last_cmd_status = console_commit_and_ack_config("BTPS", "16", recorder_is_active());
 }
 
 /* NUMCH handler */
@@ -674,9 +770,18 @@ static void handle_numch(const char *p_args, size_t args_length)
 
 	if (args_length == 0) {
 		printk("\nValue is set to %u\n", g_cfg.num_audio_channels);
+		s_last_cmd_status = 0;
 		return;
 	}
-	int val = atoi(p_args);
+
+	uint32_t val = 0;
+	if (parse_strict_u32(p_args, args_length, &val) != 0) {
+		printk("\nInvalid value %.*s\n", (int)args_length, p_args);
+		printk("\nValue is set to %u\n", g_cfg.num_audio_channels);
+		s_last_cmd_status = -EINVAL;
+		return;
+	}
+
 	if (val == 2) {
 		g_cfg.num_audio_channels = 2;
 		if (settings) {
@@ -695,12 +800,13 @@ static void handle_numch(const char *p_args, size_t args_length)
 #endif
 		printk("\nValue is set to 2\n");
 		printk("\nSend APPLY command and reboot for changes to take effect\n");
-		console_commit_and_ack_config("NUMCH", "2", recorder_is_active());
+		s_last_cmd_status = console_commit_and_ack_config("NUMCH", "2", recorder_is_active());
 		return;
 	}
 	if (val != 1) {
-		printk("\nInvalid value %s\n", p_args);
+		printk("\nInvalid value %.*s\n", (int)args_length, p_args);
 		printk("\nValue is set to %u\n", g_cfg.num_audio_channels);
+		s_last_cmd_status = -EINVAL;
 		return;
 	}
 	g_cfg.num_audio_channels = 1;
@@ -709,7 +815,7 @@ static void handle_numch(const char *p_args, size_t args_length)
 	}
 	printk("\nValue is set to 1\n");
 	printk("\nSend APPLY command and reboot for changes to take effect\n");
-	console_commit_and_ack_config("NUMCH", "1", recorder_is_active());
+	s_last_cmd_status = console_commit_and_ack_config("NUMCH", "1", recorder_is_active());
 }
 
 #if defined(CONFIG_WILDSONIC_VERBOSE_LOGS)
@@ -748,6 +854,7 @@ static void handle_audio(const char *p_args, size_t args_length)
 		printk("\nNumber of channels set to %u\n", g_cfg.num_audio_channels);
 		printk("Sampling frequency set to %u\n", g_cfg.sampling_rate);
 		printk("Bits per sample set to %u\n", g_cfg.audio_sampling_width);
+		s_last_cmd_status = 0;
 		return;
 	}
 
@@ -784,9 +891,13 @@ static void handle_audio(const char *p_args, size_t args_length)
 				main_apply_dsp_settings();
 			}
 
-			if (old_samf != new_samf && g_cfg.upper_cutoff_frequency == (old_samf / 2)) {
-				g_cfg.upper_cutoff_frequency = new_samf / 2;
-				settings->lpf_cutoff_hz = new_samf / 2;
+			if ((old_samf != new_samf && g_cfg.upper_cutoff_frequency == (old_samf / 2)) ||
+			    g_cfg.upper_cutoff_frequency >= ((new_samf * 49) / 100)) {
+				uint32_t safe_cutoff = dsp_validate_lpf_cutoff(new_samf, (new_samf * 45) / 100);
+				g_cfg.upper_cutoff_frequency = safe_cutoff;
+				if (settings) {
+					settings->lpf_cutoff_hz = safe_cutoff;
+				}
 				if (!recorder_is_active()) {
 					main_apply_dsp_settings();
 				}
@@ -797,6 +908,7 @@ static void handle_audio(const char *p_args, size_t args_length)
 			printk("Sampling frequency set to %u\n", g_cfg.sampling_rate);
 			printk("Bits per sample set to %u\n", g_cfg.audio_sampling_width);
 			printk("\nSend APPLY command and reboot for changes to take effect\n");
+			s_last_cmd_status = 0;
 			return;
 		}
 	}
@@ -805,6 +917,7 @@ static void handle_audio(const char *p_args, size_t args_length)
 	printk("\nNumber of channels set to %u\n", g_cfg.num_audio_channels);
 	printk("Sampling frequency set to %u\n", g_cfg.sampling_rate);
 	printk("Bits per sample set to %u\n", g_cfg.audio_sampling_width);
+	s_last_cmd_status = -EINVAL;
 }
 
 /* RECT handler */
@@ -814,22 +927,26 @@ static void handle_rect(const char *p_args, size_t args_length)
 
 	if (args_length == 0) {
 		printk("\nValue is set to %u\n", g_cfg.recording_length);
+		s_last_cmd_status = 0;
 		return;
 	}
 
-	long val = strtol(p_args, NULL, 10);
-	if (val <= 0 || val > 86400) {
-		printk("\nInvalid value %s\n", p_args);
+	uint32_t val = 0;
+	if (parse_strict_u32(p_args, args_length, &val) != 0 || val == 0 || val > 86400) {
+		printk("\nInvalid value %.*s\n", (int)args_length, p_args);
 		printk("\nValue is set to %u\n", g_cfg.recording_length);
+		s_last_cmd_status = -EINVAL;
 		return;
 	}
 
-	g_cfg.recording_length = (uint32_t)val;
-	settings->record_seconds = (uint32_t)val;
+	g_cfg.recording_length = val;
+	if (settings) {
+		settings->record_seconds = val;
+	}
 
 	struct schedule_config scfg;
 	scheduler_get_config(&scfg);
-	scfg.record_length = (uint32_t)val;
+	scfg.record_length = val;
 	scheduler_set_config(&scfg);
 	main_scheduler_resume();
 
@@ -837,7 +954,7 @@ static void handle_rect(const char *p_args, size_t args_length)
 	printk("\nSend APPLY command and reboot for changes to take effect\n");
 	char rect_str[16];
 	snprintf(rect_str, sizeof(rect_str), "%u", g_cfg.recording_length);
-	console_commit_and_ack_config("RECT", rect_str, recorder_is_active());
+	s_last_cmd_status = console_commit_and_ack_config("RECT", rect_str, recorder_is_active());
 }
 
 /* SLEEP handler
@@ -851,24 +968,29 @@ static void handle_sleep(const char *p_args, size_t args_length)
 
 	if (args_length == 0) {
 		printk("\nValue is set to %u\n", g_cfg.sleep_pause_interval);
+		s_last_cmd_status = 0;
 		return;
 	}
 
 	if (p_args[0] == '-') {
 		printk("\nInvalid value: negative values are not allowed\n");
 		printk("\nValue is set to %u\n", g_cfg.sleep_pause_interval);
+		s_last_cmd_status = -EINVAL;
 		return;
 	}
 
-	long val = strtol(p_args, NULL, 10);
-	if (val < 0 || val > 86400) {
-		printk("\nInvalid value %s\n", p_args);
+	uint32_t val = 0;
+	if (parse_strict_u32(p_args, args_length, &val) != 0 || val > 86400) {
+		printk("\nInvalid value %.*s\n", (int)args_length, p_args);
 		printk("\nValue is set to %u\n", g_cfg.sleep_pause_interval);
+		s_last_cmd_status = -EINVAL;
 		return;
 	}
 
-	g_cfg.sleep_pause_interval = (uint32_t)val;
-	settings->sleep_seconds = (uint32_t)val;
+	g_cfg.sleep_pause_interval = val;
+	if (settings) {
+		settings->sleep_seconds = val;
+	}
 
 	struct schedule_config scfg;
 	scheduler_get_config(&scfg);
@@ -880,7 +1002,7 @@ static void handle_sleep(const char *p_args, size_t args_length)
 	printk("\nSend APPLY command and reboot for changes to take effect\n");
 	char sleep_str[16];
 	snprintf(sleep_str, sizeof(sleep_str), "%u", g_cfg.sleep_pause_interval);
-	console_commit_and_ack_config("SLEEP", sleep_str, recorder_is_active());
+	s_last_cmd_status = console_commit_and_ack_config("SLEEP", sleep_str, recorder_is_active());
 }
 
 /* DATETIME handler */
@@ -903,6 +1025,7 @@ static void handle_datetime(const char *p_args, size_t args_length)
 		console_printf_time("\nBoot time Local set to ", boot_utc, scfg.time_zone_offset, "\n");
 		console_printf_time("\nCurrent time UTC time is ", cur_utc, 0, "\n");
 		console_printf_time("\nCurrent time Local is ", cur_utc, scfg.time_zone_offset, "\n");
+		s_last_cmd_status = 0;
 		return;
 	}
 
@@ -915,6 +1038,7 @@ static void handle_datetime(const char *p_args, size_t args_length)
 		if (tokens == 1 && (tz_token[0] == '+' || tz_token[0] == '-' || isdigit((unsigned char)tz_token[0]))) {
 			if (scheduler_parse_timezone(tz_token, &tz_off) != 0) {
 				printk("\nInvalid time zone %s\n", tz_token);
+				s_last_cmd_status = -EINVAL;
 				return;
 			}
 		}
@@ -930,6 +1054,7 @@ static void handle_datetime(const char *p_args, size_t args_length)
 		int set_res = rtc_calendar_set(&new_utc);
 		if (set_res != 0) {
 			printk("\n[ERROR] Failed to set RTC hardware calendar (%d)\n", set_res);
+			s_last_cmd_status = set_res;
 			return;
 		}
 		g_cfg.boot_time_utc = utc_epoch;
@@ -940,10 +1065,12 @@ static void handle_datetime(const char *p_args, size_t args_length)
 		console_printf_time("\nCurrent time Local is ", utc_epoch, scfg.time_zone_offset, "\n");
 		main_scheduler_resume();
 		printk("\nSend APPLY command and reboot for changes to take effect\n");
+		s_last_cmd_status = 0;
 		return;
 	}
 
-	printk("\nInvalid date time %s\nUTC Time Format should be YYYY-MM-DD HH:MM:SS\n", p_args);
+	printk("\nInvalid date time %.*s\nUTC Time Format should be YYYY-MM-DD HH:MM:SS\n", (int)args_length, p_args);
+	s_last_cmd_status = -EINVAL;
 }
 
 /* TIMEZONE handler */
@@ -958,21 +1085,24 @@ static void handle_timezone(const char *p_args, size_t args_length)
 		uint32_t tz_hr = (uint32_t)(abs_off / 3600);
 		uint32_t tz_min = (uint32_t)((abs_off % 3600) / 60);
 		printk("\nTime zone is set to %c%02u:%02u\n", sign, tz_hr, tz_min);
+		s_last_cmd_status = 0;
 		return;
 	}
 
 	int32_t offset = 0;
 	if (scheduler_parse_timezone(p_args, &offset) == 0) {
 		scfg.time_zone_offset = offset;
+		g_cfg.time_zone_offset = offset;
 		scheduler_set_config(&scfg);
 		main_scheduler_resume();
-		printk("\nTime zone set to %s\n", p_args);
+		printk("\nTime zone set to %.*s\n", (int)args_length, p_args);
 		printk("\nSend APPLY command and reboot for changes to take effect\n");
-		console_commit_and_ack_config("TIMEZONE", p_args, recorder_is_active());
+		s_last_cmd_status = console_commit_and_ack_config("TIMEZONE", p_args, recorder_is_active());
 		return;
 	}
 
-	printk("\nInvalid time zone argument %s\n", p_args);
+	printk("\nInvalid time zone argument %.*s\n", (int)args_length, p_args);
+	s_last_cmd_status = -EINVAL;
 }
 
 /* DATERANGE handler */
@@ -985,6 +1115,7 @@ static void handle_daterange(const char *p_args, size_t args_length)
 		printk("\nBegin end date set to %04u/%02u/%02u-%04u/%02u/%02u\n",
 		       scfg.start_date.year, scfg.start_date.month, scfg.start_date.day,
 		       scfg.end_date.year, scfg.end_date.month, scfg.end_date.day);
+		s_last_cmd_status = 0;
 		return;
 	}
 
@@ -998,14 +1129,15 @@ static void handle_daterange(const char *p_args, size_t args_length)
 		       scfg.start_date.year, scfg.start_date.month, scfg.start_date.day,
 		       scfg.end_date.year, scfg.end_date.month, scfg.end_date.day);
 		printk("\nSend APPLY command and reboot for changes to take effect\n");
-		console_commit_and_ack_config("DATERANGE", p_args, recorder_is_active());
+		s_last_cmd_status = console_commit_and_ack_config("DATERANGE", p_args, recorder_is_active());
 		return;
 	}
 
-	printk("\nInvalid begin end date %s\n", p_args);
+	printk("\nInvalid begin end date %.*s\n", (int)args_length, p_args);
 	printk("\nBegin end date set to %04u/%02u/%02u-%04u/%02u/%02u\n",
 	       scfg.start_date.year, scfg.start_date.month, scfg.start_date.day,
 	       scfg.end_date.year, scfg.end_date.month, scfg.end_date.day);
+	s_last_cmd_status = -EINVAL;
 }
 
 /* TIMEOFDAY handler */
@@ -1032,6 +1164,7 @@ static void handle_timeofday(const char *p_args, size_t args_length)
 		if (valid_cnt == 0) {
 			printk("\nNo valid time of day ranges set\n");
 		}
+		s_last_cmd_status = 0;
 		return;
 	}
 
@@ -1061,11 +1194,12 @@ static void handle_timeofday(const char *p_args, size_t args_length)
 			}
 		}
 		printk("\nSend APPLY command and reboot for changes to take effect\n");
-		console_commit_and_ack_config("TIMEOFDAY", p_args, recorder_is_active());
+		s_last_cmd_status = console_commit_and_ack_config("TIMEOFDAY", p_args, recorder_is_active());
 		return;
 	}
 
-	printk("\nInvalid begin end time %s\n", p_args);
+	printk("\nInvalid begin end time %.*s\n", (int)args_length, p_args);
+	s_last_cmd_status = -EINVAL;
 }
 
 /* DAYSOFWEEK handler */
@@ -1084,6 +1218,7 @@ static void handle_daysofweek(const char *p_args, size_t args_length)
 		if (scfg.day_of_week_mask & 0x20) printk("S");
 		if (scfg.day_of_week_mask & 0x40) printk("U");
 		printk("\"\n");
+		s_last_cmd_status = 0;
 		return;
 	}
 
@@ -1108,11 +1243,12 @@ static void handle_daysofweek(const char *p_args, size_t args_length)
 		if (scfg.day_of_week_mask & 0x40) printk("U");
 		printk("\"\n");
 		printk("\nSend APPLY command and reboot for changes to take effect\n");
-		console_commit_and_ack_config("DAYSOFWEEK", p_args, recorder_is_active());
+		s_last_cmd_status = console_commit_and_ack_config("DAYSOFWEEK", p_args, recorder_is_active());
 		return;
 	}
 
-	printk("\nInvalid days of week %s\n", p_args);
+	printk("\nInvalid days of week %.*s\n", (int)args_length, p_args);
+	s_last_cmd_status = -EINVAL;
 }
 
 /* GAIN handler */
@@ -1122,26 +1258,62 @@ static void handle_gain(const char *p_args, size_t args_length)
 
 	if (args_length == 0) {
 		printk("\nAudio gain set to 0.1*%d\n", g_cfg.mic_gain_times_ten);
+		s_last_cmd_status = 0;
+		return;
+	}
+
+	/* Trim */
+	const char *str = p_args;
+	size_t len = args_length;
+	while (len > 0 && isspace((unsigned char)*str)) {
+		str++;
+		len--;
+	}
+	while (len > 0 && isspace((unsigned char)str[len - 1])) {
+		len--;
+	}
+	if (len == 0) {
+		s_last_cmd_status = -EINVAL;
 		return;
 	}
 
 	int sign = 1;
 	size_t off = 0;
-	if (p_args[0] == 'N' || p_args[0] == '-') {
+	if (str[0] == 'N' || str[0] == '-') {
 		sign = -1;
 		off = 1;
 	}
-	float val = (float)strtod(&p_args[off], NULL);
-	int gain_t10 = (int)roundf(sign * val * 10.0f);
 
+	char buf[32];
+	if (len >= sizeof(buf)) {
+		s_last_cmd_status = -EINVAL;
+		return;
+	}
+	memcpy(buf, str, len);
+	buf[len] = '\0';
+
+	char *endptr = NULL;
+	errno = 0;
+	double val = strtod(&buf[off], &endptr);
+	if (endptr == &buf[off] || *endptr != '\0' || errno == ERANGE) {
+		printk("\nInvalid audio gain %.*s\n", (int)args_length, p_args);
+		printk("\nAudio gain set to 0.1*%d\n", g_cfg.mic_gain_times_ten);
+		s_last_cmd_status = -EINVAL;
+		return;
+	}
+
+	int gain_t10 = (int)roundf((float)(sign * val * 10.0));
 	if (gain_t10 < -400 || gain_t10 > 400) {
 		printk("\nInvalid audio gain 0.1*%d\n", gain_t10);
 		printk("\nAudio gain set to 0.1*%d\n", g_cfg.mic_gain_times_ten);
+		s_last_cmd_status = -EINVAL;
 		return;
 	}
 
 	g_cfg.mic_gain_times_ten = gain_t10;
-	settings->digital_gain = powf(10.0f, ((float)gain_t10 / 10.0f) / 20.0f);
+	if (settings) {
+		settings->digital_gain = powf(10.0f, ((float)gain_t10 / 10.0f) / 20.0f);
+	}
 	if (!recorder_is_active()) {
 		main_apply_dsp_settings();
 	}
@@ -1150,7 +1322,7 @@ static void handle_gain(const char *p_args, size_t args_length)
 	printk("\nSend APPLY command and reboot for changes to take effect\n");
 	char gain_str[16];
 	snprintf(gain_str, sizeof(gain_str), "0.1*%d", gain_t10);
-	console_commit_and_ack_config("GAIN", gain_str, recorder_is_active());
+	s_last_cmd_status = console_commit_and_ack_config("GAIN", gain_str, recorder_is_active());
 }
 
 /* LCUTOFF (HPF) handler */
@@ -1160,28 +1332,32 @@ static void handle_lcutoff(const char *p_args, size_t args_length)
 
 	if (args_length == 0) {
 		printk("\nValue is set to %u\n", g_cfg.lower_cutoff_frequency);
+		s_last_cmd_status = 0;
 		return;
 	}
 
-	int hz = atoi(p_args);
-	if (hz != 0 && (hz < 10 || hz > 2000)) {
-		printk("\nInvalid value %s\n", p_args);
+	uint32_t hz = 0;
+	if (parse_strict_u32(p_args, args_length, &hz) != 0 || (hz != 0 && (hz < 10 || hz > 2000))) {
+		printk("\nInvalid value %.*s\n", (int)args_length, p_args);
 		printk("\nValue is set to %u\n", g_cfg.lower_cutoff_frequency);
+		s_last_cmd_status = -EINVAL;
 		return;
 	}
 
-	g_cfg.lower_cutoff_frequency = (uint32_t)hz;
-	settings->hpf_cutoff_hz = (uint32_t)hz;
-	settings->hpf_enabled = (hz > 0);
+	g_cfg.lower_cutoff_frequency = hz;
+	if (settings) {
+		settings->hpf_cutoff_hz = hz;
+		settings->hpf_enabled = (hz > 0);
+	}
 	if (!recorder_is_active()) {
 		main_apply_dsp_settings();
 	}
 
-	printk("\nValue is set to %u\n", (uint32_t)hz);
+	printk("\nValue is set to %u\n", hz);
 	printk("\nSend APPLY command and reboot for changes to take effect\n");
 	char lcut_str[16];
-	snprintf(lcut_str, sizeof(lcut_str), "%u", (uint32_t)hz);
-	console_commit_and_ack_config("LCUTOFF", lcut_str, recorder_is_active());
+	snprintf(lcut_str, sizeof(lcut_str), "%u", hz);
+	s_last_cmd_status = console_commit_and_ack_config("LCUTOFF", lcut_str, recorder_is_active());
 }
 
 /* UCUTOFF (LPF) handler */
@@ -1191,28 +1367,33 @@ static void handle_ucutoff(const char *p_args, size_t args_length)
 
 	if (args_length == 0) {
 		printk("\nValue is set to %u\n", g_cfg.upper_cutoff_frequency);
+		s_last_cmd_status = 0;
 		return;
 	}
 
-	int hz = atoi(p_args);
-	if (hz != 0 && (hz < 1000 || (uint32_t)hz > g_cfg.sampling_rate / 2)) {
-		printk("\nInvalid value %s\n", p_args);
+	uint32_t hz = 0;
+	uint32_t nyquist_bound = (g_cfg.sampling_rate * 49) / 100;
+	if (parse_strict_u32(p_args, args_length, &hz) != 0 || (hz != 0 && (hz < 1000 || hz >= nyquist_bound))) {
+		printk("\nInvalid value %.*s\n", (int)args_length, p_args);
 		printk("\nValue is set to %u\n", g_cfg.upper_cutoff_frequency);
+		s_last_cmd_status = -EINVAL;
 		return;
 	}
 
-	g_cfg.upper_cutoff_frequency = (uint32_t)hz;
-	settings->lpf_cutoff_hz = (uint32_t)hz;
-	settings->lpf_enabled = (hz > 0);
+	g_cfg.upper_cutoff_frequency = hz;
+	if (settings) {
+		settings->lpf_cutoff_hz = hz;
+		settings->lpf_enabled = (hz > 0);
+	}
 	if (!recorder_is_active()) {
 		main_apply_dsp_settings();
 	}
 
-	printk("\nValue is set to %u\n", (uint32_t)hz);
+	printk("\nValue is set to %u\n", hz);
 	printk("\nSend APPLY command and reboot for changes to take effect\n");
 	char ucut_str[16];
-	snprintf(ucut_str, sizeof(ucut_str), "%u", (uint32_t)hz);
-	console_commit_and_ack_config("UCUTOFF", ucut_str, recorder_is_active());
+	snprintf(ucut_str, sizeof(ucut_str), "%u", hz);
+	s_last_cmd_status = console_commit_and_ack_config("UCUTOFF", ucut_str, recorder_is_active());
 }
 
 /* FLDR handler */
@@ -1222,17 +1403,31 @@ static void handle_fldr(const char *p_args, size_t args_length)
 		const char *mode_str = (g_cfg.folder_structure == 0) ? "flat" :
 				       ((g_cfg.folder_structure == 1) ? "daily" : "hourly");
 		printk("\nValue is set to %s\n", mode_str);
+		s_last_cmd_status = 0;
 		return;
 	}
 
-	if (strcasecmp(p_args, "flat") == 0) {
+	char buf[32];
+	if (args_length >= sizeof(buf)) {
+		s_last_cmd_status = -EINVAL;
+		return;
+	}
+	memcpy(buf, p_args, args_length);
+	buf[args_length] = '\0';
+	char *str = buf;
+	while (*str && isspace((unsigned char)*str)) str++;
+	size_t slen = strlen(str);
+	while (slen > 0 && isspace((unsigned char)str[slen - 1])) str[--slen] = '\0';
+
+	if (strcasecmp(str, "flat") == 0) {
 		g_cfg.folder_structure = 0;
-	} else if (strcasecmp(p_args, "daily") == 0 || strcasecmp(p_args, "day") == 0) {
+	} else if (strcasecmp(str, "daily") == 0 || strcasecmp(str, "day") == 0) {
 		g_cfg.folder_structure = 1;
-	} else if (strcasecmp(p_args, "hourly") == 0 || strcasecmp(p_args, "hour") == 0) {
+	} else if (strcasecmp(str, "hourly") == 0 || strcasecmp(str, "hour") == 0) {
 		g_cfg.folder_structure = 2;
 	} else {
-		printk("\nInvalid value %s\n", p_args);
+		printk("\nInvalid value %s\n", str);
+		s_last_cmd_status = -EINVAL;
 		return;
 	}
 
@@ -1240,7 +1435,7 @@ static void handle_fldr(const char *p_args, size_t args_length)
 			       ((g_cfg.folder_structure == 1) ? "daily" : "hourly");
 	printk("\nValue is set to %s\n", mode_str);
 	printk("\nSend APPLY command and reboot for changes to take effect\n");
-	console_commit_and_ack_config("FLDR", mode_str, recorder_is_active());
+	s_last_cmd_status = console_commit_and_ack_config("FLDR", mode_str, recorder_is_active());
 }
 
 /* STOR handler */
@@ -1330,24 +1525,24 @@ static int handle_dname(const char *p_args, size_t args_length)
 }
 
 /* PW handler */
-static void handle_pw(const char *p_args, size_t args_length)
+static int handle_pw(const char *p_args, size_t args_length)
 {
 	if (args_length == 0) {
 		printk("\nValue is set to %s\n", g_cfg.device_password);
-		return;
+		return 0;
 	}
 
 	if (args_length >= sizeof(g_cfg.device_password)) {
-		printk("\nInvalid value %s\n", p_args);
+		printk("\nInvalid value %.*s\n", (int)args_length, p_args);
 		printk("\nValue is set to %s\n", g_cfg.device_password);
-		return;
+		return -EINVAL;
 	}
 
 	strncpy(g_cfg.device_password, p_args, sizeof(g_cfg.device_password) - 1);
 	g_cfg.device_password[sizeof(g_cfg.device_password) - 1] = '\0';
 	printk("\nValue is set to %s\n", g_cfg.device_password);
 	printk("\nSend APPLY command and reboot for changes to take effect\n");
-	console_commit_and_ack_config("PW", g_cfg.device_password, recorder_is_active());
+	return console_commit_and_ack_config("PW", g_cfg.device_password, recorder_is_active());
 }
 
 struct wildsonic_assert_record g_assert_info = {
@@ -1499,14 +1694,30 @@ static void handle_apply(void)
 {
 	if (recorder_is_active()) {
 		printk("\nBUSY: Cannot commit to flash while recording is active. Send STOP_RECORDING first.\n");
+		if (s_current_out_resp && s_current_out_resp_size > 0) {
+			snprintf(s_current_out_resp, s_current_out_resp_size, "BUSY: Cannot commit to flash while recording is active");
+		}
+		s_last_cmd_status = -EBUSY;
 		return;
 	}
 	g_cfg.save_config_flag = true;
-	config_store_save();
+	int save_rc = config_store_save();
+	if (save_rc != 0) {
+		LOG_ERR("Failed to persist config to flash (%d)", save_rc);
+		if (s_current_out_resp && s_current_out_resp_size > 0) {
+			snprintf(s_current_out_resp, s_current_out_resp_size, "[ERROR] Flash save failed (%d)", save_rc);
+		}
+		s_last_cmd_status = save_rc;
+		return;
+	}
 	/* Canonical Maxim notification: */
 	printk("\nDevice configuration is applied after reboot.\n");
+	if (s_current_out_resp && s_current_out_resp_size > 0) {
+		snprintf(s_current_out_resp, s_current_out_resp_size, "Device configuration is applied after reboot.");
+	}
 	/* Historical compatibility note for test harnesses: Flash persistence not implemented in legacy stubs */
 	main_scheduler_resume();
+	s_last_cmd_status = 0;
 }
 
 /* RBT handler */
@@ -1519,6 +1730,7 @@ static void handle_rbt(void)
 		if (s_current_out_resp && s_current_out_resp_size > 0) {
 			snprintf(s_current_out_resp, s_current_out_resp_size, "[ACK] RBT: Reboot already pending");
 		}
+		s_last_cmd_status = 0;
 		return;
 	}
 
@@ -1532,9 +1744,6 @@ static void handle_rbt(void)
 #endif
 	if (s_current_out_resp && s_current_out_resp_size > 0) {
 		snprintf(s_current_out_resp, s_current_out_resp_size, "[ACK] RBT: Controlled reboot initiated");
-	}
-	if (s_from_ble) {
-		ble_comm_printf("[ACK] RBT: Controlled reboot initiated\r\n");
 	}
 
 	if (recorder_is_active()) {
@@ -1551,6 +1760,7 @@ static void handle_rbt(void)
 			if (s_current_out_resp && s_current_out_resp_size > 0) {
 				snprintf(s_current_out_resp, s_current_out_resp_size, "[ERROR] Storage shutdown timeout (%d)", wait_rc);
 			}
+			s_last_cmd_status = -ETIMEDOUT;
 			return;
 		}
 	}
@@ -1562,6 +1772,7 @@ static void handle_rbt(void)
 		if (s_current_out_resp && s_current_out_resp_size > 0) {
 			snprintf(s_current_out_resp, s_current_out_resp_size, "[ERROR] Storage resources still active");
 		}
+		s_last_cmd_status = -EBUSY;
 		return;
 	}
 
@@ -1584,6 +1795,7 @@ static void handle_rbt(void)
 #if defined(CONFIG_REBOOT)
 	sys_reboot(SYS_REBOOT_COLD);
 #endif
+	s_last_cmd_status = 0;
 }
 
 /* ARBT handler */
@@ -1596,6 +1808,7 @@ static void handle_arbt(void)
 		if (s_current_out_resp && s_current_out_resp_size > 0) {
 			snprintf(s_current_out_resp, s_current_out_resp_size, "[ACK] ARBT: Reboot already pending");
 		}
+		s_last_cmd_status = 0;
 		return;
 	}
 
@@ -1610,9 +1823,6 @@ static void handle_arbt(void)
 #endif
 	if (s_current_out_resp && s_current_out_resp_size > 0) {
 		snprintf(s_current_out_resp, s_current_out_resp_size, "[ACK] ARBT: Controlled reboot initiated");
-	}
-	if (s_from_ble) {
-		ble_comm_printf("[ACK] ARBT: Controlled reboot initiated\r\n");
 	}
 
 	/* If recording is active, request orderly stop and wait for clean drain */
@@ -1630,6 +1840,7 @@ static void handle_arbt(void)
 			if (s_current_out_resp && s_current_out_resp_size > 0) {
 				snprintf(s_current_out_resp, s_current_out_resp_size, "[ERROR] Storage shutdown timeout (%d)", wait_rc);
 			}
+			s_last_cmd_status = -ETIMEDOUT;
 			return;
 		}
 	}
@@ -1641,6 +1852,7 @@ static void handle_arbt(void)
 		if (s_current_out_resp && s_current_out_resp_size > 0) {
 			snprintf(s_current_out_resp, s_current_out_resp_size, "[ERROR] Storage resources still active");
 		}
+		s_last_cmd_status = -EBUSY;
 		return;
 	}
 
@@ -1661,6 +1873,7 @@ static void handle_arbt(void)
 		if (s_current_out_resp && s_current_out_resp_size > 0) {
 			snprintf(s_current_out_resp, s_current_out_resp_size, "[ERROR] Flash save failed (%d)", save_rc);
 		}
+		s_last_cmd_status = save_rc;
 		return;
 	}
 #if defined(CONFIG_WILDSONIC_VERBOSE_LOGS)
@@ -1676,6 +1889,7 @@ static void handle_arbt(void)
 #if defined(CONFIG_REBOOT)
 	sys_reboot(SYS_REBOOT_COLD);
 #endif
+	s_last_cmd_status = 0;
 }
 
 /* SDFMT handler */
@@ -1716,7 +1930,7 @@ void console_init(void)
 	}
 }
 
-/* Process incoming command line */
+/* Command dispatcher - Process incoming command line */
 static int console_process_line_internal(char *cmd_line, bool from_ble, char *out_resp, size_t out_resp_size)
 {
 	if (!cmd_line) return -EINVAL;
@@ -1745,13 +1959,23 @@ static int console_process_line_internal(char *cmd_line, bool from_ble, char *ou
 	if (strncasecmp(p, "BITS", 4) == 0 && (p[4] == ' ' || p[4] == '\0' || p[4] == '=')) {
 		const char *arg = p + 4;
 		while (*arg == ' ' || *arg == '=') arg++;
+		s_last_cmd_status = 0;
 		handle_btps(arg, strlen(arg));
+		if (s_last_cmd_status != 0) return s_last_cmd_status;
+		if (out_resp && out_resp_size > 0 && out_resp[0] == '\0') {
+			snprintf(out_resp, out_resp_size, "OK");
+		}
 		return 0;
 	}
 	if (strncasecmp(p, "CHANNELS", 8) == 0 && (p[8] == ' ' || p[8] == '\0' || p[8] == '=')) {
 		const char *arg = p + 8;
 		while (*arg == ' ' || *arg == '=') arg++;
+		s_last_cmd_status = 0;
 		handle_numch(arg, strlen(arg));
+		if (s_last_cmd_status != 0) return s_last_cmd_status;
+		if (out_resp && out_resp_size > 0 && out_resp[0] == '\0') {
+			snprintf(out_resp, out_resp_size, "OK");
+		}
 		return 0;
 	}
 #if defined(CONFIG_WILDSONIC_VERBOSE_LOGS)
@@ -1759,6 +1983,10 @@ static int console_process_line_internal(char *cmd_line, bool from_ble, char *ou
 		const char *arg = p + 6;
 		while (*arg == ' ' || *arg == '=') arg++;
 		handle_source(arg, strlen(arg));
+		return 0;
+	}
+	if (strcasecmp(p, "SDBENCH") == 0 || strcasecmp(p, "SD_BENCH") == 0) {
+		sd_benchmark_run_matrix();
 		return 0;
 	}
 #endif
@@ -1790,17 +2018,21 @@ static int console_process_line_internal(char *cmd_line, bool from_ble, char *ou
 
 	const char *p_args = &p[arg_offset];
 	size_t args_len = (len >= arg_offset) ? (len - arg_offset) : 0;
+	int handler_rc = 0;
+	s_last_cmd_status = 0;
 
 	switch (cmd_id) {
 	case CMD_HELP:
 		display_console_help();
 		break;
 	case CMD_SERIAL_NUMBER:
-		return handle_sn(p_args, args_len);
+		handler_rc = handle_sn(p_args, args_len);
+		break;
 	case CMD_DEVICE_NAME:
-		return handle_dname(p_args, args_len);
+		handler_rc = handle_dname(p_args, args_len);
+		break;
 	case CMD_PASSWORD:
-		handle_pw(p_args, args_len);
+		handler_rc = handle_pw(p_args, args_len);
 		break;
 	case CMD_SMS_KEYWORD:
 		report_deferred_hardware("SMSKW");
@@ -2010,6 +2242,13 @@ static int console_process_line_internal(char *cmd_line, bool from_ble, char *ou
 			display_console_commands();
 		}
 		return -EINVAL;
+	}
+
+	if (handler_rc != 0) {
+		return handler_rc;
+	}
+	if (s_last_cmd_status != 0) {
+		return s_last_cmd_status;
 	}
 
 	if (out_resp && out_resp_size > 0 && out_resp[0] == '\0') {

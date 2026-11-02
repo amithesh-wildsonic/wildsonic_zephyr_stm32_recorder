@@ -6,6 +6,7 @@
 #include "ble_comm.h"
 #include <zephyr/kernel.h>
 #include <zephyr/logging/log.h>
+#include <zephyr/logging/log_ctrl.h>
 #include <zephyr/drivers/timer/system_timer.h>
 
 #if defined(CONFIG_WILDSONIC_VERBOSE_LOGS)
@@ -67,6 +68,11 @@ static void rtc_wkup_isr(const void *arg)
 	/* Clear EXTI Line 20 pending bit */
 	LL_EXTI_ClearFlag_0_31(LL_EXTI_LINE_20);
 
+	if (!rtc_timer_active) {
+		/* Unexpected or stale wake event (e.g. from prior boot): do not notify scheduler */
+		return;
+	}
+
 	rtc_timer_active = false;
 	last_wake_source = RTC_WAKE_TIMER;
 	k_sem_give(&rtc_wake_sem);
@@ -87,6 +93,26 @@ int rtc_sleep_init(void)
 	/* Enable Power Controller clock and Backup Domain write access */
 	LL_APB1_GRP1_EnableClock(LL_APB1_GRP1_PERIPH_PWR);
 	LL_PWR_EnableBkUpAccess();
+
+	/* Startup cleanup of any previously armed RTC wakeup timer from prior boot/reset */
+	LL_RTC_DisableWriteProtection(RTC);
+	if (LL_RTC_WAKEUP_IsEnabled(RTC)) {
+		LL_RTC_WAKEUP_Disable(RTC);
+	}
+	LL_RTC_DisableIT_WUT(RTC);
+
+	uint32_t wutwf_to = 10000;
+	while (!LL_RTC_IsActiveFlag_WUTW(RTC) && --wutwf_to) {
+		k_busy_wait(10);
+	}
+	LL_RTC_ClearFlag_WUT(RTC);
+	LL_RTC_EnableWriteProtection(RTC);
+
+	LL_EXTI_ClearFlag_0_31(LL_EXTI_LINE_20);
+	NVIC_ClearPendingIRQ(RTC_WKUP_IRQn);
+	k_sem_reset(&rtc_wake_sem);
+	rtc_timer_active = false;
+	last_wake_source = RTC_WAKE_NONE;
 
 	/* Enable RTC clock source if not already running */
 	if (!LL_RCC_IsEnabledRTC()) {
@@ -225,6 +251,8 @@ int rtc_sleep_arm(uint32_t seconds)
 
 	/* Clear pending flags */
 	LL_RTC_ClearFlag_WUT(RTC);
+	LL_EXTI_EnableIT_0_31(LL_EXTI_LINE_20);
+	LL_EXTI_EnableRisingTrig_0_31(LL_EXTI_LINE_20);
 	LL_EXTI_ClearFlag_0_31(LL_EXTI_LINE_20);
 
 	/* Enable Wakeup Timer interrupt and timer itself */
@@ -241,6 +269,9 @@ int rtc_sleep_arm(uint32_t seconds)
 	}
 
 	rtc_timer_active = true;
+#if defined(CONFIG_WILDSONIC_VERBOSE_LOGS)
+	printk("[TEST] RTC_WUT_ARMED: duration=%u s\n", seconds);
+#endif
 	return 0;
 }
 
@@ -354,8 +385,8 @@ int rtc_sleep_enter_stop2(uint32_t seconds)
 	EXTI->EMR1 = 0;
 	EXTI->IMR2 = 0;
 	EXTI->EMR2 = 0;
-	EXTI->PR1 = 0xFFFFFFFF;
-	EXTI->PR2 = 0xFFFFFFFF;
+	LL_EXTI_EnableRisingTrig_0_31(LL_EXTI_LINE_20);
+	LL_EXTI_ClearFlag_0_31(LL_EXTI_LINE_20);
 
 	/* Save active NVIC interrupt enable configuration */
 	uint32_t saved_nvic_iser[3];
@@ -363,23 +394,26 @@ int rtc_sleep_enter_stop2(uint32_t seconds)
 	saved_nvic_iser[1] = NVIC->ISER[1];
 	saved_nvic_iser[2] = NVIC->ISER[2];
 
-	/* Disable all NVIC interrupts except RTC_WKUP_IRQn (IRQ 3) */
+	/* Disable other NVIC interrupts during WFI except RTC_WKUP_IRQn (IRQ 3) */
 	NVIC->ICER[0] = 0xFFFFFFFF & ~(1UL << (RTC_WKUP_IRQn & 0x1F));
 	NVIC->ICER[1] = 0xFFFFFFFF;
 	NVIC->ICER[2] = 0xFFFFFFFF;
 
 	NVIC->ISER[0] = (1UL << (RTC_WKUP_IRQn & 0x1F));
 
-	/* Clear all pending NVIC flags */
-	NVIC->ICPR[0] = 0xFFFFFFFF;
-	NVIC->ICPR[1] = 0xFFFFFFFF;
-	NVIC->ICPR[2] = 0xFFFFFFFF;
+	/* Target only RTC_WKUP_IRQn pending state; do not wipe unrelated peripheral events! */
+	NVIC_ClearPendingIRQ(RTC_WKUP_IRQn);
 
 	/* Suspend SysTick to prevent kernel tick interrupts during Stop 2 */
 	uint32_t saved_systick_ctrl = SysTick->CTRL;
 	SysTick->CTRL &= ~(SysTick_CTRL_ENABLE_Msk | SysTick_CTRL_TICKINT_Msk);
 	SCB->ICSR |= SCB_ICSR_PENDSTCLR_Msk;
 	SCB->ICSR |= SCB_ICSR_PENDSVCLR_Msk;
+
+	/* Prevent ST-Link/debugger disconnect and hardware NRST assert during Stop 2 */
+#if defined(DBGMCU_CR_DBG_STOP)
+	DBGMCU->CR |= DBGMCU_CR_DBG_STOP;
+#endif
 
 	/* Configure STM32L4 Power controller for Stop 2 Mode */
 	rtc_access_enable();
@@ -397,21 +431,26 @@ int rtc_sleep_enter_stop2(uint32_t seconds)
 	/* Enable Cortex-M4 Deep Sleep (sets SCB->SCR SLEEPDEEP bit) */
 	LL_LPM_EnableDeepSleep();
 
-	/* Clear pending flags immediately prior to entering Stop 2 */
-	rtc_write_protect_disable();
-	LL_RTC_ClearFlag_WUT(RTC);
-	rtc_write_protect_enable();
-	LL_EXTI_ClearFlag_0_31(LL_EXTI_LINE_20);
-	LL_EXTI_ClearFlag_0_31(LL_EXTI_LINE_13);
-	NVIC_ClearPendingIRQ(RTC_WKUP_IRQn);
-
 	/* Verify RTC Wakeup Timer is armed before WFI */
 	if (!LL_RTC_WAKEUP_IsEnabled(RTC)) {
+#if defined(CONFIG_WILDSONIC_VERBOSE_LOGS)
+		printk("[TEST] Sleep precondition failed: RTC Wakeup Timer not armed (CR=0x%08X)\n",
+		       (unsigned int)RTC->CR);
+#endif
 		LOG_ERR("Stop 2 aborted: RTC Wakeup Timer is not enabled");
 		LL_LPM_EnableSleep();
 		rtc_sleep_disarm();
 		return -EIO;
 	}
+
+#if defined(CONFIG_WILDSONIC_VERBOSE_LOGS)
+	printk("[TEST] STOP2_ENTERED\n");
+#endif
+	while (log_process()) {}
+#if defined(CONFIG_SOC_SERIES_STM32L4X)
+	/* Ensure all UART console bits are completely transmitted before clocks freeze in Stop 2 */
+	while (!LL_USART_IsActiveFlag_TC(USART2)) {}
+#endif
 
 	/*
 	 * =========================================================================
@@ -500,6 +539,17 @@ int rtc_sleep_enter_stop2(uint32_t seconds)
 	/* Restore console UART RX interrupts after Stop 2 wakeup */
 	console_async_resume();
 	ble_comm_resume();
+#if defined(CONFIG_WILDSONIC_VERBOSE_LOGS)
+	/* Emit wake milestones cleanly only after system clocks and UART are 100% operational */
+	printk("[TEST] STOP2_EXITED\n");
+	if (last_wake_source == RTC_WAKE_TIMER) {
+		printk("[TEST] RTC_WAKE_ISR\n");
+	}
+	if (clk_ret == 0 && LL_RCC_GetSysClkSource() == LL_RCC_SYS_CLKSOURCE_STATUS_PLL) {
+		printk("[TEST] CLOCKS_RESTORED\n");
+	}
+	printk("[TEST] UART_RESTORED\n");
+#endif
 
 	/* Disarm RTC Wakeup Timer and clear pending flags */
 	rtc_sleep_disarm();

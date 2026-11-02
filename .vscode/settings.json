@@ -1,4 +1,30 @@
 {
     "cmake.sourceDirectory": "${workspaceFolder}/app",
-    "terminal.integrated.stickyScroll.enabled": false
+    "terminal.integrated.stickyScroll.enabled": false,
+    "zephyr-workbench.build.configurations": [
+      {
+        "name": "TEST",
+        "board": "nucleo_l476rg",
+        "west-flags": [
+          "SD_BUS=sdmmc",
+          "EXTRA_CONF_FILE=test.conf"
+        ],
+        "env.EXTRA_CONF_FILE": [
+          "${workspaceFolder}/app/test.conf"
+        ],
+        "default-runner": "stm32cubeprogrammer"
+      },
+      {
+        "name": "PRODUCTION",
+        "board": "nucleo_l476rg",
+        "west-flags": [
+          "SD_BUS=sdmmc"
+        ],
+        "default-runner": "stm32cubeprogrammer"
+      }
+    ],
+    "zephyr-workbench.westWorkspace": "${workspaceFolder}/../../zephyrproject",
+    "zephyr-workbench.toolchain": "zephyr",
+    "zephyr-workbench.sdk": "global",
+    "zephyr-workbench.intellisense.provider": "cpptools"
 }

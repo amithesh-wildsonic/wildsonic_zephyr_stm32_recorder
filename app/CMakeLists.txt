@@ -45,5 +45,6 @@ else()
     src/scheduler_retention.c
   )
   target_sources_ifdef(CONFIG_WILDSONIC_VERBOSE_LOGS app PRIVATE src/psram_benchmark.c)
+  target_sources_ifdef(CONFIG_WILDSONIC_VERBOSE_LOGS app PRIVATE src/sd_benchmark.c)
   zephyr_include_directories(src)
 endif()

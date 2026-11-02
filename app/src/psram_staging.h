@@ -5,13 +5,30 @@
 #include <stdint.h>
 #include <stdbool.h>
 
+#if defined(__ZEPHYR__)
+#include <zephyr/toolchain.h>
+#endif
+
 #ifdef __cplusplus
 extern "C" {
 #endif
 
+#define PSRAM_TOTAL_BYTES          (4U * 1024U * 1024U)
+#define PSRAM_AUDIO_BUFFER_BYTES   (3U * 1024U * 1024U)
+#define PSRAM_RESERVED_BYTES       (PSRAM_TOTAL_BYTES - PSRAM_AUDIO_BUFFER_BYTES)
+
+#define PSRAM_BATCH_BYTES          (256U * 1024U)
+#define PSRAM_AUDIO_SLOT_COUNT     (PSRAM_AUDIO_BUFFER_BYTES / PSRAM_BATCH_BYTES)
+
+#if defined(__ZEPHYR__)
+BUILD_ASSERT(PSRAM_AUDIO_BUFFER_BYTES <= PSRAM_TOTAL_BYTES, "PSRAM audio buffer exceeds total capacity");
+BUILD_ASSERT((PSRAM_AUDIO_BUFFER_BYTES % PSRAM_BATCH_BYTES) == 0, "PSRAM audio buffer must be multiple of batch bytes");
+BUILD_ASSERT(PSRAM_AUDIO_SLOT_COUNT == 12, "PSRAM slot count must be exactly 12");
+#endif
+
 #define PSRAM_STAGING_BASE_ADDR                0x00000000U
-#define PSRAM_STAGING_DEFAULT_CAPACITY_BYTES   (1024U * 1024U)  /* 1 MiB staging allocation */
-#define PSRAM_STAGING_DEFAULT_BATCH_BYTES      (256U * 1024U)   /* 256 KiB SD batch write */
+#define PSRAM_STAGING_DEFAULT_CAPACITY_BYTES   PSRAM_AUDIO_BUFFER_BYTES  /* 3 MiB staging allocation */
+#define PSRAM_STAGING_DEFAULT_BATCH_BYTES      PSRAM_BATCH_BYTES         /* 256 KiB SD batch write */
 
 /**
  * @brief Explicit ownership states for PSRAM ping-pong batch buffers.
@@ -35,24 +52,32 @@ struct psram_batch_buf_info {
 	uint32_t capacity_bytes;
 	uint32_t filled_bytes;
 	uint32_t committed_bytes;
+	uint32_t peeked_bytes;
 	enum psram_batch_state state;
 	uint32_t batch_id;
 };
 
-#define PSRAM_MAX_BATCH_BUFFERS 32U
+#define PSRAM_MAX_BATCH_BUFFERS 16U
 
 struct psram_staging_stats {
 	bool active;
-	uint32_t capacity_bytes;
-	uint32_t batch_size_bytes;
+	uint32_t physical_capacity_bytes; /* 4 MB */
+	uint32_t capacity_bytes;          /* 3 MB */
+	uint32_t reserved_bytes;          /* 1 MB */
+	uint32_t slot_count;              /* 12 */
+	uint32_t slot_size_bytes;         /* 256 KB */
+	uint32_t batch_size_bytes;        /* 256 KB */
 	uint32_t occupied_bytes;
 	uint32_t in_flight_bytes;
 	uint32_t high_water_bytes;
+	uint32_t free_slots;
+	uint32_t ready_slots;
 	uint64_t bytes_buffered;
 	uint64_t bytes_flushed;
 	uint64_t samples_accepted;
 	uint32_t full_buffer_events;
 	uint32_t dropped_samples;
+	uint32_t rejected_blocks;
 };
 
 /**
@@ -111,6 +136,13 @@ int psram_staging_push(const void *src, uint32_t bytes, uint32_t samples);
 int psram_staging_peek(void *dst, uint32_t bytes_requested, uint32_t *bytes_read);
 
 /**
+ * @brief Rewind in-flight peeked bytes back to committed bytes on error or abort.
+ *
+ * Restores uncommitted data so it can be re-peeked in a subsequent transfer attempt.
+ */
+void psram_staging_rewind_peek(void);
+
+/**
  * @brief Commit previously peeked audio data after a successful storage write.
  *
  * Advances the consumer index (tail_pos) by bytes_committed and decrements
@@ -137,6 +169,16 @@ int psram_staging_pop(void *dst, uint32_t bytes_requested, uint32_t *bytes_read)
  * @brief Query current occupied byte count in staging buffer.
  */
 uint32_t psram_staging_occupied(void);
+
+/**
+ * @brief Query current in-flight reserved byte count in staging buffer.
+ */
+uint32_t psram_staging_in_flight(void);
+
+/**
+ * @brief Query whether staging buffer is completely idle (0 occupied, 0 in-flight).
+ */
+bool psram_staging_is_idle(void);
 
 /**
  * @brief Query configured total staging buffer capacity in bytes.
@@ -189,6 +231,16 @@ int psram_staging_flush_publish(void);
  * @return 0 on success (buffer became free), -ETIMEDOUT on timeout.
  */
 int psram_staging_wait_free(uint32_t timeout_ms);
+
+/**
+ * @brief Get count of batch slots currently in FREE state.
+ */
+uint32_t psram_staging_free_slots(void);
+
+/**
+ * @brief Get count of batch slots currently in READY state.
+ */
+uint32_t psram_staging_ready_slots(void);
 
 #ifdef __cplusplus
 }

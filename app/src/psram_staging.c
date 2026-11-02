@@ -19,8 +19,8 @@ LOG_MODULE_REGISTER(psram_staging, LOG_LEVEL_WRN);
 #endif
 
 static bool staging_active = false;
-static uint32_t buf_capacity = PSRAM_STAGING_DEFAULT_CAPACITY_BYTES;
-static uint32_t batch_size = PSRAM_STAGING_DEFAULT_BATCH_BYTES;
+static uint32_t buf_capacity = PSRAM_AUDIO_BUFFER_BYTES;
+static uint32_t batch_size = PSRAM_BATCH_BYTES;
 
 /* Explicit ping-pong / multi-batch buffer architecture */
 struct psram_batch_buf {
@@ -28,11 +28,12 @@ struct psram_batch_buf {
 	uint32_t capacity_bytes;
 	uint32_t filled_bytes;
 	uint32_t committed_bytes;
+	uint32_t peeked_bytes;
 	enum psram_batch_state state;
 	uint32_t batch_id;
 };
 
-static uint32_t num_batch_buffers = 2U;
+static uint32_t num_batch_buffers = PSRAM_AUDIO_SLOT_COUNT;
 static struct psram_batch_buf batch_bufs[PSRAM_MAX_BATCH_BUFFERS];
 static uint32_t active_fill_idx = 0;
 static uint32_t active_drain_idx = 0;
@@ -51,6 +52,7 @@ static uint64_t total_flushed = 0;
 static uint64_t total_samples = 0;
 static uint32_t full_events = 0;
 static uint32_t drops = 0;
+static uint32_t rejected_blocks = 0;
 
 #if defined(__ZEPHYR__)
 static struct k_spinlock staging_lock;
@@ -72,11 +74,11 @@ int psram_staging_init(uint32_t capacity_bytes, uint32_t batch_size_bytes)
 		return -ENODEV;
 	}
 
-	if (capacity_bytes == 0 || capacity_bytes > PSRAM_IS66WVS_CAPACITY_BYTES) {
-		capacity_bytes = PSRAM_STAGING_DEFAULT_CAPACITY_BYTES;
+	if (capacity_bytes == 0 || capacity_bytes > (PSRAM_TOTAL_BYTES - PSRAM_RESERVED_BYTES)) {
+		capacity_bytes = PSRAM_AUDIO_BUFFER_BYTES;
 	}
 	if (batch_size_bytes == 0 || batch_size_bytes > capacity_bytes) {
-		batch_size_bytes = PSRAM_STAGING_DEFAULT_BATCH_BYTES;
+		batch_size_bytes = PSRAM_BATCH_BYTES;
 	}
 
 	/* Enforce 512-byte block alignment for SD compatibility */
@@ -109,6 +111,7 @@ int psram_staging_init(uint32_t capacity_bytes, uint32_t batch_size_bytes)
 		batch_bufs[i].capacity_bytes = batch_size;
 		batch_bufs[i].filled_bytes = 0;
 		batch_bufs[i].committed_bytes = 0;
+		batch_bufs[i].peeked_bytes = 0;
 		batch_bufs[i].state = BATCH_STATE_FREE;
 		batch_bufs[i].batch_id = 0;
 	}
@@ -136,8 +139,8 @@ int psram_staging_init(uint32_t capacity_bytes, uint32_t batch_size_bytes)
 #endif
 	STAGING_UNLOCK();
 
-	LOG_INF("PSRAM ping-pong batch buffer initialized: %u buffers x %u KB = %u KB total",
-	        num_batch_buffers, batch_size >> 10, buf_capacity >> 10);
+	LOG_INF("PSRAM audio staging initialized: %u slots x %u KB = %u KB total (Reserved: %u KB)",
+	        num_batch_buffers, batch_size >> 10, buf_capacity >> 10, PSRAM_RESERVED_BYTES >> 10);
 	return 0;
 }
 
@@ -153,6 +156,7 @@ void psram_staging_reset(void)
 		batch_bufs[i].state = BATCH_STATE_FREE;
 		batch_bufs[i].filled_bytes = 0;
 		batch_bufs[i].committed_bytes = 0;
+		batch_bufs[i].peeked_bytes = 0;
 		batch_bufs[i].batch_id = 0;
 	}
 	active_fill_idx = 0;
@@ -168,6 +172,7 @@ void psram_staging_reset(void)
 	total_samples = 0;
 	full_events = 0;
 	drops = 0;
+	rejected_blocks = 0;
 
 	batch_bufs[0].state = BATCH_STATE_FILLING;
 	batch_bufs[0].batch_id = ++batch_seq_counter;
@@ -195,6 +200,22 @@ uint32_t psram_staging_occupied(void)
 	uint32_t occ = count_occupied;
 	STAGING_UNLOCK();
 	return occ;
+}
+
+uint32_t psram_staging_in_flight(void)
+{
+	STAGING_LOCK();
+	uint32_t inflight = reserved_bytes;
+	STAGING_UNLOCK();
+	return inflight;
+}
+
+bool psram_staging_is_idle(void)
+{
+	STAGING_LOCK();
+	bool idle = (count_occupied == 0 && reserved_bytes == 0 && !write_in_flight);
+	STAGING_UNLOCK();
+	return idle;
 }
 
 uint32_t psram_staging_capacity(void)
@@ -240,10 +261,12 @@ int psram_staging_push(const void *src, uint32_t bytes, uint32_t samples)
 		cur->state = BATCH_STATE_FILLING;
 		cur->filled_bytes = 0;
 		cur->committed_bytes = 0;
+		cur->peeked_bytes = 0;
 		cur->batch_id = ++batch_seq_counter;
 	} else if (cur->state != BATCH_STATE_FILLING) {
-		/* Both ping-pong buffers occupied (READY or WRITING); producer cannot overwrite */
+		/* All batch buffer slots occupied (READY or WRITING); producer cannot overwrite */
 		full_events++;
+		rejected_blocks++;
 		STAGING_UNLOCK();
 		LOG_WRN("PSRAM staging busy at capacity: rejected %u samples (%u bytes)", samples, bytes);
 		return -ENOBUFS;
@@ -265,6 +288,7 @@ int psram_staging_push(const void *src, uint32_t bytes, uint32_t samples)
 			cur->state = BATCH_STATE_FILLING;
 			cur->filled_bytes = 0;
 			cur->committed_bytes = 0;
+			cur->peeked_bytes = 0;
 			cur->batch_id = ++batch_seq_counter;
 			space_in_cur = cur->capacity_bytes;
 		}
@@ -272,6 +296,7 @@ int psram_staging_push(const void *src, uint32_t bytes, uint32_t samples)
 
 	if (bytes > space_in_cur || bytes > available) {
 		full_events++;
+		rejected_blocks++;
 		STAGING_UNLOCK();
 		LOG_WRN("PSRAM staging capacity unavailable: rejected %u samples (%u bytes)", samples, bytes);
 		return -ENOBUFS;
@@ -320,6 +345,7 @@ int psram_staging_push(const void *src, uint32_t bytes, uint32_t samples)
 			batch_bufs[active_fill_idx].state = BATCH_STATE_FILLING;
 			batch_bufs[active_fill_idx].filled_bytes = 0;
 			batch_bufs[active_fill_idx].committed_bytes = 0;
+			batch_bufs[active_fill_idx].peeked_bytes = 0;
 			batch_bufs[active_fill_idx].batch_id = ++batch_seq_counter;
 		}
 	}
@@ -363,8 +389,8 @@ int psram_staging_peek(void *dst, uint32_t bytes_requested, uint32_t *bytes_read
 		}
 	}
 
-	uint32_t uncommitted = (drain->filled_bytes > drain->committed_bytes) ?
-	                       (drain->filled_bytes - drain->committed_bytes) : 0;
+	uint32_t uncommitted = (drain->filled_bytes > drain->peeked_bytes) ?
+	                       (drain->filled_bytes - drain->peeked_bytes) : 0;
 	if (uncommitted == 0) {
 		STAGING_UNLOCK();
 		if (bytes_read) *bytes_read = 0;
@@ -372,7 +398,8 @@ int psram_staging_peek(void *dst, uint32_t bytes_requested, uint32_t *bytes_read
 	}
 
 	to_read = (bytes_requested < uncommitted) ? bytes_requested : uncommitted;
-	read_offset = drain->base_addr + drain->committed_bytes;
+	read_offset = drain->base_addr + drain->peeked_bytes;
+	drain->peeked_bytes += to_read;
 	tail_pos = read_offset % buf_capacity;
 	STAGING_UNLOCK();
 
@@ -380,6 +407,11 @@ int psram_staging_peek(void *dst, uint32_t bytes_requested, uint32_t *bytes_read
 	if (ret != 0) {
 		LOG_ERR("PSRAM physical peek failed at addr 0x%06X (code %d)",
 		        read_offset, ret);
+		STAGING_LOCK();
+		if (drain->peeked_bytes >= to_read) {
+			drain->peeked_bytes -= to_read;
+		}
+		STAGING_UNLOCK();
 		if (bytes_read) *bytes_read = 0;
 		return ret;
 	}
@@ -388,6 +420,14 @@ int psram_staging_peek(void *dst, uint32_t bytes_requested, uint32_t *bytes_read
 		*bytes_read = to_read;
 	}
 	return 0;
+}
+
+void psram_staging_rewind_peek(void)
+{
+	STAGING_LOCK();
+	struct psram_batch_buf *drain = &batch_bufs[active_drain_idx];
+	drain->peeked_bytes = drain->committed_bytes;
+	STAGING_UNLOCK();
 }
 
 int psram_staging_commit(uint32_t bytes_committed)
@@ -408,6 +448,9 @@ int psram_staging_commit(uint32_t bytes_committed)
 	}
 
 	drain->committed_bytes += bytes_committed;
+	if (drain->peeked_bytes < drain->committed_bytes) {
+		drain->peeked_bytes = drain->committed_bytes;
+	}
 	tail_pos = (tail_pos + bytes_committed) % buf_capacity;
 	count_occupied -= bytes_committed;
 	total_flushed += bytes_committed;
@@ -419,6 +462,7 @@ int psram_staging_commit(uint32_t bytes_committed)
 			drain->state = BATCH_STATE_FREE;
 			drain->filled_bytes = 0;
 			drain->committed_bytes = 0;
+			drain->peeked_bytes = 0;
 			buffer_freed = true;
 		}
 		active_drain_idx = (active_drain_idx + 1U) % num_batch_buffers;
@@ -482,10 +526,37 @@ int psram_staging_get_batch_info(uint32_t buffer_idx, struct psram_batch_buf_inf
 	info->capacity_bytes = batch_bufs[buffer_idx].capacity_bytes;
 	info->filled_bytes = batch_bufs[buffer_idx].filled_bytes;
 	info->committed_bytes = batch_bufs[buffer_idx].committed_bytes;
+	info->peeked_bytes = batch_bufs[buffer_idx].peeked_bytes;
 	info->state = batch_bufs[buffer_idx].state;
 	info->batch_id = batch_bufs[buffer_idx].batch_id;
 	STAGING_UNLOCK();
 	return 0;
+}
+
+uint32_t psram_staging_free_slots(void)
+{
+	STAGING_LOCK();
+	uint32_t free_cnt = 0;
+	for (uint32_t i = 0; i < num_batch_buffers; i++) {
+		if (batch_bufs[i].state == BATCH_STATE_FREE) {
+			free_cnt++;
+		}
+	}
+	STAGING_UNLOCK();
+	return free_cnt;
+}
+
+uint32_t psram_staging_ready_slots(void)
+{
+	STAGING_LOCK();
+	uint32_t ready_cnt = 0;
+	for (uint32_t i = 0; i < num_batch_buffers; i++) {
+		if (batch_bufs[i].state == BATCH_STATE_READY) {
+			ready_cnt++;
+		}
+	}
+	STAGING_UNLOCK();
+	return ready_cnt;
 }
 
 void psram_staging_get_stats(struct psram_staging_stats *stats)
@@ -494,15 +565,31 @@ void psram_staging_get_stats(struct psram_staging_stats *stats)
 
 	STAGING_LOCK();
 	stats->active = staging_active;
+	stats->physical_capacity_bytes = PSRAM_TOTAL_BYTES;
 	stats->capacity_bytes = buf_capacity;
+	stats->reserved_bytes = PSRAM_RESERVED_BYTES;
+	stats->slot_count = num_batch_buffers;
+	stats->slot_size_bytes = batch_size;
 	stats->batch_size_bytes = batch_size;
 	stats->occupied_bytes = count_occupied;
 	stats->in_flight_bytes = reserved_bytes;
 	stats->high_water_bytes = peak_occupancy;
+	uint32_t free_cnt = 0;
+	uint32_t ready_cnt = 0;
+	for (uint32_t i = 0; i < num_batch_buffers; i++) {
+		if (batch_bufs[i].state == BATCH_STATE_FREE) {
+			free_cnt++;
+		} else if (batch_bufs[i].state == BATCH_STATE_READY) {
+			ready_cnt++;
+		}
+	}
+	stats->free_slots = free_cnt;
+	stats->ready_slots = ready_cnt;
 	stats->bytes_buffered = total_buffered;
 	stats->bytes_flushed = total_flushed;
 	stats->samples_accepted = total_samples;
 	stats->full_buffer_events = full_events;
 	stats->dropped_samples = drops;
+	stats->rejected_blocks = rejected_blocks;
 	STAGING_UNLOCK();
 }

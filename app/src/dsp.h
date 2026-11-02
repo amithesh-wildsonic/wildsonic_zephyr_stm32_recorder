@@ -59,6 +59,14 @@ int dsp_init(uint32_t sample_rate_hz);
 /* Configure DSP pipeline parameters */
 int dsp_configure(const struct dsp_config *cfg, uint32_t sample_rate_hz);
 
+/* Validate and clamp LPF cutoff frequency (Hz) against Nyquist boundary (0.49 * fs).
+ * Returns safe valid cutoff below Nyquist (e.g. 90000 Hz for 192k, 45000 Hz for 96k, 20000 Hz for 48k),
+ * or 0 if disabled. */
+uint32_t dsp_validate_lpf_cutoff(uint32_t sample_rate_hz, uint32_t requested_cutoff_hz);
+
+/* Check if LPF stage is effectively active (enabled, > 0, and strictly below Nyquist boundary) */
+bool dsp_is_lpf_effective(void);
+
 /* Reset all filter internal delay states (call before starting a new recording) */
 void dsp_reset(void);
 

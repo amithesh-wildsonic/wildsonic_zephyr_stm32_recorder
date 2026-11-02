@@ -4,6 +4,7 @@
 #include "main.h"
 #include "recorder.h"
 #include "rtc_calendar.h"
+#include "scheduler.h"
 #include "scheduler_retention.h"
 
 #include <zephyr/drivers/uart.h>
@@ -335,6 +336,13 @@ static void ble_comm_process_line(char *line) {
   s_ble_module_awake = true;
   s_ble_supervisor_online = true;
 
+  if (strcmp(p, "WS+ALIVE") == 0) {
+    s_pairing_window_active = true;
+    s_lock_pending_on_disconnect = false;
+    LOG_INF("[BLE] RX: WS+ALIVE (keep-alive, pairing window active)");
+    return;
+  }
+
   if (strcasecmp(p, "GET_DEV_INFO") == 0) {
     s_ble_module_awake = true;
     LOG_INF("[BLE] RX: GET_DEV_INFO (dispatching formatted device report)");
@@ -351,7 +359,7 @@ static void ble_comm_process_line(char *line) {
   /* 4. Configuration & Control Commands (Forwarded to existing dispatcher) */
   s_ble_module_awake = true;
 
-  char resp_buf[64] = {0};
+  char resp_buf[128] = {0};
   int rc = console_process_line_source(p, true, resp_buf, sizeof(resp_buf));
   if (rc == 0) {
     if (resp_buf[0] != '\0') {
@@ -360,7 +368,11 @@ static void ble_comm_process_line(char *line) {
       ble_comm_printf("OK\r\n");
     }
   } else {
-    ble_comm_printf("ERR\r\n");
+    if (resp_buf[0] != '\0') {
+      ble_comm_printf("%s\r\n", resp_buf);
+    } else {
+      ble_comm_printf("ERR\r\n");
+    }
   }
 }
 
@@ -990,7 +1002,17 @@ void ble_comm_resume(void) {
   }
 #endif
 
+  struct uart_config bcfg = {
+    .baudrate = 115200,
+    .parity = UART_CFG_PARITY_NONE,
+    .stop_bits = UART_CFG_STOP_BITS_1,
+    .data_bits = UART_CFG_DATA_BITS_8,
+    .flow_ctrl = UART_CFG_FLOW_CTRL_NONE,
+  };
+  (void)uart_configure(s_ble_uart_dev, &bcfg);
+
 #if defined(CONFIG_UART_INTERRUPT_DRIVEN)
+  uart_irq_callback_user_data_set(s_ble_uart_dev, ble_uart_isr, NULL);
   uart_irq_rx_enable(s_ble_uart_dev);
 #endif
 
@@ -1011,51 +1033,21 @@ void ble_comm_send_dev_info(void) {
   uint32_t sleep_sec = cfg->sleep_pause_interval
                            ? cfg->sleep_pause_interval
                            : (settings ? settings->sleep_seconds : 60);
-  uint32_t cycles = settings ? settings->cycles : 1;
 
+  /* 1. Audio config status */
   ble_comm_printf("SAMF %u\r\n", cfg->sampling_rate);
-
   ble_comm_printf("BTPS %u\r\n", cfg->audio_sampling_width);
-
   ble_comm_printf("NUMCH %u\r\n", cfg->num_audio_channels);
-
   ble_comm_printf("GAIN %d\r\n", cfg->mic_gain_times_ten);
-
   ble_comm_printf("LCUTOFF %u\r\n", cfg->lower_cutoff_frequency);
-
   ble_comm_printf("UCUTOFF %u\r\n", cfg->upper_cutoff_frequency);
-
   ble_comm_printf("RECT %u\r\n", cfg->recording_length);
-
   ble_comm_printf("SLEEP %u\r\n", sleep_sec);
 
-  ble_comm_printf("CYCLE %u\r\n", cycles);
+  /* 2. Version info */
+  ble_comm_printf("VER 1.2.0, SHA d7a4f91, DT %s %s\r\n", __DATE__, __TIME__);
 
-  ble_comm_printf("NAME %s\r\n",
-                  (cfg && cfg->device_name[0]) ? cfg->device_name : "");
-
-  ble_comm_printf("MODEL WS-STM32L476\r\n");
-
-  ble_comm_printf("SERIAL %s\r\n",
-                  (cfg && cfg->serial_number[0]) ? cfg->serial_number : "0");
-
-  ble_comm_printf("FWVER 1.2.0-BLE\r\n");
-
-  ble_comm_printf("MIC ANALOG\r\n");
-
-  ble_comm_printf("BATTCAP 0\r\n");
-
-  ble_comm_printf("RECTIME %u\r\n", cfg->recording_length);
-
-  ble_comm_printf("INTERVAL %u\r\n", sleep_sec);
-
-  ble_comm_printf("SRATE %u\r\n", cfg->sampling_rate);
-
-  ble_comm_printf("RECBITS %u\r\n", cfg->audio_sampling_width);
-
-  ble_comm_printf("NCH %u\r\n", cfg->num_audio_channels);
-
-
+  /* 3. Storage status */
   uint64_t sd_used = 0, sd_total = 0;
   struct fs_statvfs stat;
   if (fs_statvfs("/SD:", &stat) == 0) {
@@ -1066,32 +1058,89 @@ void ble_comm_send_dev_info(void) {
   ble_comm_printf("SDUSED %llu, SDCAP %llu\r\n", (unsigned long long)sd_used,
                   (unsigned long long)sd_total);
 
+  /* 4. Folder structure */
+  const char *fldr_str = (cfg->folder_structure == 1) ? "daily" :
+                         ((cfg->folder_structure == 2) ? "hourly" : "flat");
+  ble_comm_printf("FLDR %s\r\n", fldr_str);
 
+  /* 5. Power management status */
   ble_comm_printf("VBATT N/A, CBATT N/A, REMBATT N/A\r\n");
-
   ble_comm_printf("FULLBATT N/A, REMTIME N/A, AVGPWR N/A\r\n");
+  ble_comm_printf("NBAT 1\r\n");
 
-  ble_comm_printf("NBAT 0\r\n");
-
-
+  /* 6. Time and schedule status with local timezone offset */
   struct rtc_calendar_time now_cal;
   if (rtc_calendar_get(&now_cal) == 0 && rtc_calendar_is_valid()) {
-    ble_comm_printf("DATETIME %04d-%02d-%02d %02d:%02d:%02d.000 +00:00\r\n",
-                    now_cal.year, now_cal.month, now_cal.day, now_cal.hour,
-                    now_cal.min, now_cal.sec);
+    time_t cur_utc = scheduler_calendar_to_epoch(&now_cal);
+    time_t cur_loc = cur_utc + cfg->time_zone_offset;
+    struct rtc_calendar_time loc_cal;
+    scheduler_epoch_to_calendar(cur_loc, &loc_cal);
+
+    char tz_sign = '+';
+    int32_t tz_abs = cfg->time_zone_offset;
+    if (tz_abs < 0) {
+      tz_sign = '-';
+      tz_abs = -tz_abs;
+    }
+    uint16_t tz_h = (uint16_t)(tz_abs / 3600);
+    uint16_t tz_m = (uint16_t)((tz_abs % 3600) / 60);
+
+    ble_comm_printf("DATETIME %04d-%02d-%02d %02d:%02d:%02d.%03d %c%02d:%02d\r\n",
+                    loc_cal.year, loc_cal.month, loc_cal.day,
+                    loc_cal.hour, loc_cal.min, loc_cal.sec,
+                    now_cal.subsec,
+                    tz_sign, tz_h, tz_m);
+    ble_comm_printf("TIMEZONE %c%02d:%02d\r\n", tz_sign, tz_h, tz_m);
   } else {
     ble_comm_printf("DATETIME N/A\r\n");
+    ble_comm_printf("TIMEZONE +00:00\r\n");
   }
 
-  ble_comm_printf("TIMEZONE +00:00\r\n");
+  /* 7. Schedule date range */
+  struct schedule_config scfg;
+  scheduler_get_config(&scfg);
+  ble_comm_printf("DATERANGE %04u/%02u/%02u-%04u/%02u/%02u\r\n",
+                  scfg.start_date.year ? scfg.start_date.year : 2026,
+                  scfg.start_date.month ? scfg.start_date.month : 1,
+                  scfg.start_date.day ? scfg.start_date.day : 1,
+                  scfg.end_date.year ? scfg.end_date.year : 2099,
+                  scfg.end_date.month ? scfg.end_date.month : 12,
+                  scfg.end_date.day ? scfg.end_date.day : 31);
 
-
-  ble_comm_printf("DATERANGE 2026/01/01-2099/12/31\r\n");
-
+  /* 8. Sun mode */
   ble_comm_printf("SUNMODE Disabled\r\n");
 
+  /* 9. Schedule time of day ranges (indices 0..9) */
+  for (int i = 0; i < 10; i++) {
+    uint32_t start_sec = scfg.tod_ranges[i].start_second;
+    uint32_t end_sec = scfg.tod_ranges[i].end_second;
+    ble_comm_printf("TIMEOFDAY %d %02d:%02d:%02d-%02d:%02d:%02d\r\n",
+                    i,
+                    start_sec / 3600, (start_sec / 60) % 60, start_sec % 60,
+                    end_sec / 3600, (end_sec / 60) % 60, end_sec % 60);
+  }
 
-  /* Critical termination line required to release mobile app lock */
+  /* 10. Days of week */
+  char days_str[8] = {0};
+  int d_idx = 0;
+  uint8_t dow_mask = scfg.day_of_week_mask ? scfg.day_of_week_mask : 0x7F;
+  if (dow_mask & 0x01) days_str[d_idx++] = 'M';
+  if (dow_mask & 0x02) days_str[d_idx++] = 'T';
+  if (dow_mask & 0x04) days_str[d_idx++] = 'W';
+  if (dow_mask & 0x08) days_str[d_idx++] = 'R';
+  if (dow_mask & 0x10) days_str[d_idx++] = 'F';
+  if (dow_mask & 0x20) days_str[d_idx++] = 'S';
+  if (dow_mask & 0x40) days_str[d_idx++] = 'U';
+  days_str[d_idx] = '\0';
+  ble_comm_printf("DAYSOFWEEK %s\r\n", days_str);
+
+  /* 11. Legacy compatibility tags for test suites and mobile ID */
+  ble_comm_printf("MODEL WS-STM32L476\r\n");
+  ble_comm_printf("FWVER 1.2.0-BLE\r\n");
+  ble_comm_printf("MIC ANALOG\r\n");
+  ble_comm_printf("BATTCAP 0\r\n");
+
+  /* 12. Environmental sensor status & report termination */
   ble_comm_printf("TEMP 0.00, HUMID 0.00\r\n");
 
   k_mutex_unlock(&s_ble_report_mutex);

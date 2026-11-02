@@ -1,6 +1,7 @@
 /* SPDX-License-Identifier: Apache-2.0 */
 #include "rtc_calendar.h"
 #include "rtc_sleep.h"
+#include "scheduler.h"
 #include <stdio.h>
 #include <string.h>
 #include <errno.h>
@@ -126,13 +127,12 @@ int rtc_calendar_parse(const char *str, struct rtc_calendar_time *t)
 
 #if defined(CONFIG_SOC_SERIES_STM32L4X)
 
-static uint16_t rtc_calendar_extract_millis_from_rtc(void)
+static uint16_t rtc_calendar_calc_millis_from_ss(uint32_t ss)
 {
 	uint32_t pred_s = RTC->PRER & 0x7FFFU;
 	if (pred_s == 0U) {
 		return 0U;
 	}
-	uint32_t ss = RTC->SSR & 0xFFFFU;
 	if (ss > pred_s) {
 		ss = pred_s;
 	}
@@ -164,17 +164,26 @@ int rtc_calendar_get(struct rtc_calendar_time *t)
 	}
 
 	/*
-	 * Per STM32L4 reference manual (RM0351):
-	 * To ensure consistent time and date read, read RTC_TR first.
-	 * Reading TR locks the content of shadow registers TR and DR until DR is read.
+	 * Per STM32L4 reference manual (RM0351, 32.3.8 Reading the calendar):
+	 * When reading shadow registers after low-power modes (Stop 1, Stop 2) or to ensure fresh data:
+	 * 1. Clear RSF bit in RTC_ISR (LL_RTC_ClearFlag_RS).
+	 * 2. Wait boundedly until RSF is set by hardware (max 2 RTCCLK cycles).
+	 * 3. Reading RTC_SSR or RTC_TR locks shadow registers SSR, TR, and DR until DR is read.
 	 */
+	LL_RTC_ClearFlag_RS(RTC);
+	uint32_t rsf_to = 1000;
+	while (!LL_RTC_IsActiveFlag_RS(RTC) && --rsf_to) {
+		k_busy_wait(10);
+	}
+
+	uint32_t ss = RTC->SSR & 0xFFFFU;
 	uint32_t tr = LL_RTC_TIME_Get(RTC);
 	uint32_t dr = LL_RTC_DATE_Get(RTC);
 
 	t->hour  = __LL_RTC_CONVERT_BCD2BIN(__LL_RTC_GET_HOUR(tr));
 	t->min   = __LL_RTC_CONVERT_BCD2BIN(__LL_RTC_GET_MINUTE(tr));
 	t->sec   = __LL_RTC_CONVERT_BCD2BIN(__LL_RTC_GET_SECOND(tr));
-	t->subsec = rtc_calendar_extract_millis_from_rtc();
+	t->subsec = rtc_calendar_calc_millis_from_ss(ss);
 
 	t->year  = 2000 + __LL_RTC_CONVERT_BCD2BIN(__LL_RTC_GET_YEAR(dr));
 	t->month = __LL_RTC_CONVERT_BCD2BIN(__LL_RTC_GET_MONTH(dr));
@@ -187,6 +196,41 @@ int rtc_calendar_get(struct rtc_calendar_time *t)
 
 	t->valid = true;
 	return 0;
+}
+
+void rtc_calendar_log_snapshot(const char *phase, int64_t target_utc)
+{
+#if defined(CONFIG_WILDSONIC_VERBOSE_LOGS)
+	uint32_t tr = RTC->TR;
+	uint32_t dr = RTC->DR;
+	uint32_t ss = RTC->SSR & 0xFFFFU;
+	uint32_t prer = RTC->PRER;
+	uint32_t clksrc = LL_RCC_GetRTCClockSource();
+	bool lse_rdy = LL_RCC_LSE_IsReady();
+	bool lsi_rdy = LL_RCC_LSI_IsReady();
+	uint32_t wutr = RTC->WUTR;
+	bool wute = LL_RTC_WAKEUP_IsEnabled(RTC);
+
+	struct rtc_calendar_time cur;
+	int get_rc = rtc_calendar_get(&cur);
+	char time_str[32] = "UNSET";
+	int64_t cur_utc = 0;
+	if (get_rc == 0 && cur.valid) {
+		snprintf(time_str, sizeof(time_str), "%04u-%02u-%02u %02u:%02u:%02u.%03u",
+		         cur.year, cur.month, cur.day, cur.hour, cur.min, cur.sec, cur.subsec);
+		cur_utc = scheduler_calendar_to_epoch(&cur);
+	}
+	int64_t remaining = (target_utc > 0 && cur_utc > 0) ? (target_utc - cur_utc) : 0;
+
+	printk("[TEST] RTC SNAPSHOT [%s]: TR=0x%08X DR=0x%08X SSR=%u PRER=0x%08X CLKSRC=0x%02X LSE=%d LSI=%d WUTR=%u WUTE=%d UTC=%s REMAINING=%lld s\n",
+	       phase ? phase : "INFO",
+	       (unsigned int)tr, (unsigned int)dr, (unsigned int)ss, (unsigned int)prer,
+	       (unsigned int)clksrc, (int)lse_rdy, (int)lsi_rdy,
+	       (unsigned int)wutr, (int)wute, time_str, (long long)remaining);
+#else
+	ARG_UNUSED(phase);
+	ARG_UNUSED(target_utc);
+#endif
 }
 
 int rtc_calendar_set(const struct rtc_calendar_time *t)
@@ -356,6 +400,12 @@ int rtc_calendar_set(const struct rtc_calendar_time *t)
 	sim_time.valid = true;
 	sim_time_valid = true;
 	return 0;
+}
+
+void rtc_calendar_log_snapshot(const char *phase, int64_t target_utc)
+{
+	ARG_UNUSED(phase);
+	ARG_UNUSED(target_utc);
 }
 
 #endif /* CONFIG_SOC_SERIES_STM32L4X */

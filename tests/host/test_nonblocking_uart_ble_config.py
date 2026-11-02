@@ -415,11 +415,11 @@ def test_command_bursts_do_not_block_audio_acquisition_priorities():
     # Audio acquisition priority is preemptive 0 (highest preemptive task)
     assert "#define ACQUISITION_THREAD_PRIORITY K_PRIO_PREEMPT(0)" in audio_src
 
-    # SD Writer priority is 2
-    assert "#define SD_WRITER_PRIORITY 2" in RECORDER_C.read_text(encoding="utf-8")
+    # Recorder processing priority is 1 (higher than SD writer to prevent starvation)
+    assert "#define RECORDER_THREAD_PRIORITY   1" in main_src
 
-    # Recorder control priority is 3
-    assert "#define RECORDER_THREAD_PRIORITY   3" in main_src
+    # SD Writer priority is 3 (lower priority than recorder/DSP processing)
+    assert "#define SD_WRITER_PRIORITY 3" in RECORDER_C.read_text(encoding="utf-8")
 
     # Console command execution dropped to priority 4
     assert "k_thread_priority_set(k_current_get(), 4);" in main_src
