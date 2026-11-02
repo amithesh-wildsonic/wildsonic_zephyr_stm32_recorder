@@ -51,6 +51,26 @@ bool main_is_scheduler_paused(void);
 bool main_is_reboot_pending(void);
 void main_set_reboot_pending(bool pending);
 
+/* Graceful shutdown state machine */
+enum system_shutdown_stage {
+  SHUTDOWN_STAGE_IDLE = 0,
+  SHUTDOWN_STAGE_REQUESTED,
+  SHUTDOWN_STAGE_SCHEDULER_STOPPED,
+  SHUTDOWN_STAGE_ADC_DMA_STOPPED,
+  SHUTDOWN_STAGE_AUDIO_QUEUES_DRAINED,
+  SHUTDOWN_STAGE_PSRAM_READER_DRAINED,
+  SHUTDOWN_STAGE_SD_WRITER_DRAINED,
+  SHUTDOWN_STAGE_WAV_FINALIZED,
+  SHUTDOWN_STAGE_CONFIG_PERSISTED,
+  SHUTDOWN_STAGE_REBOOT_READY,
+  SHUTDOWN_STAGE_SYSTEM_RESET,
+};
+
+void main_set_shutdown_stage(enum system_shutdown_stage stage);
+enum system_shutdown_stage main_get_shutdown_stage(void);
+const char *main_get_shutdown_stage_name(enum system_shutdown_stage stage);
+
+
 
 
 #ifdef __cplusplus

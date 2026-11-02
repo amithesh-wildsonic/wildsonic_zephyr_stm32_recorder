@@ -122,6 +122,14 @@ void config_store_load_defaults(void)
 		cfg->folder_structure = 2;
 		cfg->save_config_flag = false;
 		cfg->format_sd_card_flag = false;
+		cfg->location_lat_e7 = SCHEDULER_INVALID_LOCATION_COORDINATE;
+		cfg->location_lon_e7 = SCHEDULER_INVALID_LOCATION_COORDINATE;
+		cfg->sun_recording_mode = SUN_MODE_DISABLED;
+		cfg->sunrise_sunset_rounding = 0;
+		cfg->sunrise_interval_before = 0;
+		cfg->sunrise_interval_after = 0;
+		cfg->sunset_interval_before = 0;
+		cfg->sunset_interval_after = 0;
 	}
 
 	struct app_settings *settings = main_get_settings();
@@ -157,6 +165,14 @@ void config_store_load_defaults(void)
 	scfg.time_zone_offset = 0;
 	scfg.record_length = 600;
 	scfg.sleep_interval = 0;
+	scfg.latitude_e7 = SCHEDULER_INVALID_LOCATION_COORDINATE;
+	scfg.longitude_e7 = SCHEDULER_INVALID_LOCATION_COORDINATE;
+	scfg.sun_recording_mode = SUN_MODE_DISABLED;
+	scfg.sunrise_sunset_rounding = 0;
+	scfg.sunrise_interval_before = 0;
+	scfg.sunrise_interval_after = 0;
+	scfg.sunset_interval_before = 0;
+	scfg.sunset_interval_after = 0;
 	scheduler_set_config(&scfg);
 
 	console_sync_staged_to_active();
@@ -206,6 +222,15 @@ static void unpack_record_to_system(const struct wildsonic_persisted_config *rec
 		uint32_t validated_lpf = dsp_validate_lpf_cutoff(eff_rate, rec->upper_cutoff_frequency);
 		cfg->upper_cutoff_frequency = validated_lpf;
 		cfg->folder_structure = rec->folder_structure;
+
+		cfg->location_lat_e7 = rec->latitude_e7 ? rec->latitude_e7 : SCHEDULER_INVALID_LOCATION_COORDINATE;
+		cfg->location_lon_e7 = rec->longitude_e7 ? rec->longitude_e7 : SCHEDULER_INVALID_LOCATION_COORDINATE;
+		cfg->sun_recording_mode = rec->sun_recording_mode;
+		cfg->sunrise_sunset_rounding = rec->sunrise_sunset_rounding;
+		cfg->sunrise_interval_before = rec->sunrise_interval_before;
+		cfg->sunrise_interval_after = rec->sunrise_interval_after;
+		cfg->sunset_interval_before = rec->sunset_interval_before;
+		cfg->sunset_interval_after = rec->sunset_interval_after;
 	}
 
 	struct app_settings *settings = main_get_settings();
@@ -236,6 +261,15 @@ static void unpack_record_to_system(const struct wildsonic_persisted_config *rec
 	scfg.time_zone_offset = rec->time_zone_offset;
 	scfg.record_length = rec->recording_length;
 	scfg.sleep_interval = rec->sleep_pause_interval;
+
+	scfg.latitude_e7 = rec->latitude_e7 ? rec->latitude_e7 : SCHEDULER_INVALID_LOCATION_COORDINATE;
+	scfg.longitude_e7 = rec->longitude_e7 ? rec->longitude_e7 : SCHEDULER_INVALID_LOCATION_COORDINATE;
+	scfg.sun_recording_mode = rec->sun_recording_mode;
+	scfg.sunrise_sunset_rounding = rec->sunrise_sunset_rounding;
+	scfg.sunrise_interval_before = rec->sunrise_interval_before;
+	scfg.sunrise_interval_after = rec->sunrise_interval_after;
+	scfg.sunset_interval_before = rec->sunset_interval_before;
+	scfg.sunset_interval_after = rec->sunset_interval_after;
 
 	scheduler_reset_tod_ranges(scfg.tod_ranges, SCHEDULER_MAX_TIME_OF_DAY_RANGES);
 	for (int i = 0; i < SCHEDULER_MAX_TIME_OF_DAY_RANGES && i < rec->num_tod_ranges; i++) {
@@ -285,6 +319,14 @@ static void pack_system_to_record(struct wildsonic_persisted_config *rec)
 	rec->end_day = scfg.end_date.day;
 	rec->day_of_week_mask = scfg.day_of_week_mask;
 	rec->time_zone_offset = scfg.time_zone_offset;
+	rec->latitude_e7 = scfg.latitude_e7;
+	rec->longitude_e7 = scfg.longitude_e7;
+	rec->sun_recording_mode = scfg.sun_recording_mode;
+	rec->sunrise_sunset_rounding = scfg.sunrise_sunset_rounding;
+	rec->sunrise_interval_before = scfg.sunrise_interval_before;
+	rec->sunrise_interval_after = scfg.sunrise_interval_after;
+	rec->sunset_interval_before = scfg.sunset_interval_before;
+	rec->sunset_interval_after = scfg.sunset_interval_after;
 
 	uint8_t count = 0;
 	for (int i = 0; i < SCHEDULER_MAX_TIME_OF_DAY_RANGES; i++) {
@@ -663,6 +705,21 @@ int config_store_write_status_file(const char *path)
 	STATUS_WRITE_LINE("folder_structure=%s\n", fldr_str);
 	STATUS_WRITE_LINE("psram_staging=%s\n", (settings && settings->psram_staging_enabled) ? "enabled" : "disabled");
 
+	if (scfg.latitude_e7 != SCHEDULER_INVALID_LOCATION_COORDINATE &&
+	    scfg.longitude_e7 != SCHEDULER_INVALID_LOCATION_COORDINATE) {
+		STATUS_WRITE_LINE("location=%.7f, %.7f\n",
+		                  (double)scfg.latitude_e7 / 10000000.0,
+		                  (double)scfg.longitude_e7 / 10000000.0);
+	} else {
+		STATUS_WRITE_LINE("location=Not set\n");
+	}
+	STATUS_WRITE_LINE("sun_recording_mode=%u\n", (unsigned int)scfg.sun_recording_mode);
+	STATUS_WRITE_LINE("sunrise_interval_before=%u\n", (unsigned int)scfg.sunrise_interval_before);
+	STATUS_WRITE_LINE("sunrise_interval_after=%u\n", (unsigned int)scfg.sunrise_interval_after);
+	STATUS_WRITE_LINE("sunset_interval_before=%u\n", (unsigned int)scfg.sunset_interval_before);
+	STATUS_WRITE_LINE("sunset_interval_after=%u\n", (unsigned int)scfg.sunset_interval_after);
+	STATUS_WRITE_LINE("sunrise_sunset_rounding=%u\n", (unsigned int)scfg.sunrise_sunset_rounding);
+
 #undef STATUS_WRITE_LINE
 
 	rc = fs_close(&file);
@@ -864,39 +921,97 @@ int config_store_import_sd(void)
 			updated = true;
 			if (read_bytes != 1) break;
 			continue;
+		} else if (strcasecmp(key, "latitude") == 0 || strcasecmp(key, "lat") == 0) {
+			double lat_val = strtod(val, NULL);
+			if (lat_val >= -90.0 && lat_val <= 90.0) {
+				struct wildsonic_config *cfg = console_get_config();
+				int32_t e7 = (int32_t)floor(lat_val * 10000000.0 + 0.5);
+				if (cfg) cfg->location_lat_e7 = e7;
+				struct schedule_config scfg;
+				scheduler_get_config(&scfg);
+				scfg.latitude_e7 = e7;
+				scheduler_set_config(&scfg);
+				updated = true;
+			}
+			if (read_bytes != 1) break;
+			continue;
+		} else if (strcasecmp(key, "longitude") == 0 || strcasecmp(key, "lon") == 0) {
+			double lon_val = strtod(val, NULL);
+			if (lon_val >= -180.0 && lon_val <= 180.0) {
+				struct wildsonic_config *cfg = console_get_config();
+				int32_t e7 = (int32_t)floor(lon_val * 10000000.0 + 0.5);
+				if (cfg) cfg->location_lon_e7 = e7;
+				struct schedule_config scfg;
+				scheduler_get_config(&scfg);
+				scfg.longitude_e7 = e7;
+				scheduler_set_config(&scfg);
+				updated = true;
+			}
+			if (read_bytes != 1) break;
+			continue;
 		} else if (strcasecmp(key, "sun_recording_mode") == 0) {
 			struct wildsonic_config *cfg = console_get_config();
-			if (cfg) cfg->sun_recording_mode = (uint8_t)strtoul(val, NULL, 10);
+			uint8_t m = (uint8_t)strtoul(val, NULL, 10);
+			if (cfg) cfg->sun_recording_mode = m;
+			struct schedule_config scfg;
+			scheduler_get_config(&scfg);
+			scfg.sun_recording_mode = m;
+			scheduler_set_config(&scfg);
 			updated = true;
 			if (read_bytes != 1) break;
 			continue;
 		} else if (strcasecmp(key, "sunrise_interval_before") == 0) {
 			struct wildsonic_config *cfg = console_get_config();
-			if (cfg) cfg->sunrise_interval_before = (uint8_t)strtoul(val, NULL, 10);
+			uint8_t v = (uint8_t)strtoul(val, NULL, 10);
+			if (cfg) cfg->sunrise_interval_before = v;
+			struct schedule_config scfg;
+			scheduler_get_config(&scfg);
+			scfg.sunrise_interval_before = v;
+			scheduler_set_config(&scfg);
 			updated = true;
 			if (read_bytes != 1) break;
 			continue;
 		} else if (strcasecmp(key, "sunrise_interval_after") == 0) {
 			struct wildsonic_config *cfg = console_get_config();
-			if (cfg) cfg->sunrise_interval_after = (uint8_t)strtoul(val, NULL, 10);
+			uint8_t v = (uint8_t)strtoul(val, NULL, 10);
+			if (cfg) cfg->sunrise_interval_after = v;
+			struct schedule_config scfg;
+			scheduler_get_config(&scfg);
+			scfg.sunrise_interval_after = v;
+			scheduler_set_config(&scfg);
 			updated = true;
 			if (read_bytes != 1) break;
 			continue;
 		} else if (strcasecmp(key, "sunset_interval_before") == 0) {
 			struct wildsonic_config *cfg = console_get_config();
-			if (cfg) cfg->sunset_interval_before = (uint8_t)strtoul(val, NULL, 10);
+			uint8_t v = (uint8_t)strtoul(val, NULL, 10);
+			if (cfg) cfg->sunset_interval_before = v;
+			struct schedule_config scfg;
+			scheduler_get_config(&scfg);
+			scfg.sunset_interval_before = v;
+			scheduler_set_config(&scfg);
 			updated = true;
 			if (read_bytes != 1) break;
 			continue;
 		} else if (strcasecmp(key, "sunset_interval_after") == 0) {
 			struct wildsonic_config *cfg = console_get_config();
-			if (cfg) cfg->sunset_interval_after = (uint8_t)strtoul(val, NULL, 10);
+			uint8_t v = (uint8_t)strtoul(val, NULL, 10);
+			if (cfg) cfg->sunset_interval_after = v;
+			struct schedule_config scfg;
+			scheduler_get_config(&scfg);
+			scfg.sunset_interval_after = v;
+			scheduler_set_config(&scfg);
 			updated = true;
 			if (read_bytes != 1) break;
 			continue;
 		} else if (strcasecmp(key, "sunrise_sunset_rounding") == 0) {
 			struct wildsonic_config *cfg = console_get_config();
-			if (cfg) cfg->sunrise_sunset_rounding = (uint8_t)strtoul(val, NULL, 10);
+			uint8_t v = (uint8_t)strtoul(val, NULL, 10);
+			if (cfg) cfg->sunrise_sunset_rounding = v;
+			struct schedule_config scfg;
+			scheduler_get_config(&scfg);
+			scfg.sunrise_sunset_rounding = v;
+			scheduler_set_config(&scfg);
 			updated = true;
 			if (read_bytes != 1) break;
 			continue;

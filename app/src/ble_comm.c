@@ -1108,7 +1108,31 @@ void ble_comm_send_dev_info(void) {
                   scfg.end_date.day ? scfg.end_date.day : 31);
 
   /* 8. Sun mode */
-  ble_comm_printf("SUNMODE Disabled\r\n");
+  if (scfg.sun_recording_mode != SUN_MODE_DISABLED) {
+    if (scfg.sun_recording_mode == SUN_MODE_SUNRISE) {
+      ble_comm_printf("SUNMODE Sunrise\r\n");
+    } else if (scfg.sun_recording_mode == SUN_MODE_SUNSET) {
+      ble_comm_printf("SUNMODE Sunset\r\n");
+    } else if (scfg.sun_recording_mode == SUN_MODE_SUNRISE_AND_SUNSET) {
+      ble_comm_printf("SUNMODE Sunrise and Sunset\r\n");
+    } else if (scfg.sun_recording_mode == SUN_MODE_SUNRISE_TO_SUNSET) {
+      ble_comm_printf("SUNMODE Sunrise to Sunset\r\n");
+    } else if (scfg.sun_recording_mode == SUN_MODE_SUNSET_TO_SUNRISE) {
+      ble_comm_printf("SUNMODE Sunset to Sunrise\r\n");
+    }
+    k_sleep(K_MSEC(10));
+    ble_comm_printf("SUNRISEAFT %u\r\n", scfg.sunrise_interval_after);
+    k_sleep(K_MSEC(10));
+    ble_comm_printf("SUNSETBEF %u\r\n", scfg.sunset_interval_before);
+    k_sleep(K_MSEC(10));
+    ble_comm_printf("SUNSETAFT %u\r\n", scfg.sunset_interval_after);
+    k_sleep(K_MSEC(10));
+    ble_comm_printf("SUNROUND %u\r\n", scfg.sunrise_sunset_rounding);
+    k_sleep(K_MSEC(10));
+  } else {
+    ble_comm_printf("SUNMODE Disabled\r\n");
+    k_sleep(K_MSEC(10));
+  }
 
   /* 9. Schedule time of day ranges (indices 0..9) */
   for (int i = 0; i < 10; i++) {

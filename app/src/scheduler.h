@@ -55,6 +55,21 @@ struct schedule_date {
 };
 
 /**
+ * @brief Sun recording modes matching canonical WildSonic reference.
+ */
+enum sun_recording_mode {
+	SUN_MODE_DISABLED = 0,
+	SUN_MODE_SUNRISE,
+	SUN_MODE_SUNSET,
+	SUN_MODE_SUNRISE_AND_SUNSET,
+	SUN_MODE_SUNRISE_TO_SUNSET,
+	SUN_MODE_SUNSET_TO_SUNRISE,
+};
+
+#define SCHEDULER_INVALID_LOCATION_COORDINATE ((int32_t)0x80000000)
+#define SCHEDULER_LOCATION_COORDINATE_SCALE   10000000
+
+/**
  * @brief Complete scheduler configuration model.
  */
 struct schedule_config {
@@ -65,6 +80,16 @@ struct schedule_config {
 	int32_t time_zone_offset;        /* Signed seconds offset from UTC (-43200 to +50400) */
 	uint32_t record_length;          /* Session recording duration in seconds */
 	uint32_t sleep_interval;         /* Minimum quiet/pause interval between sessions in seconds */
+
+	/* Solar scheduling & location configuration */
+	int32_t latitude_e7;             /* Signed decimal degrees * 1e7; SCHEDULER_INVALID_LOCATION_COORDINATE if unset */
+	int32_t longitude_e7;            /* Signed decimal degrees * 1e7; SCHEDULER_INVALID_LOCATION_COORDINATE if unset */
+	uint8_t sun_recording_mode;      /* enum sun_recording_mode */
+	uint8_t sunrise_sunset_rounding; /* Rounding interval in minutes (0 = none) */
+	uint8_t sunrise_interval_before; /* Minutes before sunrise to start recording */
+	uint8_t sunrise_interval_after;  /* Minutes after sunrise to end recording */
+	uint8_t sunset_interval_before;  /* Minutes before sunset to start recording */
+	uint8_t sunset_interval_after;   /* Minutes after sunset to end recording */
 };
 
 /**

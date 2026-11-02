@@ -43,6 +43,7 @@ else()
     src/led_indicator.c
     src/ble_comm.c
     src/scheduler_retention.c
+    src/solar_calculator.c
   )
   target_sources_ifdef(CONFIG_WILDSONIC_VERBOSE_LOGS app PRIVATE src/psram_benchmark.c)
   target_sources_ifdef(CONFIG_WILDSONIC_VERBOSE_LOGS app PRIVATE src/sd_benchmark.c)

@@ -70,7 +70,18 @@ struct __attribute__((packed)) wildsonic_persisted_config {
 	uint8_t pending_apply;             /* 1 = pending configuration staged, awaiting reboot apply; 0 = active */
 	uint32_t pending_generation;       /* Monotonic generation counter for pending config */
 	uint32_t applied_generation;       /* Monotonic generation counter for applied config */
-	uint8_t reserved[263];             /* Pad out to exactly 508 bytes before checksum (1 + 4 + 4 + 263 = 272) */
+
+	/* Solar scheduling & location configuration */
+	int32_t latitude_e7;               /* Signed decimal degrees * 1e7 */
+	int32_t longitude_e7;              /* Signed decimal degrees * 1e7 */
+	uint8_t sun_recording_mode;        /* 0 = Disabled, 1 = Sunrise, etc. */
+	uint8_t sunrise_sunset_rounding;   /* Rounding in minutes */
+	uint8_t sunrise_interval_before;   /* Minutes before sunrise */
+	uint8_t sunrise_interval_after;    /* Minutes after sunrise */
+	uint8_t sunset_interval_before;    /* Minutes before sunset */
+	uint8_t sunset_interval_after;     /* Minutes after sunset */
+
+	uint8_t reserved[249];             /* Pad out to exactly 508 bytes before checksum */
 	uint32_t checksum;                 /* Additive byte sum of bytes 0..507 */
 };
 
