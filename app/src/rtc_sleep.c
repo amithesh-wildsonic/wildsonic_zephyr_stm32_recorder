@@ -269,6 +269,7 @@ int rtc_sleep_arm(uint32_t seconds)
 	}
 
 	rtc_timer_active = true;
+	printk("RTC wakeup configured\n");
 #if defined(CONFIG_WILDSONIC_VERBOSE_LOGS)
 	printk("[TEST] RTC_WUT_ARMED: duration=%u s\n", seconds);
 #endif

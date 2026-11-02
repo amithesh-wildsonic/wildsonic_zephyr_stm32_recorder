@@ -6,6 +6,7 @@
 #include <zephyr/kernel.h>
 #include <zephyr/fs/fs.h>
 #include <zephyr/storage/disk_access.h>
+#include <zephyr/drivers/disk/sdmmc_stm32.h>
 #include <ff.h>
 #include <stdio.h>
 #include <string.h>
@@ -247,6 +248,302 @@ int sd_benchmark_run_matrix(void)
 
 	printk("=========================================================================================================\n\n");
 	return 0;
+}
+
+static uint32_t calc_crc32(const uint8_t *data, size_t len)
+{
+	uint32_t crc = 0xFFFFFFFFU;
+	for (size_t i = 0; i < len; i++) {
+		crc ^= data[i];
+		for (int b = 0; b < 8; b++) {
+			crc = (crc >> 1) ^ (0xEDB88320U & -(crc & 1));
+		}
+	}
+	return ~crc;
+}
+
+int sd_benchmark_run_stage1_dma_tests(void)
+{
+	if (recorder_is_active()) {
+		printk("\n[REJECTED] Cannot run SD tests while recording is active.\n\n");
+		return -EBUSY;
+	}
+
+	printk("\n=========================================================================================================\n");
+	printk("                        STAGE 1: STANDALONE SDMMC DMA VERIFICATION SUITE                                  \n");
+	printk("=========================================================================================================\n");
+	printk("Hardware : STM32L476RG (Cortex-M4F @ 72 MHz)\n");
+	printk("SDMMC1   : 4-bit bus @ 8 MHz (CLKDIV=4)\n");
+	printk("DMA2     : Channel 4, Request Slot 7 (32-bit transfer width, shared txrx)\n");
+	printk("---------------------------------------------------------------------------------------------------------\n");
+
+	struct sdmmc_dma_transfer_diag diag;
+	memset(&diag, 0, sizeof(diag));
+	stm32_sdmmc_get_dma_diag(&diag);
+
+	printk("[DMA CONFIG] Initialized: %s | Controller: DMA2 | Channel: %u | Slot: %u\n",
+	       diag.dma_init_success ? "YES (DMA enabled)" : "NO (polling/IT fallback)",
+	       diag.dma_channel, diag.dma_slot);
+
+	if (!diag.dma_init_success) {
+		printk("[STAGE 1 ERROR] SDMMC DMA is not active in driver! Aborting tests.\n");
+		return -ENODEV;
+	}
+
+	uint8_t *wbuf = recorder_get_bounce_buf_a();
+	uint8_t *rbuf = recorder_get_bounce_buf_b();
+	if (!wbuf || !rbuf) {
+		printk("[STAGE 1 ERROR] Failed to obtain test bounce buffers.\n");
+		return -ENOMEM;
+	}
+
+	int tests_passed = 0;
+	int total_tests = 4;
+
+	/* -------------------------------------------------------------------------
+	 * TEST 1: 512-byte transfer (1 sector = 128 DMA items)
+	 * ------------------------------------------------------------------------- */
+	printk("\n--> [TEST 1/4] 512-Byte Single Sector DMA Write & Readback CRC Test...\n");
+	const char *test1_path = "/SD:/dma_test_512b.tmp";
+	for (uint32_t i = 0; i < 512; i++) {
+		wbuf[i] = (uint8_t)(0x3C ^ (i * 7 + 13));
+	}
+	uint32_t crc_w512 = calc_crc32(wbuf, 512);
+
+	struct fs_file_t file;
+	fs_file_t_init(&file);
+	int rc = fs_open(&file, test1_path, FS_O_CREATE | FS_O_WRITE);
+	if (rc != 0) {
+		printk("    [FAIL] fs_open write failed: %d\n", rc);
+		return rc;
+	}
+	ssize_t written = fs_write(&file, wbuf, 512);
+	fs_close(&file);
+	if (written != 512) {
+		printk("    [FAIL] fs_write expected 512 B, got %d\n", (int)written);
+		fs_unlink(test1_path);
+		return -EIO;
+	}
+
+	memset(rbuf, 0, 512);
+	rc = fs_open(&file, test1_path, FS_O_READ);
+	if (rc != 0) {
+		printk("    [FAIL] fs_open read failed: %d\n", rc);
+		fs_unlink(test1_path);
+		return rc;
+	}
+	ssize_t read_bytes = fs_read(&file, rbuf, 512);
+	fs_close(&file);
+	fs_unlink(test1_path);
+	if (read_bytes != 512) {
+		printk("    [FAIL] fs_read expected 512 B, got %d\n", (int)read_bytes);
+		return -EIO;
+	}
+
+	uint32_t crc_r512 = calc_crc32(rbuf, 512);
+	stm32_sdmmc_get_dma_diag(&diag);
+
+	if (crc_w512 == crc_r512 && memcmp(wbuf, rbuf, 512) == 0 && diag.last_initial_dma_items == 128) {
+		printk("    [PASS] 512 B: CRC=0x%08X (match), DMA items=%u (expected 128), DMA cplt=%u, DATAEND=%u\n",
+		       crc_r512, diag.last_initial_dma_items, diag.dma_cplt_count, diag.dataend_cplt_count);
+		tests_passed++;
+	} else {
+		printk("    [FAIL] 512 B mismatch: CRC write=0x%08X read=0x%08X, DMA items=%u (expected 128)\n",
+		       crc_w512, crc_r512, diag.last_initial_dma_items);
+		return -EIO;
+	}
+
+	/* -------------------------------------------------------------------------
+	 * TEST 2: 4 KB transfer (8 sectors = 1024 DMA items)
+	 * ------------------------------------------------------------------------- */
+	printk("\n--> [TEST 2/4] 4 KB (4096-Byte) DMA Write & Readback CRC Test...\n");
+	const char *test2_path = "/SD:/dma_test_4k.tmp";
+	for (uint32_t i = 0; i < 4096; i++) {
+		wbuf[i] = (uint8_t)(0x5A ^ (i * 11 + 29));
+	}
+	uint32_t crc_w4k = calc_crc32(wbuf, 4096);
+
+	rc = fs_open(&file, test2_path, FS_O_CREATE | FS_O_WRITE);
+	if (rc != 0) {
+		printk("    [FAIL] fs_open write failed: %d\n", rc);
+		return rc;
+	}
+	written = fs_write(&file, wbuf, 4096);
+	fs_close(&file);
+	if (written != 4096) {
+		printk("    [FAIL] fs_write expected 4096 B, got %d\n", (int)written);
+		fs_unlink(test2_path);
+		return -EIO;
+	}
+
+	memset(rbuf, 0, 4096);
+	rc = fs_open(&file, test2_path, FS_O_READ);
+	if (rc != 0) {
+		printk("    [FAIL] fs_open read failed: %d\n", rc);
+		fs_unlink(test2_path);
+		return rc;
+	}
+	read_bytes = fs_read(&file, rbuf, 4096);
+	fs_close(&file);
+	fs_unlink(test2_path);
+	if (read_bytes != 4096) {
+		printk("    [FAIL] fs_read expected 4096 B, got %d\n", (int)read_bytes);
+		return -EIO;
+	}
+
+	uint32_t crc_r4k = calc_crc32(rbuf, 4096);
+	stm32_sdmmc_get_dma_diag(&diag);
+
+	if (crc_w4k == crc_r4k && memcmp(wbuf, rbuf, 4096) == 0 && diag.last_initial_dma_items == 1024) {
+		printk("    [PASS] 4 KB: CRC=0x%08X (match), DMA items=%u (expected 1024), DMA cplt=%u, DATAEND=%u\n",
+		       crc_r4k, diag.last_initial_dma_items, diag.dma_cplt_count, diag.dataend_cplt_count);
+		tests_passed++;
+	} else {
+		printk("    [FAIL] 4 KB mismatch: CRC write=0x%08X read=0x%08X, DMA items=%u (expected 1024)\n",
+		       crc_w4k, crc_r4k, diag.last_initial_dma_items);
+		return -EIO;
+	}
+
+	/* -------------------------------------------------------------------------
+	 * TEST 3: 16 KB transfer (32 sectors = 4096 DMA items) - Production Chunk Size
+	 * ------------------------------------------------------------------------- */
+	printk("\n--> [TEST 3/4] 16 KB Production Chunk DMA Write & Readback CRC Test...\n");
+	const char *test3_path = "/SD:/dma_test_16k.tmp";
+	for (uint32_t i = 0; i < 16384; i++) {
+		wbuf[i] = (uint8_t)(0xC3 ^ (i * 17 + 41));
+	}
+	uint32_t crc_w16k = calc_crc32(wbuf, 16384);
+
+	rc = fs_open(&file, test3_path, FS_O_CREATE | FS_O_WRITE);
+	if (rc != 0) {
+		printk("    [FAIL] fs_open write failed: %d\n", rc);
+		return rc;
+	}
+	written = fs_write(&file, wbuf, 16384);
+	fs_close(&file);
+	if (written != 16384) {
+		printk("    [FAIL] fs_write expected 16384 B, got %d\n", (int)written);
+		fs_unlink(test3_path);
+		return -EIO;
+	}
+
+	memset(rbuf, 0, 16384);
+	rc = fs_open(&file, test3_path, FS_O_READ);
+	if (rc != 0) {
+		printk("    [FAIL] fs_open read failed: %d\n", rc);
+		fs_unlink(test3_path);
+		return rc;
+	}
+	read_bytes = fs_read(&file, rbuf, 16384);
+	fs_close(&file);
+	fs_unlink(test3_path);
+	if (read_bytes != 16384) {
+		printk("    [FAIL] fs_read expected 16384 B, got %d\n", (int)read_bytes);
+		return -EIO;
+	}
+
+	uint32_t crc_r16k = calc_crc32(rbuf, 16384);
+	stm32_sdmmc_get_dma_diag(&diag);
+
+	if (crc_w16k == crc_r16k && memcmp(wbuf, rbuf, 16384) == 0 && diag.last_initial_dma_items == 4096) {
+		printk("    [PASS] 16 KB: CRC=0x%08X (match), DMA items=%u (expected 4096), DMA cplt=%u, DATAEND=%u\n",
+		       crc_r16k, diag.last_initial_dma_items, diag.dma_cplt_count, diag.dataend_cplt_count);
+		tests_passed++;
+	} else {
+		printk("    [FAIL] 16 KB mismatch: CRC write=0x%08X read=0x%08X, DMA items=%u (expected 4096)\n",
+		       crc_w16k, crc_r16k, diag.last_initial_dma_items);
+		return -EIO;
+	}
+
+	/* -------------------------------------------------------------------------
+	 * TEST 4: Repeated Sequential DMA Writes (256 KB = 16 x 16 KB) with Full Readback CRC
+	 * ------------------------------------------------------------------------- */
+	printk("\n--> [TEST 4/4] Repeated Sequential 256 KB (16 x 16 KB) Write & CRC Readback...\n");
+	const char *test4_path = "/SD:/dma_seq_256k.tmp";
+	const uint32_t num_chunks = 16;
+	const uint32_t chunk_size = 16384;
+	const uint32_t total_seq_bytes = num_chunks * chunk_size;
+	uint32_t expected_crcs[16];
+
+	rc = fs_open(&file, test4_path, FS_O_CREATE | FS_O_WRITE);
+	if (rc != 0) {
+		printk("    [FAIL] fs_open write failed: %d\n", rc);
+		return rc;
+	}
+
+	uint64_t t_w_start = k_cycle_get_64();
+	for (uint32_t c = 0; c < num_chunks; c++) {
+		for (uint32_t i = 0; i < chunk_size; i++) {
+			wbuf[i] = (uint8_t)((c * 37 + 19) ^ (i & 0xFF));
+		}
+		expected_crcs[c] = calc_crc32(wbuf, chunk_size);
+
+		written = fs_write(&file, wbuf, chunk_size);
+		if (written != (ssize_t)chunk_size) {
+			printk("    [FAIL] Chunk %u fs_write returned %d\n", c, (int)written);
+			fs_close(&file);
+			fs_unlink(test4_path);
+			return -EIO;
+		}
+	}
+	uint64_t t_w_end = k_cycle_get_64();
+	fs_close(&file);
+
+	uint64_t w_elapsed_us = k_cyc_to_us_floor64(t_w_end - t_w_start);
+	uint32_t w_thpt_kb_s = w_elapsed_us ? (uint32_t)(((uint64_t)total_seq_bytes * 1000000ULL) / (w_elapsed_us * 1024ULL)) : 0;
+
+	/* Readback and verify all 16 chunks */
+	rc = fs_open(&file, test4_path, FS_O_READ);
+	if (rc != 0) {
+		printk("    [FAIL] fs_open read failed: %d\n", rc);
+		fs_unlink(test4_path);
+		return rc;
+	}
+
+	int crc_mismatches = 0;
+	uint64_t t_r_start = k_cycle_get_64();
+	for (uint32_t c = 0; c < num_chunks; c++) {
+		read_bytes = fs_read(&file, rbuf, chunk_size);
+		if (read_bytes != (ssize_t)chunk_size) {
+			printk("    [FAIL] Chunk %u fs_read returned %d\n", c, (int)read_bytes);
+			crc_mismatches++;
+			break;
+		}
+
+		uint32_t r_crc = calc_crc32(rbuf, chunk_size);
+		if (r_crc != expected_crcs[c]) {
+			printk("    [FAIL] Chunk %u CRC mismatch: expected 0x%08X, got 0x%08X\n",
+			       c, expected_crcs[c], r_crc);
+			crc_mismatches++;
+		}
+	}
+	uint64_t t_r_end = k_cycle_get_64();
+	fs_close(&file);
+	fs_unlink(test4_path);
+
+	uint64_t r_elapsed_us = k_cyc_to_us_floor64(t_r_end - t_r_start);
+	uint32_t r_thpt_kb_s = r_elapsed_us ? (uint32_t)(((uint64_t)total_seq_bytes * 1000000ULL) / (r_elapsed_us * 1024ULL)) : 0;
+
+	if (crc_mismatches == 0) {
+		printk("    [PASS] 256 KB Sequential: All 16 chunks CRC32 verified!\n");
+		printk("           Write Throughput: %u KB/s (%u ms) | Read Throughput: %u KB/s (%u ms)\n",
+		       w_thpt_kb_s, (unsigned)(w_elapsed_us / 1000ULL),
+		       r_thpt_kb_s, (unsigned)(r_elapsed_us / 1000ULL));
+		tests_passed++;
+	} else {
+		printk("    [FAIL] 256 KB Sequential failed: %d chunk CRC mismatches!\n", crc_mismatches);
+		return -EIO;
+	}
+
+	printk("---------------------------------------------------------------------------------------------------------\n");
+	printk("STAGE 1 SUMMARY: %d of %d tests passed.\n", tests_passed, total_tests);
+	if (tests_passed == total_tests) {
+		printk("VERDICT: >>> ALL STANDALONE SDMMC DMA VERIFICATION TESTS PASSED SUCCESSFULLY! <<<\n");
+	} else {
+		printk("VERDICT: >>> STAGE 1 VERIFICATION FAILED <<<\n");
+	}
+	printk("=========================================================================================================\n\n");
+	return (tests_passed == total_tests) ? 0 : -EIO;
 }
 
 #endif /* CONFIG_WILDSONIC_VERBOSE_LOGS */

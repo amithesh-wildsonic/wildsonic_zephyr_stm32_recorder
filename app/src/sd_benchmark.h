@@ -38,6 +38,11 @@ int sd_benchmark_run_test(enum sd_bench_type type,
 
 /* Execute full benchmark matrix (32 KB, 64 KB, 128 KB, 256 KB, 512 KB) */
 int sd_benchmark_run_matrix(void);
+
+/* Execute Stage 1 standalone SDMMC DMA verification tests:
+ * 512 B, 4 KB, 16 KB, repeated sequential 256 KB with readback CRC verification.
+ */
+int sd_benchmark_run_stage1_dma_tests(void);
 #else
 static inline int sd_benchmark_run_test(enum sd_bench_type type,
                                         uint32_t block_bytes,
@@ -48,6 +53,10 @@ static inline int sd_benchmark_run_test(enum sd_bench_type type,
 	return -38; /* -ENOSYS */
 }
 static inline int sd_benchmark_run_matrix(void)
+{
+	return -38; /* -ENOSYS */
+}
+static inline int sd_benchmark_run_stage1_dma_tests(void)
 {
 	return -38; /* -ENOSYS */
 }

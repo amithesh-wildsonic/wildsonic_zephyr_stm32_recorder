@@ -1411,6 +1411,10 @@ static void recorder_thread_fn(void *p1, void *p2, void *p3) {
         s_last_evaluated_window_utc = 0;
         /* Do not update scheduler_retention_save on failed sessions: preserve last successful end */
         /* Do not increment s_schedule_cycle on failure */
+        if (s_rec_last_stats.sd_write_error != 0 || failure == -EIO || failure == -ENODEV ||
+            !recorder_is_storage_available()) {
+          printk("[SCHEDULER] Recording opportunity skipped due to storage failure\n");
+        }
         printk("[SCHEDULER] Session %u failed (%d); recording opportunity skipped, schedule remains active for next window.\n\n> ",
                s_rec_req.cycle, failure);
         atomic_set(&s_schedule_paused, 0);
@@ -1544,6 +1548,11 @@ static void dispatch_recording_session(const struct schedule_interval *interval,
 void main_scheduler_service_step(void) {
   if (atomic_get(&s_reboot_pending) || atomic_get(&s_schedule_paused) ||
       atomic_get(&s_rec_busy) || recorder_is_active()) {
+    return;
+  }
+
+  /* Prevent new recordings from starting while storage remains faulted */
+  if (!recorder_is_storage_available()) {
     return;
   }
 

@@ -5,9 +5,15 @@
  * so MSI is switched to 48 MHz (range 11). SYSCLK stays on HSI16 -> PLL.
  * Add 10-47k pull-ups on CMD and D0-D3 if your breakout has none.
  */
+#include <zephyr/dt-bindings/dma/stm32_dma.h>
+
 &clk_msi {
 	status = "okay";
 	msi-range = <11>;
+};
+
+&dma2 {
+	status = "okay";
 };
 
 &sdmmc1 {
@@ -18,6 +24,8 @@
 	bus-width = <4>;
 	clk-div = <4>;		/* STM32L4 formula: 48 MHz / (4 + 2) = 8 MHz; four-bit bus (4.0 MB/s bus) */
 	disk-name = "SD";
+	dmas = <&dma2 4 7 (STM32_DMA_32BITS | STM32_DMA_PRIORITY_HIGH)>;
+	dma-names = "txrx";
 };
 
 /*

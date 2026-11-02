@@ -931,6 +931,7 @@ int recorder_init(void) {
   printk("[DBG] fs_mount ret=%d\n", ret);
 #endif
   if (ret) {
+    s_storage_state = STORAGE_STATE_FAULT;
     LOG_ERR("SD mount failed: %d (card inserted? exFAT/FAT32 formatted? "
             "wiring/overlay?)",
             ret);
@@ -980,6 +981,8 @@ int recorder_storage_recover(void) {
     return -EBUSY;
   }
   s_storage_recovering = true;
+
+  /* Step 1: Unmount existing filesystem if mounted */
   if (mounted) {
     int ret = fs_unmount(&mp);
     if (ret != 0) {
@@ -988,32 +991,44 @@ int recorder_storage_recover(void) {
     mounted = false;
   }
 
-  /* FatFs unmount powers the disk off through CTRL_DEINIT. Reinitialize the
-   * disk before mounting the volume again; do not retry file operations on
-   * the stale mounted filesystem after an SDMMC timeout. */
+  /* Step 2: Ensure disk is marked deinitialized so disk_access_init executes hardware reset */
+  (void)disk_access_ioctl("SD", DISK_IOCTL_CTRL_DEINIT, NULL);
+
+  /* Step 3: Reinitialize SDMMC peripheral and SD card (resets hardware via RCC reset line) */
   int ret = disk_access_init("SD");
   if (ret != 0) {
     LOG_ERR("Storage recovery: SDMMC reinitialization failed: %d", ret);
     s_storage_state = STORAGE_STATE_FAULT;
     s_storage_recovery_result = ret;
     s_storage_recovering = false;
+    printk("[ERROR] Storage recovery failed\n");
     return ret;
   }
 
+  /* Step 4: Mount filesystem volume */
   ret = fs_mount(&mp);
   if (ret != 0) {
     LOG_ERR("Storage recovery: filesystem remount failed: %d", ret);
     s_storage_state = STORAGE_STATE_FAULT;
     s_storage_recovery_result = ret;
     s_storage_recovering = false;
+    printk("[ERROR] Storage recovery failed\n");
     return ret;
   }
   mounted = true;
-  ret = disk_access_ioctl("SD", DISK_IOCTL_CTRL_DEINIT, NULL);
-  if (ret != 0) {
-    LOG_WRN("Storage recovery: could not release temporary disk reference: %d", ret);
+
+  /* Step 5: Verify that the host controller and card are actually idle */
+  int idle_rc = recorder_sd_verify_idle();
+  if (idle_rc != 0) {
+    LOG_ERR("Storage recovery: controller not idle after remount (%d)", idle_rc);
+    s_storage_state = STORAGE_STATE_FAULT;
+    s_storage_recovery_result = idle_rc;
+    s_storage_recovering = false;
+    printk("[ERROR] Storage recovery failed\n");
+    return idle_rc;
   }
 
+  /* Step 6: Mark healthy and clear writer errors */
   s_storage_state = STORAGE_STATE_HEALTHY;
   s_storage_recovery_result = 0;
   sd_writer_err = 0;
@@ -1455,6 +1470,10 @@ int recorder_get_last_error(void) { return s_recorder_last_error; }
 int recorder_get_last_sd_error(void) { return s_recorder_last_sd_error; }
 int recorder_get_storage_recovery_result(void) { return s_storage_recovery_result; }
 
+bool recorder_is_storage_available(void) {
+  return mounted && (s_storage_state == STORAGE_STATE_HEALTHY);
+}
+
 void recorder_request_stop(void) {
   if (s_recorder_stop_reason == RECORDER_STOP_NONE) {
     s_recorder_stop_reason = RECORDER_STOP_USER;
@@ -1599,6 +1618,40 @@ int recorder_sleep(uint32_t seconds, uint32_t *wake_recovery_us) {
   if (s_storage_state == STORAGE_STATE_HEALTHY) {
     int sd_idle_rc = recorder_sd_verify_idle();
     if (sd_idle_rc != 0) {
+      /* Operation still active: bounded wait */
+      int64_t wait_deadline = k_uptime_get() + 50;
+      while (k_uptime_get() < wait_deadline) {
+        k_sleep(K_MSEC(5));
+        sd_idle_rc = recorder_sd_verify_idle();
+        if (sd_idle_rc == 0) {
+          break;
+        }
+      }
+    }
+
+    if (sd_idle_rc != 0) {
+      /* Controller stuck: Controlled recovery */
+#if defined(CONFIG_SOC_SERIES_STM32L4X)
+      if (SDMMC1->DCTRL & (SDMMC_DCTRL_DTEN | SDMMC_DCTRL_DMAEN)) {
+        SDMMC1->DCTRL = 0;
+        k_busy_wait(100);
+      }
+#endif
+      sd_idle_rc = recorder_sd_verify_idle();
+      if (sd_idle_rc != 0) {
+        int rec_rc = recorder_storage_recover();
+        if (rec_rc == 0) {
+          sd_idle_rc = recorder_sd_verify_idle();
+        } else {
+          sd_idle_rc = rec_rc;
+        }
+      }
+    }
+
+    if (sd_idle_rc != 0) {
+      s_storage_state = STORAGE_STATE_FAULT;
+      printk("[ERROR] Storage controller failed to become idle\n");
+      printk("[ERROR] Standby cancelled; device remaining awake\n");
 #if defined(CONFIG_WILDSONIC_VERBOSE_LOGS)
       printk("[TEST] Sleep precondition failed: SDMMC controller not idle (%d)\n", sd_idle_rc);
 #endif
@@ -1638,6 +1691,7 @@ int recorder_sleep(uint32_t seconds, uint32_t *wake_recovery_us) {
   const uint64_t t_pre = k_uptime_get();
 
   s_power_state = REC_PWR_STOP2;
+  printk("Entering Stop 2\n");
   int res = rtc_sleep_enter_stop2(seconds);
   s_power_state = REC_PWR_WAKE_RECOVERY;
 
@@ -1776,12 +1830,15 @@ int recorder_record_session(uint32_t seconds, uint32_t cycle,
   static uint8_t hdr[WAV_HEADER_BYTES] __aligned(4);
   int ret;
 
-  if (!mounted) {
+  if (!mounted || s_storage_state == STORAGE_STATE_FAULT) {
     led_indicator_set(LED_IND_ERROR);
     st.err = -ENODEV;
+    st.sd_write_error = -ENODEV;
     s_recorder_last_error = -ENODEV;
     s_recorder_last_sd_error = -ENODEV;
-    recorder_active = false;
+    printk("[ERROR] Recording failed: SD write error (-19)\n");
+    printk("[ERROR] Storage unavailable\n");
+    printk("[ERROR] Recording session failed: -19\n");
     if (out)
       *out = st;
     return -ENODEV;
@@ -2847,6 +2904,11 @@ int recorder_record_session(uint32_t seconds, uint32_t cycle,
   recorder_active = false;
   if (err != 0 && !recorder_abort_requested) {
     led_indicator_set(LED_IND_ERROR);
+    if (st.sd_write_error != 0) {
+      printk("[ERROR] Recording failed: SD write error (%d)\n", st.sd_write_error);
+    } else if (err == -EIO || err == -ENODEV || err == -ETIMEDOUT || err == -ENOSPC) {
+      printk("[ERROR] Recording failed: SD write error (%d)\n", err);
+    }
     printk("[ERROR] Recording session failed: %d\n", err);
 #if defined(CONFIG_WILDSONIC_VERBOSE_LOGS)
     printk("  Diagnostics: acquired=%llu, written=%llu, uncommitted=%llu, drops=%llu\n",
@@ -2867,8 +2929,12 @@ int recorder_record_session(uint32_t seconds, uint32_t cycle,
       st.sd_recovery_result = s_storage_recovery_result;
       if (s_storage_recovery_result != 0) {
         LOG_ERR("Storage recovery failed: %d", s_storage_recovery_result);
+        printk("[ERROR] Storage unavailable\n");
       }
       if (out) *out = st;
+    } else if (storage_error == -ENODEV || storage_error == -ENOSPC || !mounted ||
+               s_storage_state == STORAGE_STATE_FAULT) {
+      printk("[ERROR] Storage unavailable\n");
     }
   } else {
     led_indicator_set(LED_IND_OFF);

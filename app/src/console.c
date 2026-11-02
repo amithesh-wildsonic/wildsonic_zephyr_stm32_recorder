@@ -2459,6 +2459,11 @@ static int console_process_line_internal(char *cmd_line, bool from_ble, char *ou
 		sd_benchmark_run_matrix();
 		return 0;
 	}
+	if (strcasecmp(p, "SDDMA") == 0 || strcasecmp(p, "SD_DMA") == 0 ||
+	    strcasecmp(p, "SDTEST") == 0 || strcasecmp(p, "SD_TEST") == 0) {
+		sd_benchmark_run_stage1_dma_tests();
+		return 0;
+	}
 #endif
 
 	if (strcasecmp(p, "STATUS") == 0) {

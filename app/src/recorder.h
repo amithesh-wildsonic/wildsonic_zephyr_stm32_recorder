@@ -186,6 +186,7 @@ void recorder_request_stop_reason(enum recorder_stop_reason reason);
 void recorder_request_stop(void);
 bool recorder_is_active(void);
 bool recorder_is_shutdown_ready(void);
+bool recorder_is_storage_available(void);
 int recorder_sd_verify_idle(void);
 bool recorder_is_abort_requested(void);
 int recorder_wait_idle(uint32_t timeout_ms);
