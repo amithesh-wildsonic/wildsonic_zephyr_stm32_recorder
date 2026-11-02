@@ -10,6 +10,7 @@
 #include "scheduler.h"
 #include "recorder.h"
 #include "audio_in.h"
+#include "dsp.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -202,12 +203,14 @@ static void unpack_record_to_system(const struct wildsonic_persisted_config *rec
 		cfg->audio_sampling_width = eff_bits;
 		cfg->num_audio_channels = eff_ch;
 		cfg->lower_cutoff_frequency = rec->lower_cutoff_frequency;
-		cfg->upper_cutoff_frequency = rec->upper_cutoff_frequency;
+		uint32_t validated_lpf = dsp_validate_lpf_cutoff(eff_rate, rec->upper_cutoff_frequency);
+		cfg->upper_cutoff_frequency = validated_lpf;
 		cfg->folder_structure = rec->folder_structure;
 	}
 
 	struct app_settings *settings = main_get_settings();
 	if (settings) {
+		uint32_t validated_lpf = dsp_validate_lpf_cutoff(eff_rate, rec->upper_cutoff_frequency);
 		settings->sample_rate = eff_rate;
 		settings->sample_bits = (uint16_t)eff_bits;
 		settings->channels = (uint16_t)eff_ch;
@@ -216,8 +219,8 @@ static void unpack_record_to_system(const struct wildsonic_persisted_config *rec
 		settings->digital_gain = powf(10.0f, ((float)rec->mic_gain_times_ten / 10.0f) / 20.0f);
 		settings->hpf_cutoff_hz = rec->lower_cutoff_frequency;
 		settings->hpf_enabled = (rec->lower_cutoff_frequency > 0);
-		settings->lpf_cutoff_hz = rec->upper_cutoff_frequency;
-		settings->lpf_enabled = (rec->upper_cutoff_frequency > 0);
+		settings->lpf_cutoff_hz = validated_lpf;
+		settings->lpf_enabled = (validated_lpf > 0);
 		settings->psram_staging_enabled = (rec->psram_staging_enabled != 0);
 	}
 
@@ -699,128 +702,249 @@ int config_store_import_sd(void)
 		return rc;
 	}
 
+	struct wildsonic_config orig_cfg = *console_get_config();
+	struct schedule_config orig_scfg;
+	scheduler_get_config(&orig_scfg);
+
 	char line[128];
 	size_t line_pos = 0;
 	char ch;
 	bool updated = false;
+	bool import_error = false;
+	bool discarding_oversized = false;
+	ssize_t read_bytes = 0;
 
-	while (fs_read(&file, &ch, 1) == 1) {
-		if (ch == '\r') continue;
-		if (ch == '\n' || line_pos >= sizeof(line) - 1) {
-			line[line_pos] = '\0';
-			line_pos = 0;
-
-			/* Trim comment */
-			char *hash = strchr(line, '#');
-			if (hash) *hash = '\0';
-
-			/* Trim leading whitespace */
-			char *start = line;
-			while (*start && isspace((unsigned char)*start)) start++;
-
-			/* Trim trailing whitespace */
-			size_t len = strlen(start);
-			while (len > 0 && isspace((unsigned char)start[len - 1])) {
-				start[--len] = '\0';
-			}
-
-			if (len == 0) continue;
-
-			char *eq = strchr(start, '=');
-			if (!eq) continue;
-
-			*eq = '\0';
-			char *key = start;
-			char *val = eq + 1;
-
-			/* Trim key trailing spaces */
-			size_t klen = strlen(key);
-			while (klen > 0 && isspace((unsigned char)key[klen - 1])) {
-				key[--klen] = '\0';
-			}
-
-			/* Trim val leading spaces */
-			while (*val && isspace((unsigned char)*val)) val++;
-			/* Trim val trailing spaces */
-			size_t vlen = strlen(val);
-			while (vlen > 0 && isspace((unsigned char)val[vlen - 1])) {
-				val[--vlen] = '\0';
-			}
-
-			char cmd_buf[128];
-			cmd_buf[0] = '\0';
-
-			if (strcasecmp(key, "sampling_frequency") == 0 || strcasecmp(key, "samf") == 0) {
-				snprintf(cmd_buf, sizeof(cmd_buf), "SAMF %s", val);
-			} else if (strcasecmp(key, "record_length") == 0 || strcasecmp(key, "rect") == 0) {
-				snprintf(cmd_buf, sizeof(cmd_buf), "RECT %s", val);
-			} else if (strcasecmp(key, "sleep_interval") == 0 || strcasecmp(key, "sleep") == 0) {
-				snprintf(cmd_buf, sizeof(cmd_buf), "SLEEP %s", val);
-			} else if (strcasecmp(key, "bits_per_sample") == 0 || strcasecmp(key, "btps") == 0) {
-				snprintf(cmd_buf, sizeof(cmd_buf), "BTPS %s", val);
-			} else if (strcasecmp(key, "number_of_channels") == 0 || strcasecmp(key, "numch") == 0) {
-				snprintf(cmd_buf, sizeof(cmd_buf), "NUMCH %s", val);
-			} else if (strcasecmp(key, "mic_gain") == 0 || strcasecmp(key, "gain") == 0) {
-				snprintf(cmd_buf, sizeof(cmd_buf), "GAIN %s", val);
-			} else if (strcasecmp(key, "lower_cutoff_frequency") == 0 || strcasecmp(key, "lcutoff") == 0) {
-				snprintf(cmd_buf, sizeof(cmd_buf), "LCUTOFF %s", val);
-			} else if (strcasecmp(key, "upper_cutoff_frequency") == 0 || strcasecmp(key, "ucutoff") == 0) {
-				snprintf(cmd_buf, sizeof(cmd_buf), "UCUTOFF %s", val);
-			} else if (strcasecmp(key, "date_range") == 0 || strcasecmp(key, "daterange") == 0) {
-				snprintf(cmd_buf, sizeof(cmd_buf), "DATERANGE %s", val);
-			} else if (strncasecmp(key, "time_of_day_", 12) == 0) {
-				if (isdigit((unsigned char)key[12]) && key[13] == '\0') {
-					int idx = key[12] - '0';
-					snprintf(cmd_buf, sizeof(cmd_buf), "TIMEOFDAY %d %s", idx, val);
-				} else {
-					printk("\nUnknown or BAD config option : %s\n", key);
+	while ((read_bytes = fs_read(&file, &ch, 1)) == 1 || line_pos > 0) {
+		if (read_bytes == 1) {
+			if (discarding_oversized) {
+				if (ch == '\n') {
+					discarding_oversized = false;
+					line_pos = 0;
 				}
-			} else if (strcasecmp(key, "time_of_day") == 0 || strcasecmp(key, "timeofday") == 0) {
-				snprintf(cmd_buf, sizeof(cmd_buf), "TIMEOFDAY %s", val);
-			} else if (strcasecmp(key, "days_of_week") == 0 || strcasecmp(key, "daysofweek") == 0) {
-				snprintf(cmd_buf, sizeof(cmd_buf), "DAYSOFWEEK %s", val);
-			} else if (strcasecmp(key, "time_zone") == 0 || strcasecmp(key, "timezone") == 0) {
-				snprintf(cmd_buf, sizeof(cmd_buf), "TIMEZONE %s", val);
-			} else if (strcasecmp(key, "system_time") == 0 || strcasecmp(key, "datetime") == 0) {
-				snprintf(cmd_buf, sizeof(cmd_buf), "DATETIME %s", val);
-			} else if (strcasecmp(key, "folder_structure") == 0 || strcasecmp(key, "fldr") == 0) {
-				snprintf(cmd_buf, sizeof(cmd_buf), "FLDR %s", val);
-			} else if (strcasecmp(key, "transmission_mode") == 0 || strcasecmp(key, "gsm") == 0 ||
-			           strcasecmp(key, "location") == 0 ||
-			           strcasecmp(key, "sms_frequency") == 0 || strcasecmp(key, "smsfreq") == 0 ||
-			           strcasecmp(key, "low_battery_threshold") == 0 || strcasecmp(key, "lbat") == 0 ||
-			           strcasecmp(key, "sun_recording_mode") == 0 ||
-			           strcasecmp(key, "sunrise_interval_before") == 0 ||
-			           strcasecmp(key, "sunrise_interval_after") == 0 ||
-			           strcasecmp(key, "sunset_interval_before") == 0 ||
-			           strcasecmp(key, "sunset_interval_after") == 0 ||
-			           strcasecmp(key, "sunrise_sunset_rounding") == 0) {
-				LOG_INF("config_store_import_sd: ignoring unsupported hardware setting '%s'", key);
-			} else if (strcasecmp(key, "build_version") == 0 ||
-			           strcasecmp(key, "build_datetime") == 0 ||
-			           strcasecmp(key, "build_sha") == 0) {
-				LOG_INF("config_store_import_sd: ignoring status metadata '%s'", key);
+				continue;
+			}
+
+			if (ch == '\r') {
+				continue;
+			}
+
+			if (ch != '\n') {
+				if (line_pos >= sizeof(line) - 1) {
+					LOG_WRN("config_store_import_sd: line exceeds 127 bytes, discarding");
+					import_error = true;
+					discarding_oversized = true;
+					line_pos = 0;
+					continue;
+				}
+				line[line_pos++] = ch;
+				continue;
+			}
+		}
+
+		/* We have reached a newline or EOF with pending characters */
+		line[line_pos] = '\0';
+		line_pos = 0;
+
+		/* Trim comment */
+		char *hash = strchr(line, '#');
+		if (hash) *hash = '\0';
+
+		/* Trim leading whitespace */
+		char *start = line;
+		while (*start && isspace((unsigned char)*start)) start++;
+
+		/* Trim trailing whitespace */
+		size_t len = strlen(start);
+		while (len > 0 && isspace((unsigned char)start[len - 1])) {
+			start[--len] = '\0';
+		}
+
+		if (len == 0) {
+			if (read_bytes != 1) break;
+			continue;
+		}
+
+		char *eq = strchr(start, '=');
+		if (!eq) {
+			printk("\nUnknown or BAD config option : %s\n", start);
+			import_error = true;
+			if (read_bytes != 1) break;
+			continue;
+		}
+
+		*eq = '\0';
+		char *key = start;
+		char *val = eq + 1;
+
+		/* Trim key trailing spaces */
+		size_t klen = strlen(key);
+		while (klen > 0 && isspace((unsigned char)key[klen - 1])) {
+			key[--klen] = '\0';
+		}
+
+		/* Trim val leading spaces */
+		while (*val && isspace((unsigned char)*val)) val++;
+		/* Trim val trailing spaces */
+		size_t vlen = strlen(val);
+		while (vlen > 0 && isspace((unsigned char)val[vlen - 1])) {
+			val[--vlen] = '\0';
+		}
+
+		char cmd_buf[128];
+		cmd_buf[0] = '\0';
+
+		if (strcasecmp(key, "sampling_frequency") == 0 || strcasecmp(key, "samf") == 0) {
+			snprintf(cmd_buf, sizeof(cmd_buf), "SAMF %s", val);
+		} else if (strcasecmp(key, "record_length") == 0 || strcasecmp(key, "rect") == 0) {
+			snprintf(cmd_buf, sizeof(cmd_buf), "RECT %s", val);
+		} else if (strcasecmp(key, "sleep_interval") == 0 || strcasecmp(key, "sleep") == 0) {
+			snprintf(cmd_buf, sizeof(cmd_buf), "SLEEP %s", val);
+		} else if (strcasecmp(key, "bits_per_sample") == 0 || strcasecmp(key, "btps") == 0) {
+			snprintf(cmd_buf, sizeof(cmd_buf), "BTPS %s", val);
+		} else if (strcasecmp(key, "number_of_channels") == 0 || strcasecmp(key, "numch") == 0) {
+			snprintf(cmd_buf, sizeof(cmd_buf), "NUMCH %s", val);
+		} else if (strcasecmp(key, "mic_gain") == 0 || strcasecmp(key, "gain") == 0) {
+			snprintf(cmd_buf, sizeof(cmd_buf), "GAIN %s", val);
+		} else if (strcasecmp(key, "lower_cutoff_frequency") == 0 || strcasecmp(key, "lcutoff") == 0) {
+			snprintf(cmd_buf, sizeof(cmd_buf), "LCUTOFF %s", val);
+		} else if (strcasecmp(key, "upper_cutoff_frequency") == 0 || strcasecmp(key, "ucutoff") == 0) {
+			snprintf(cmd_buf, sizeof(cmd_buf), "UCUTOFF %s", val);
+		} else if (strcasecmp(key, "date_range") == 0 || strcasecmp(key, "daterange") == 0) {
+			snprintf(cmd_buf, sizeof(cmd_buf), "DATERANGE %s", val);
+		} else if (strncasecmp(key, "time_of_day_", 12) == 0) {
+			if (isdigit((unsigned char)key[12]) && key[13] == '\0') {
+				int idx = key[12] - '0';
+				snprintf(cmd_buf, sizeof(cmd_buf), "TIMEOFDAY %d %s", idx, val);
 			} else {
 				printk("\nUnknown or BAD config option : %s\n", key);
+				import_error = true;
+				if (read_bytes != 1) break;
+				continue;
 			}
-
-			if (cmd_buf[0] != '\0') {
-				int rc = console_process_line_source(cmd_buf, false, NULL, 0);
-				if (rc == 0) {
+		} else if (strcasecmp(key, "time_of_day") == 0 || strcasecmp(key, "timeofday") == 0) {
+			snprintf(cmd_buf, sizeof(cmd_buf), "TIMEOFDAY %s", val);
+		} else if (strcasecmp(key, "days_of_week") == 0 || strcasecmp(key, "daysofweek") == 0) {
+			snprintf(cmd_buf, sizeof(cmd_buf), "DAYSOFWEEK %s", val);
+		} else if (strcasecmp(key, "time_zone") == 0 || strcasecmp(key, "timezone") == 0) {
+			snprintf(cmd_buf, sizeof(cmd_buf), "TIMEZONE %s", val);
+		} else if (strcasecmp(key, "system_time") == 0 || strcasecmp(key, "datetime") == 0) {
+			snprintf(cmd_buf, sizeof(cmd_buf), "DATETIME %s", val);
+		} else if (strcasecmp(key, "folder_structure") == 0 || strcasecmp(key, "fldr") == 0) {
+			snprintf(cmd_buf, sizeof(cmd_buf), "FLDR %s", val);
+		} else if (strcasecmp(key, "transmission_mode") == 0 || strcasecmp(key, "gsm") == 0) {
+			struct wildsonic_config *cfg = console_get_config();
+			if (cfg) cfg->transmission_mode = (uint32_t)strtoul(val, NULL, 10);
+			updated = true;
+			if (read_bytes != 1) break;
+			continue;
+		} else if (strcasecmp(key, "location") == 0) {
+			struct wildsonic_config *cfg = console_get_config();
+			if (cfg) {
+				int lat = 0, lon = 0;
+				if (sscanf(val, "%d %d", &lat, &lon) == 2) {
+					cfg->location_lat_e7 = lat;
+					cfg->location_lon_e7 = lon;
 					updated = true;
-				} else {
-					LOG_WRN("config_store_import_sd: command '%s' failed (%d)", cmd_buf, rc);
+					if (read_bytes != 1) break;
+					continue;
 				}
 			}
+			updated = true;
+			if (read_bytes != 1) break;
+			continue;
+		} else if (strcasecmp(key, "sms_frequency") == 0 || strcasecmp(key, "smsfreq") == 0) {
+			struct wildsonic_config *cfg = console_get_config();
+			if (cfg) cfg->sms_frequency = (uint32_t)strtoul(val, NULL, 10);
+			updated = true;
+			if (read_bytes != 1) break;
+			continue;
+		} else if (strcasecmp(key, "low_battery_threshold") == 0 || strcasecmp(key, "lbat") == 0) {
+			struct wildsonic_config *cfg = console_get_config();
+			if (cfg) cfg->low_battery_threshold = (uint16_t)strtoul(val, NULL, 10);
+			updated = true;
+			if (read_bytes != 1) break;
+			continue;
+		} else if (strcasecmp(key, "sun_recording_mode") == 0) {
+			struct wildsonic_config *cfg = console_get_config();
+			if (cfg) cfg->sun_recording_mode = (uint8_t)strtoul(val, NULL, 10);
+			updated = true;
+			if (read_bytes != 1) break;
+			continue;
+		} else if (strcasecmp(key, "sunrise_interval_before") == 0) {
+			struct wildsonic_config *cfg = console_get_config();
+			if (cfg) cfg->sunrise_interval_before = (uint8_t)strtoul(val, NULL, 10);
+			updated = true;
+			if (read_bytes != 1) break;
+			continue;
+		} else if (strcasecmp(key, "sunrise_interval_after") == 0) {
+			struct wildsonic_config *cfg = console_get_config();
+			if (cfg) cfg->sunrise_interval_after = (uint8_t)strtoul(val, NULL, 10);
+			updated = true;
+			if (read_bytes != 1) break;
+			continue;
+		} else if (strcasecmp(key, "sunset_interval_before") == 0) {
+			struct wildsonic_config *cfg = console_get_config();
+			if (cfg) cfg->sunset_interval_before = (uint8_t)strtoul(val, NULL, 10);
+			updated = true;
+			if (read_bytes != 1) break;
+			continue;
+		} else if (strcasecmp(key, "sunset_interval_after") == 0) {
+			struct wildsonic_config *cfg = console_get_config();
+			if (cfg) cfg->sunset_interval_after = (uint8_t)strtoul(val, NULL, 10);
+			updated = true;
+			if (read_bytes != 1) break;
+			continue;
+		} else if (strcasecmp(key, "sunrise_sunset_rounding") == 0) {
+			struct wildsonic_config *cfg = console_get_config();
+			if (cfg) cfg->sunrise_sunset_rounding = (uint8_t)strtoul(val, NULL, 10);
+			updated = true;
+			if (read_bytes != 1) break;
+			continue;
+		} else if (strcasecmp(key, "build_version") == 0 ||
+		           strcasecmp(key, "build_datetime") == 0 ||
+		           strcasecmp(key, "build_sha") == 0) {
+			LOG_INF("config_store_import_sd: ignoring status metadata '%s'", key);
+			if (read_bytes != 1) break;
+			continue;
 		} else {
-			line[line_pos++] = ch;
+			printk("\nUnknown or BAD config option : %s\n", key);
+			import_error = true;
+			if (read_bytes != 1) break;
+			continue;
 		}
+
+		if (cmd_buf[0] != '\0') {
+			int rc = console_process_line_source(cmd_buf, false, NULL, 0);
+			if (rc == 0) {
+				updated = true;
+			} else {
+				LOG_WRN("config_store_import_sd: command '%s' failed (%d)", cmd_buf, rc);
+				import_error = true;
+			}
+		}
+
+		if (read_bytes != 1) break;
+	}
+
+	if (read_bytes < 0) {
+		LOG_ERR("config_store_import_sd: fs_read failed (%d)", (int)read_bytes);
+		import_error = true;
 	}
 
 	fs_close(&file);
 
+	if (import_error) {
+		LOG_ERR("config_store_import_sd: import failed, rolling back to previous configuration");
+		*console_get_config() = orig_cfg;
+		scheduler_set_config(&orig_scfg);
+		config_store_rollback_pending();
+		updated = false;
+	}
 	if (updated) {
 		config_store_save();
+	}
+	if (updated) {
+		console_sync_staged_to_active();
 	}
 
 	/* Rename config.ini to config.bak (or unlink if rename fails) */
@@ -833,7 +957,7 @@ int config_store_import_sd(void)
 	}
 
 	config_store_write_status_file(status_path);
-	return 0;
+	return import_error ? -EINVAL : 0;
 #else
 	return 0;
 #endif

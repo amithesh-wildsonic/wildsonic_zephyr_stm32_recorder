@@ -1,0 +1,64 @@
+# Prerequisites
+*.d
+
+# Compiled Object files
+*.slo
+*.lo
+*.o
+*.obj
+
+# Precompiled Headers
+*.gch
+*.pch
+
+# Compiled Dynamic libraries
+*.so
+*.dylib
+*.dll
+
+# Fortran module files
+*.mod
+*.smod
+
+# Compiled Static libraries
+*.lai
+*.la
+*.a
+*.lib
+
+# Symbols information
+*.map
+
+# Executables
+*.elf
+*.exe
+*.out
+*.app
+.vscode/
+
+# Exception for HMSoft.exe
+!tools/HMSoft-10-2541-V707/HMSoft.exe
+!tools/HMSoft-10-2541-V707/CCLoader/CCLoader.exe
+
+# Backup files
+*~
+*.swp
+*.swo
+*.bak
+*.tmp
+
+# Generated output
+temp*
+build/out
+build/dictionary
+build/buildrv
+lib/bson_encode/test/out
+lib/config/include/device_config_version.hpp
+tools/bin_unpack/out
+tools/trace_parse/out
+tools/config_app/build
+tools/config_app/dist
+*.log
+app/version.cpp
+loader/version.cpp
+*.spec

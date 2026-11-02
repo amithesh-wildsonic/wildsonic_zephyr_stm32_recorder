@@ -304,13 +304,36 @@ int psram_write(uint32_t address, const uint8_t *data, uint32_t length) {
   uint32_t offset = 0;
   int ret = 0;
 
+  bool is_quad = (quad_mode_enabled || quad_test_active || quad_write_override);
+  uint32_t burst_limit = is_quad ? active_burst_size : PSRAM_IS66WVS_SAFE_BURST_BYTES_SPI;
+
+  QSPI_CommandTypeDef cmd = {0};
+  if (is_quad) {
+    cmd.Instruction = CMD_QUAD_WRITE;
+    cmd.InstructionMode = QSPI_INSTRUCTION_1_LINE;
+    cmd.AddressMode = QSPI_ADDRESS_4_LINES;
+    cmd.AddressSize = QSPI_ADDRESS_24_BITS;
+    cmd.AlternateByteMode = QSPI_ALTERNATE_BYTES_NONE;
+    cmd.DataMode = QSPI_DATA_4_LINES;
+    cmd.DummyCycles = 0;
+  } else {
+    cmd.Instruction = CMD_WRITE;
+    cmd.InstructionMode = QSPI_INSTRUCTION_1_LINE;
+    cmd.AddressMode = QSPI_ADDRESS_1_LINE;
+    cmd.AddressSize = QSPI_ADDRESS_24_BITS;
+    cmd.AlternateByteMode = QSPI_ALTERNATE_BYTES_NONE;
+    cmd.DataMode = QSPI_DATA_1_LINE;
+    cmd.DummyCycles = 0;
+  }
+  cmd.DdrMode = QSPI_DDR_MODE_DISABLE;
+  cmd.DdrHoldHalfCycle = QSPI_DDR_HHC_ANALOG_DELAY;
+  cmd.SIOOMode = QSPI_SIOO_INST_EVERY_CMD;
+
   while (offset < length) {
     uint32_t current_addr = address + offset;
     uint32_t page_remaining = PSRAM_IS66WVS_PAGE_SIZE -
                               (current_addr & (PSRAM_IS66WVS_PAGE_SIZE - 1));
 
-    bool is_quad = (quad_mode_enabled || quad_test_active || quad_write_override);
-    uint32_t burst_limit = is_quad ? active_burst_size : PSRAM_IS66WVS_SAFE_BURST_BYTES_SPI;
     uint32_t chunk = length - offset;
     if (chunk > burst_limit) {
       chunk = burst_limit;
@@ -319,31 +342,8 @@ int psram_write(uint32_t address, const uint8_t *data, uint32_t length) {
       chunk = page_remaining;
     }
 
-    QSPI_CommandTypeDef cmd = {0};
-    if (is_quad) {
-      cmd.Instruction = CMD_QUAD_WRITE;
-      cmd.InstructionMode = QSPI_INSTRUCTION_1_LINE;
-      cmd.AddressMode = QSPI_ADDRESS_4_LINES;
-      cmd.AddressSize = QSPI_ADDRESS_24_BITS;
-      cmd.Address = current_addr;
-      cmd.AlternateByteMode = QSPI_ALTERNATE_BYTES_NONE;
-      cmd.DataMode = QSPI_DATA_4_LINES;
-      cmd.NbData = chunk;
-      cmd.DummyCycles = 0;
-    } else {
-      cmd.Instruction = CMD_WRITE;
-      cmd.InstructionMode = QSPI_INSTRUCTION_1_LINE;
-      cmd.AddressMode = QSPI_ADDRESS_1_LINE;
-      cmd.AddressSize = QSPI_ADDRESS_24_BITS;
-      cmd.Address = current_addr;
-      cmd.AlternateByteMode = QSPI_ALTERNATE_BYTES_NONE;
-      cmd.DataMode = QSPI_DATA_1_LINE;
-      cmd.NbData = chunk;
-      cmd.DummyCycles = 0;
-    }
-    cmd.DdrMode = QSPI_DDR_MODE_DISABLE;
-    cmd.DdrHoldHalfCycle = QSPI_DDR_HHC_ANALOG_DELAY;
-    cmd.SIOOMode = QSPI_SIOO_INST_EVERY_CMD;
+    cmd.Address = current_addr;
+    cmd.NbData = chunk;
 
     /* Ensure controller is ready before command */
     if (hqspi.State != HAL_QSPI_STATE_READY) {
@@ -397,13 +397,36 @@ int psram_read(uint32_t address, uint8_t *data, uint32_t length) {
   uint32_t offset = 0;
   int ret = 0;
 
+  bool is_quad = (quad_mode_enabled || quad_test_active || quad_read_override);
+  uint32_t burst_limit = is_quad ? active_burst_size : PSRAM_IS66WVS_SAFE_BURST_BYTES_SPI;
+
+  QSPI_CommandTypeDef cmd = {0};
+  if (is_quad) {
+    cmd.Instruction = CMD_QUAD_FAST_READ;
+    cmd.InstructionMode = QSPI_INSTRUCTION_1_LINE;
+    cmd.AddressMode = QSPI_ADDRESS_4_LINES;
+    cmd.AddressSize = QSPI_ADDRESS_24_BITS;
+    cmd.AlternateByteMode = QSPI_ALTERNATE_BYTES_NONE;
+    cmd.DataMode = QSPI_DATA_4_LINES;
+    cmd.DummyCycles = 6;
+  } else {
+    cmd.Instruction = CMD_READ;
+    cmd.InstructionMode = QSPI_INSTRUCTION_1_LINE;
+    cmd.AddressMode = QSPI_ADDRESS_1_LINE;
+    cmd.AddressSize = QSPI_ADDRESS_24_BITS;
+    cmd.AlternateByteMode = QSPI_ALTERNATE_BYTES_NONE;
+    cmd.DataMode = QSPI_DATA_1_LINE;
+    cmd.DummyCycles = 0;
+  }
+  cmd.DdrMode = QSPI_DDR_MODE_DISABLE;
+  cmd.DdrHoldHalfCycle = QSPI_DDR_HHC_ANALOG_DELAY;
+  cmd.SIOOMode = QSPI_SIOO_INST_EVERY_CMD;
+
   while (offset < length) {
     uint32_t current_addr = address + offset;
     uint32_t page_remaining = PSRAM_IS66WVS_PAGE_SIZE -
                               (current_addr & (PSRAM_IS66WVS_PAGE_SIZE - 1));
 
-    bool is_quad = (quad_mode_enabled || quad_test_active || quad_read_override);
-    uint32_t burst_limit = is_quad ? active_burst_size : PSRAM_IS66WVS_SAFE_BURST_BYTES_SPI;
     uint32_t chunk = length - offset;
     if (chunk > burst_limit) {
       chunk = burst_limit;
@@ -412,31 +435,8 @@ int psram_read(uint32_t address, uint8_t *data, uint32_t length) {
       chunk = page_remaining;
     }
 
-    QSPI_CommandTypeDef cmd = {0};
-    if (is_quad) {
-      cmd.Instruction = CMD_QUAD_FAST_READ;
-      cmd.InstructionMode = QSPI_INSTRUCTION_1_LINE;
-      cmd.AddressMode = QSPI_ADDRESS_4_LINES;
-      cmd.AddressSize = QSPI_ADDRESS_24_BITS;
-      cmd.Address = current_addr;
-      cmd.AlternateByteMode = QSPI_ALTERNATE_BYTES_NONE;
-      cmd.DataMode = QSPI_DATA_4_LINES;
-      cmd.NbData = chunk;
-      cmd.DummyCycles = 6;
-    } else {
-      cmd.Instruction = CMD_READ;
-      cmd.InstructionMode = QSPI_INSTRUCTION_1_LINE;
-      cmd.AddressMode = QSPI_ADDRESS_1_LINE;
-      cmd.AddressSize = QSPI_ADDRESS_24_BITS;
-      cmd.Address = current_addr;
-      cmd.AlternateByteMode = QSPI_ALTERNATE_BYTES_NONE;
-      cmd.DataMode = QSPI_DATA_1_LINE;
-      cmd.NbData = chunk;
-      cmd.DummyCycles = 0;
-    }
-    cmd.DdrMode = QSPI_DDR_MODE_DISABLE;
-    cmd.DdrHoldHalfCycle = QSPI_DDR_HHC_ANALOG_DELAY;
-    cmd.SIOOMode = QSPI_SIOO_INST_EVERY_CMD;
+    cmd.Address = current_addr;
+    cmd.NbData = chunk;
 
     /* Ensure controller is ready before command */
     if (hqspi.State != HAL_QSPI_STATE_READY) {

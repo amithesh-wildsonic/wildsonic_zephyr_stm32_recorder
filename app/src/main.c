@@ -24,6 +24,7 @@
 #include <zephyr/kernel.h>
 #include <zephyr/logging/log.h>
 #include <zephyr/logging/log_ctrl.h>
+#include <zephyr/sys/atomic.h>
 #include <stm32_ll_rcc.h>
 
 #include "audio_in.h"
@@ -42,6 +43,7 @@
 #include "audio_format.h"
 #include "ble_comm.h"
 #include "scheduler_retention.h"
+#include "sd_benchmark.h"
 #if defined(CONFIG_WILDSONIC_VERBOSE_LOGS)
 #include "psram_benchmark.h"
 #endif
@@ -190,12 +192,9 @@ static bool console_read_line(char *buf, size_t max_len) {
         }
       } while (console_async_get_char(&c) == 0);
     } else {
-      /* When user is idle at the prompt (pos == 0), flush pending logs and service scheduler */
+      /* When user is idle at the prompt (pos == 0), flush pending logs */
       if (pos == 0) {
         log_process();
-        if (!main_is_scheduler_paused()) {
-          main_scheduler_service_step();
-        }
       }
     }
   }
@@ -337,9 +336,12 @@ static void print_settings(void) {
     printk("    - Stage 4: Harm Notch : %s (%u Hz, Q=10.0)\n",
            settings.harmonic_notch_enabled ? "ON" : "OFF",
            settings.notch_freq_hz * 2);
+    bool effective_lpf = settings.lpf_enabled &&
+                         (settings.lpf_cutoff_hz > 0) &&
+                         (settings.lpf_cutoff_hz < (uint32_t)((float)settings.sample_rate * 0.49f));
     printk("    - Stage 5: LPF Filter : %s (%u Hz 4th-Order Butterworth, -24 "
            "dB/oct)\n",
-           settings.lpf_enabled ? "ON" : "OFF", settings.lpf_cutoff_hz);
+           effective_lpf ? "ON" : "OFF", settings.lpf_cutoff_hz);
   }
   printk("  Expected Audio Output :\n");
   printk("    - Samples per file    : %llu frames\n", total_samples);
@@ -842,8 +844,11 @@ static void run_guided_config(void) {
     printk("    - Harmonic Notch    : %s (%u Hz)\n",
            staged.harmonic_notch_enabled ? "ON" : "OFF",
            staged.notch_freq_hz * 2);
+    bool effective_lpf = staged.lpf_enabled &&
+                         (staged.lpf_cutoff_hz > 0) &&
+                         (staged.lpf_cutoff_hz < (uint32_t)((float)staged.sample_rate * 0.49f));
     printk("    - Low-Pass Filter   : %s (%u Hz)\n",
-           staged.lpf_enabled ? "ON" : "OFF", staged.lpf_cutoff_hz);
+           effective_lpf ? "ON" : "OFF", staged.lpf_cutoff_hz);
   }
   printk("  PSRAM Audio Staging   : %s\n", staged.psram_staging_enabled
                                                ? "ENABLED"
@@ -1234,11 +1239,18 @@ static void run_scheduled_recording(void) {
     recorder_set_psram_staging_enabled(settings.psram_staging_enabled);
     int ret = recorder_record_session(interval.duration_seconds, cycle, mode, &st);
 
-    last_end_time_local = interval.start_time_utc + scfg.time_zone_offset + interval.duration_seconds;
+    /* Read actual RTC completion time to prevent finalization eating into sleep interval */
+    struct rtc_calendar_time tend;
+    time_t end_utc;
+    if (rtc_calendar_get(&tend) == 0 && rtc_calendar_is_valid()) {
+      end_utc = scheduler_calendar_to_epoch(&tend);
+    } else {
+      end_utc = interval.start_time_utc + interval.duration_seconds;
+    }
+    last_end_time_local = end_utc + scfg.time_zone_offset;
 
     if (ret != 0 || st.err != 0) {
       int failure = (ret != 0) ? ret : st.err;
-      last_end_time_local = interval.start_time_utc + scfg.time_zone_offset + interval.duration_seconds;
       bool storage_recovery_ok = recorder_get_last_sd_error() == 0 ||
                                  recorder_get_storage_recovery_result() == 0;
       if ((failure == -EIO || failure == -ETIMEDOUT || failure == -ENOBUFS || failure == -EBUSY) &&
@@ -1274,8 +1286,8 @@ static void run_scheduled_recording(void) {
  * Autonomous Scheduler Engine & State
  * ============================================================================== */
 
-static bool s_schedule_paused = false;
-static volatile bool s_reboot_pending = false;
+static atomic_t s_schedule_paused = ATOMIC_INIT(0);
+static atomic_t s_reboot_pending = ATOMIC_INIT(0);
 static uint32_t s_schedule_cycle = 1;
 static time_t s_last_end_time_local = 0;
 static time_t s_last_evaluated_window_utc = 0;
@@ -1286,8 +1298,7 @@ void main_scheduler_resume(void) {
   if (main_is_reboot_pending()) {
     return;
   }
-  if (s_schedule_paused) {
-    s_schedule_paused = false;
+  if (atomic_cas(&s_schedule_paused, 1, 0)) {
     s_last_evaluated_window_utc = 0;
     if (led_indicator_get() == LED_IND_ERROR) {
       led_indicator_set(LED_IND_OFF);
@@ -1297,8 +1308,7 @@ void main_scheduler_resume(void) {
 }
 
 void main_scheduler_pause(void) {
-  if (!s_schedule_paused) {
-    s_schedule_paused = true;
+  if (atomic_cas(&s_schedule_paused, 0, 1)) {
     if (!main_is_reboot_pending()) {
       printk("[SCHEDULER] Scheduled recording paused.\n");
     }
@@ -1310,11 +1320,18 @@ void main_scheduler_pause(void) {
  * ============================================================================== */
 
 #define RECORDER_THREAD_STACK_SIZE 4096
-#define RECORDER_THREAD_PRIORITY   3
+#define RECORDER_THREAD_PRIORITY   1
+
+#define SCHEDULER_THREAD_STACK_SIZE 2048
+#define SCHEDULER_THREAD_PRIORITY   4
 
 K_THREAD_STACK_DEFINE(recorder_thread_stack, RECORDER_THREAD_STACK_SIZE);
 static struct k_thread recorder_thread_data;
 static k_tid_t recorder_tid;
+
+K_THREAD_STACK_DEFINE(scheduler_thread_stack, SCHEDULER_THREAD_STACK_SIZE);
+static struct k_thread scheduler_thread_data;
+static k_tid_t scheduler_tid;
 
 struct recorder_request {
   uint32_t duration_sec;
@@ -1328,7 +1345,7 @@ struct recorder_request {
 static struct recorder_request s_rec_req;
 static struct k_sem s_rec_trigger_sem;
 static struct k_sem s_rec_done_sem;
-static volatile bool s_rec_busy = false;
+static atomic_t s_rec_busy = ATOMIC_INIT(0);
 static int s_rec_last_result = 0;
 static struct rec_stats s_rec_last_stats;
 
@@ -1339,7 +1356,7 @@ static void recorder_thread_fn(void *p1, void *p2, void *p3) {
 
   while (1) {
     k_sem_take(&s_rec_trigger_sem, K_FOREVER);
-    s_rec_busy = true;
+    atomic_set(&s_rec_busy, 1);
 
     /* Ensure audio hardware rate matches active settings before session begins */
     if (audio_in_rate() != settings.sample_rate) {
@@ -1356,6 +1373,11 @@ static void recorder_thread_fn(void *p1, void *p2, void *p3) {
     recorder_set_psram_staging_enabled(settings.psram_staging_enabled);
 
     memset(&s_rec_last_stats, 0, sizeof(s_rec_last_stats));
+#if defined(CONFIG_WILDSONIC_VERBOSE_LOGS)
+    if (s_rec_req.is_autonomous) {
+      printk("[TEST] NEXT_RECORDING_STARTED: session=%u, duration=%u s\n", s_rec_req.cycle, s_rec_req.duration_sec);
+    }
+#endif
     s_rec_last_result = recorder_record_session(s_rec_req.duration_sec,
                                                s_rec_req.cycle,
                                                s_rec_req.mode,
@@ -1368,43 +1390,44 @@ static void recorder_thread_fn(void *p1, void *p2, void *p3) {
              (unsigned long long)s_rec_last_stats.samples_written, s_rec_req.duration_sec);
 #endif
 
+      /* Read exact completion time from RTC calendar to avoid sleep interval eating */
+      struct rtc_calendar_time tend;
+      time_t end_utc;
+      if (rtc_calendar_get(&tend) == 0 && rtc_calendar_is_valid()) {
+        end_utc = scheduler_calendar_to_epoch(&tend);
+      } else {
+        end_utc = s_rec_req.start_time_utc + s_rec_req.duration_sec;
+      }
+
       if (recorder_is_abort_requested()) {
         if (!main_is_reboot_pending() && recorder_get_stop_reason() == RECORDER_STOP_USER) {
           printk("[SCHEDULER] Recording aborted by user stop request.\n");
           printk("[SCHEDULER] Scheduled recording paused. Enter commands or press Enter to resume.\n\n> ");
         }
-        s_schedule_paused = true;
+        atomic_set(&s_schedule_paused, 1);
       } else if (s_rec_last_result != 0 || s_rec_last_stats.err != 0) {
         int failure = (s_rec_last_result != 0) ? s_rec_last_result : s_rec_last_stats.err;
-        time_t failed_end_utc = s_rec_req.start_time_utc + s_rec_req.duration_sec;
-        s_last_end_time_local = failed_end_utc + s_rec_req.tz_offset;
+        s_last_end_time_local = end_utc + s_rec_req.tz_offset;
         s_last_evaluated_window_utc = 0;
         /* Do not update scheduler_retention_save on failed sessions: preserve last successful end */
-
-        s_schedule_cycle++;
-        if (settings.cycles > 0 && s_schedule_cycle > settings.cycles) {
-          printk("\n[SCHEDULER] Configured target cycles (%u) completed.\n\n> ", settings.cycles);
-          s_schedule_paused = true;
-        } else {
-          printk("[SCHEDULER] Session %u failed (%d); recording opportunity skipped, schedule remains active for next window.\n\n> ",
-                 s_rec_req.cycle, failure);
-          s_schedule_paused = false;
-        }
+        /* Do not increment s_schedule_cycle on failure */
+        printk("[SCHEDULER] Session %u failed (%d); recording opportunity skipped, schedule remains active for next window.\n\n> ",
+               s_rec_req.cycle, failure);
+        atomic_set(&s_schedule_paused, 0);
       } else {
-        time_t end_utc = s_rec_req.start_time_utc + s_rec_req.duration_sec;
         s_last_end_time_local = end_utc + s_rec_req.tz_offset;
         scheduler_retention_save(end_utc);
 
         s_schedule_cycle++;
         if (settings.cycles > 0 && s_schedule_cycle > settings.cycles) {
           printk("\n[SCHEDULER] Configured target cycles (%u) completed successfully.\n\n> ", settings.cycles);
-          s_schedule_paused = true;
+          atomic_set(&s_schedule_paused, 1);
         }
         s_last_evaluated_window_utc = 0;
       }
     }
 
-    s_rec_busy = false;
+    atomic_set(&s_rec_busy, 0);
     k_sem_give(&s_rec_done_sem);
   }
 }
@@ -1416,22 +1439,81 @@ static int s_last_sleep_error = 0;
 static int64_t s_last_sleep_error_log_ms = 0;
 
 bool main_is_scheduler_paused(void) {
-  return s_schedule_paused;
+  return atomic_get(&s_schedule_paused) != 0;
 }
 
 bool main_is_reboot_pending(void) {
-  return s_reboot_pending;
+  return atomic_get(&s_reboot_pending) != 0;
 }
 
 void main_set_reboot_pending(bool pending) {
-  s_reboot_pending = pending;
+  atomic_set(&s_reboot_pending, pending ? 1 : 0);
   if (pending) {
-    s_schedule_paused = true;
+    atomic_set(&s_schedule_paused, 1);
   }
 }
 
+static void dispatch_recording_session(const struct schedule_interval *interval, int32_t tz_offset) {
+  struct rtc_calendar_time cur_time;
+  if (rtc_calendar_get(&cur_time) != 0 || !rtc_calendar_is_valid()) {
+    return;
+  }
+
+  time_t now_utc = scheduler_calendar_to_epoch(&cur_time);
+  time_t now_local = now_utc + tz_offset;
+
+  char utc_str[32], local_str[32], date_buf[64], dow_buf[32], tz_buf[16];
+  struct rtc_calendar_time now_local_cal;
+  scheduler_epoch_to_calendar(now_local, &now_local_cal);
+
+  rtc_calendar_format(&cur_time, utc_str, sizeof(utc_str));
+  rtc_calendar_format(&now_local_cal, local_str, sizeof(local_str));
+
+  struct schedule_config scfg;
+  scheduler_get_config(&scfg);
+
+  if (scfg.start_date.year > 0 || scfg.end_date.year > 0) {
+    scheduler_format_date_range(&scfg.start_date, &scfg.end_date, date_buf, sizeof(date_buf));
+  } else {
+    snprintf(date_buf, sizeof(date_buf), "ALL (Unconstrained)");
+  }
+  scheduler_format_days_of_week(scfg.day_of_week_mask, dow_buf, sizeof(dow_buf));
+  scheduler_format_timezone(tz_offset, tz_buf, sizeof(tz_buf));
+
+#if defined(CONFIG_WILDSONIC_VERBOSE_LOGS)
+  printk("\n=========================================================================\n");
+  printk("           [SCHEDULER] AUTONOMOUS RECORDING SESSION %u START              \n", s_schedule_cycle);
+  printk("=========================================================================\n");
+  printk("  Current UTC Time      : %s\n", utc_str);
+  printk("  Current Local Time    : %s (%s)\n", local_str, tz_buf);
+  printk("  Active Date Range     : %s\n", date_buf);
+  printk("  Days of Week Mask     : %s (0x%02X)\n", dow_buf, scfg.day_of_week_mask);
+  printk("  Session Duration      : %u seconds\n", interval->duration_seconds);
+  printk("  Inter-Session Sleep   : %u seconds\n", scfg.sleep_interval);
+  printk("  Recording Mode        : %s\n", mode_to_string(settings.mode));
+  printk("  Sampling Rate / Bits  : %u Hz / 16-bit\n", settings.sample_rate);
+  printk("  Block Size / Pool     : %u samples (%u B) / %u blocks\n",
+         CONFIG_AUDIO_BLOCK_SAMPLES, (uint32_t)(CONFIG_AUDIO_BLOCK_SAMPLES * (CONFIG_AUDIO_SAMPLE_BITS / 8)),
+         CONFIG_AUDIO_NUM_BLOCKS);
+  printk("  Storage Destination   : SDMMC (/SD:)\n");
+  printk("  Control               : Asynchronous console active; type commands or 'stop'\n");
+  printk("=========================================================================\n");
+#endif
+
+  /* Dispatch autonomous recording to recorder_thread without blocking console REPL */
+  s_rec_req.duration_sec = interval->duration_seconds;
+  s_rec_req.cycle = s_schedule_cycle;
+  s_rec_req.mode = settings.mode;
+  s_rec_req.is_autonomous = true;
+  s_rec_req.start_time_utc = interval->start_time_utc;
+  s_rec_req.tz_offset = tz_offset;
+  atomic_set(&s_rec_busy, 1);
+  k_sem_give(&s_rec_trigger_sem);
+}
+
 void main_scheduler_service_step(void) {
-  if (s_reboot_pending || s_schedule_paused || s_rec_busy || recorder_is_active()) {
+  if (atomic_get(&s_reboot_pending) || atomic_get(&s_schedule_paused) ||
+      atomic_get(&s_rec_busy) || recorder_is_active()) {
     return;
   }
 
@@ -1457,7 +1539,6 @@ void main_scheduler_service_step(void) {
   scheduler_set_config(&scfg);
 
   time_t now_utc = scheduler_calendar_to_epoch(&cur_time);
-  time_t now_local = now_utc + scfg.time_zone_offset;
 
   struct schedule_interval interval;
   int calc_res = scheduler_calculate_next(&scfg, now_utc, s_last_end_time_local, &interval);
@@ -1472,50 +1553,7 @@ void main_scheduler_service_step(void) {
   s_no_window_logged = false;
 
   if (interval.is_immediate || interval.wait_seconds == 0) {
-    char utc_str[32], local_str[32], date_buf[64], dow_buf[32], tz_buf[16];
-    struct rtc_calendar_time now_local_cal;
-    scheduler_epoch_to_calendar(now_local, &now_local_cal);
-
-    rtc_calendar_format(&cur_time, utc_str, sizeof(utc_str));
-    rtc_calendar_format(&now_local_cal, local_str, sizeof(local_str));
-
-    if (scfg.start_date.year > 0 || scfg.end_date.year > 0) {
-      scheduler_format_date_range(&scfg.start_date, &scfg.end_date, date_buf, sizeof(date_buf));
-    } else {
-      snprintf(date_buf, sizeof(date_buf), "ALL (Unconstrained)");
-    }
-    scheduler_format_days_of_week(scfg.day_of_week_mask, dow_buf, sizeof(dow_buf));
-    scheduler_format_timezone(scfg.time_zone_offset, tz_buf, sizeof(tz_buf));
-
-#if defined(CONFIG_WILDSONIC_VERBOSE_LOGS)
-    printk("\n=========================================================================\n");
-    printk("           [SCHEDULER] AUTONOMOUS RECORDING SESSION %u START              \n", s_schedule_cycle);
-    printk("=========================================================================\n");
-    printk("  Current UTC Time      : %s\n", utc_str);
-    printk("  Current Local Time    : %s (%s)\n", local_str, tz_buf);
-    printk("  Active Date Range     : %s\n", date_buf);
-    printk("  Days of Week Mask     : %s (0x%02X)\n", dow_buf, scfg.day_of_week_mask);
-    printk("  Session Duration      : %u seconds\n", interval.duration_seconds);
-    printk("  Inter-Session Sleep   : %u seconds\n", scfg.sleep_interval);
-    printk("  Recording Mode        : %s\n", mode_to_string(settings.mode));
-    printk("  Sampling Rate / Bits  : %u Hz / 16-bit\n", settings.sample_rate);
-    printk("  Block Size / Pool     : %u samples (%u B) / %u blocks\n",
-           CONFIG_AUDIO_BLOCK_SAMPLES, (uint32_t)(CONFIG_AUDIO_BLOCK_SAMPLES * (CONFIG_AUDIO_SAMPLE_BITS / 8)),
-           CONFIG_AUDIO_NUM_BLOCKS);
-    printk("  Storage Destination   : SDMMC (/SD:)\n");
-    printk("  Control               : Asynchronous console active; type commands or 'stop'\n");
-    printk("=========================================================================\n");
-#endif
-
-    /* Dispatch autonomous recording to recorder_thread without blocking console REPL */
-    s_rec_req.duration_sec = interval.duration_seconds;
-    s_rec_req.cycle = s_schedule_cycle;
-    s_rec_req.mode = settings.mode;
-    s_rec_req.is_autonomous = true;
-    s_rec_req.start_time_utc = interval.start_time_utc;
-    s_rec_req.tz_offset = scfg.time_zone_offset;
-    s_rec_busy = true;
-    k_sem_give(&s_rec_trigger_sem);
+    dispatch_recording_session(&interval, scfg.time_zone_offset);
     return;
   } else {
     /* Standby wait for upcoming window: enter STM32L476 Stop 2 with strict RTC-only wakeup */
@@ -1536,7 +1574,7 @@ void main_scheduler_service_step(void) {
     printk("  Entering STM32L476 Stop 2 low-power standby (strict RTC-only wake)...\n");
 #endif
 
-    while (!s_schedule_paused && !recorder_is_abort_requested()) {
+    while (!atomic_get(&s_schedule_paused) && !recorder_is_abort_requested()) {
       struct rtc_calendar_time now_cal;
       if (rtc_calendar_get(&now_cal) != 0 || !rtc_calendar_is_valid()) {
         break;
@@ -1550,6 +1588,10 @@ void main_scheduler_service_step(void) {
 
       /* Enforce safe sleep chunk bounds (max 65535 s for 16-bit RTC wake timer) */
       uint32_t sleep_chunk = (remaining_sec > 65535) ? 65535 : (uint32_t)remaining_sec;
+
+#if defined(CONFIG_WILDSONIC_VERBOSE_LOGS)
+      printk("[TEST] SLEEP_INTERVAL_STARTED: duration=%u s\n", sleep_chunk);
+#endif
 
       s_sleep_attempt_counter++;
       uint32_t attempt_num = s_sleep_attempt_counter;
@@ -1586,10 +1628,13 @@ void main_scheduler_service_step(void) {
         s_consecutive_sleep_failures = 0;
         s_sleep_backoff_until_ms = 0;
         s_last_sleep_error = 0;
+#if defined(CONFIG_WILDSONIC_VERBOSE_LOGS)
+        printk("[TEST] SCHEDULER_RESUMED\n");
+#endif
       }
     }
 
-    if (s_schedule_paused || recorder_is_abort_requested()) {
+    if (atomic_get(&s_schedule_paused) || recorder_is_abort_requested()) {
       return;
     }
 
@@ -1604,53 +1649,22 @@ void main_scheduler_service_step(void) {
       return;
     }
 
-    /* Start recording session at configured scheduled time */
-    char utc_str[32], local_str[32], date_buf[64], dow_buf[32], tz_buf[16];
-    struct rtc_calendar_time now_local_cal;
-    time_t wake_local = wake_utc + scfg.time_zone_offset;
-    scheduler_epoch_to_calendar(wake_local, &now_local_cal);
-
-    rtc_calendar_format(&wake_cal, utc_str, sizeof(utc_str));
-    rtc_calendar_format(&now_local_cal, local_str, sizeof(local_str));
-
-    if (scfg.start_date.year > 0 || scfg.end_date.year > 0) {
-      scheduler_format_date_range(&scfg.start_date, &scfg.end_date, date_buf, sizeof(date_buf));
-    } else {
-      snprintf(date_buf, sizeof(date_buf), "ALL (Unconstrained)");
-    }
-    scheduler_format_days_of_week(scfg.day_of_week_mask, dow_buf, sizeof(dow_buf));
-    scheduler_format_timezone(scfg.time_zone_offset, tz_buf, sizeof(tz_buf));
-
-#if defined(CONFIG_WILDSONIC_VERBOSE_LOGS)
-    printk("\n=========================================================================\n");
-    printk("           [SCHEDULER] AUTONOMOUS RECORDING SESSION %u START              \n", s_schedule_cycle);
-    printk("=========================================================================\n");
-    printk("  Current UTC Time      : %s\n", utc_str);
-    printk("  Current Local Time    : %s (%s)\n", local_str, tz_buf);
-    printk("  Active Date Range     : %s\n", date_buf);
-    printk("  Days of Week Mask     : %s (0x%02X)\n", dow_buf, scfg.day_of_week_mask);
-    printk("  Session Duration      : %u seconds\n", interval.duration_seconds);
-    printk("  Inter-Session Sleep   : %u seconds\n", scfg.sleep_interval);
-    printk("  Recording Mode        : %s\n", mode_to_string(settings.mode));
-    printk("  Sampling Rate / Bits  : %u Hz / 16-bit\n", settings.sample_rate);
-    printk("  Block Size / Pool     : %u samples (%u B) / %u blocks\n",
-           CONFIG_AUDIO_BLOCK_SAMPLES, (uint32_t)(CONFIG_AUDIO_BLOCK_SAMPLES * (CONFIG_AUDIO_SAMPLE_BITS / 8)),
-           CONFIG_AUDIO_NUM_BLOCKS);
-    printk("  Storage Destination   : SDMMC (/SD:)\n");
-    printk("  Control               : Asynchronous console active; type commands or 'stop'\n");
-    printk("=========================================================================\n");
-#endif
-
-    /* Dispatch autonomous recording to recorder_thread without blocking console REPL */
-    s_rec_req.duration_sec = interval.duration_seconds;
-    s_rec_req.cycle = s_schedule_cycle;
-    s_rec_req.mode = settings.mode;
-    s_rec_req.is_autonomous = true;
-    s_rec_req.start_time_utc = interval.start_time_utc;
-    s_rec_req.tz_offset = scfg.time_zone_offset;
-    s_rec_busy = true;
+    dispatch_recording_session(&interval, scfg.time_zone_offset);
     k_sem_give(&s_rec_trigger_sem);
     return;
+  }
+}
+
+static void scheduler_thread_fn(void *p1, void *p2, void *p3) {
+  ARG_UNUSED(p1);
+  ARG_UNUSED(p2);
+  ARG_UNUSED(p3);
+
+  while (1) {
+    if (!main_is_scheduler_paused()) {
+      main_scheduler_service_step();
+    }
+    k_sleep(K_MSEC(100));
   }
 }
 
@@ -1728,7 +1742,55 @@ void main_psram_command(int matched, const char *arg1, const char *arg2) {
            psram_is_present() ? "IS66WVS4M8 Detected" : "Hardware Not Detected",
            psram_is_integrity_verified() ? "Integrity Verified" : "Integrity Unverified",
            psram_is_quad_mode() ? "Quad I/O Active" : "1-Line SPI Fallback");
-    printk("  Usage: psram on | psram off | psram status | psram burst <bytes>\n\n");
+    printk("  Storage Pipeline  : %s\n",
+           recorder_get_pipeline_mode_str(recorder_get_pipeline_mode()));
+#if defined(CONFIG_WILDSONIC_VERBOSE_LOGS)
+    struct psram_staging_stats pstat;
+    psram_staging_get_stats(&pstat);
+    printk("  PSRAM Physical Capacity: %u MB\n", pstat.physical_capacity_bytes >> 20);
+    printk("  PSRAM Audio Allocation : %u MB\n", pstat.capacity_bytes >> 20);
+    printk("  PSRAM Reserved Capacity: %u MB\n", pstat.reserved_bytes >> 20);
+    printk("  PSRAM Slot Count       : %u\n", pstat.slot_count);
+    printk("  PSRAM Slot Size        : %u KB\n", pstat.slot_size_bytes >> 10);
+    printk("  PSRAM Current Occupancy: %u KB (%u B)\n", pstat.occupied_bytes >> 10, pstat.occupied_bytes);
+    printk("  PSRAM High-Water Mark  : %u KB (%u B)\n", pstat.high_water_bytes >> 10, pstat.high_water_bytes);
+    printk("  PSRAM Free Slots       : %u\n", pstat.free_slots);
+    printk("  PSRAM Full Events      : %u\n", pstat.full_buffer_events);
+    printk("  PSRAM Rejected Audio Blocks: %u\n", pstat.rejected_blocks);
+    printk("  SD Writer Average Throughput: Available after recording session\n");
+    printk("  SD Writer Worst-Case Latency: Available after recording session\n");
+#else
+    printk("  Allocation        : 3 MB audio staging (12 slots x 256 KB), 1 MB reserved\n");
+#endif
+    printk("  Usage: psram on | psram off | psram status | psram burst <bytes> | psram mode <sync|async|direct>\n\n");
+  } else if (strcmp(a1, "mode") == 0 || strcmp(a1, "pipeline") == 0) {
+    if (matched >= 3) {
+      if (recorder_is_active()) {
+        printk("\n[REJECTED] Cannot change storage pipeline while recording is active.\n\n");
+        return;
+      }
+      if (strcasecmp(a2, "sync") == 0 || strcasecmp(a2, "b") == 0) {
+        recorder_set_pipeline_mode(STORAGE_PIPELINE_PSRAM_SYNC);
+        settings.psram_staging_enabled = true;
+        recorder_set_psram_staging_enabled(true);
+        printk("\nStorage pipeline set to: Mode B (Synchronous PSRAM Read + SD Write)\n\n");
+      } else if (strcasecmp(a2, "async") == 0 || strcasecmp(a2, "c") == 0 || strcasecmp(a2, "pingpong") == 0) {
+        recorder_set_pipeline_mode(STORAGE_PIPELINE_PSRAM_ASYNC);
+        settings.psram_staging_enabled = true;
+        recorder_set_psram_staging_enabled(true);
+        printk("\nStorage pipeline set to: Mode C (Asynchronous Ping-Pong PSRAM Staging)\n\n");
+      } else if (strcasecmp(a2, "direct") == 0 || strcasecmp(a2, "a") == 0 || strcasecmp(a2, "sram") == 0) {
+        recorder_set_pipeline_mode(STORAGE_PIPELINE_DIRECT_SRAM);
+        settings.psram_staging_enabled = false;
+        recorder_set_psram_staging_enabled(false);
+        printk("\nStorage pipeline set to: Mode A (Direct SRAM Queue to SD)\n\n");
+      } else {
+        printk("\nError: Unknown pipeline mode '%s'. Options: sync (Mode B), async (Mode C), direct (Mode A)\n\n", a2);
+      }
+    } else {
+      printk("\nCurrent storage pipeline mode: %s\nUsage: psram mode <sync|async|direct>\n\n",
+             recorder_get_pipeline_mode_str(recorder_get_pipeline_mode()));
+    }
   } else if (strcmp(a1, "burst") == 0) {
     if (matched >= 3) {
       if (recorder_is_active()) {
@@ -1747,6 +1809,8 @@ void main_psram_command(int matched, const char *arg1, const char *arg2) {
              psram_get_burst_size());
     }
 #if defined(CONFIG_WILDSONIC_VERBOSE_LOGS)
+  } else if (strcmp(a1, "sdbench") == 0 || strcmp(a1, "sd_bench") == 0) {
+    sd_benchmark_run_matrix();
   } else if (strcmp(a1, "bench") == 0) {
     if (recorder_is_active()) {
       printk("\n[REJECTED] Cannot run PSRAM benchmark while recording is active.\n\n");
@@ -1780,7 +1844,7 @@ void main_psram_command(int matched, const char *arg1, const char *arg2) {
 #endif
   } else {
     printk("\nPSRAM Audio Staging: %s\n", settings.psram_staging_enabled ? "ENABLED" : "DISABLED");
-    printk("  Usage: psram on | psram off | psram status | psram burst <bytes>\n\n");
+    printk("  Usage: psram on | psram off | psram status | psram burst <bytes> | psram mode <sync|async|direct>\n\n");
   }
 }
 
@@ -1803,12 +1867,11 @@ void main_psram_command(int matched, const char *arg1, const char *arg2) {
 
 int main(void) {
   g_boot_csr = RCC->CSR;
+  /* Clear the hardware reset flags immediately after capturing them */
+  LL_RCC_ClearResetFlags();
 
   led_indicator_init();
   print_banner();
-
-  /* Clear the hardware reset flags only AFTER logging them */
-  LL_RCC_ClearResetFlags();
 
   /* Initialize RTC Wakeup Timer & Calendar */
   int rtc_sleep_rc = rtc_sleep_init();
@@ -1947,10 +2010,12 @@ int main(void) {
   config_store_init();
   config_store_import_sd();
 
-  if (settings.sample_rate != audio_in_rate()) {
-    audio_in_set_rate(settings.sample_rate);
-    apply_dsp_settings();
-  }
+  /* Validate and apply final audio sampling rate and DSP parameters ONCE */
+  settings.lpf_cutoff_hz = dsp_validate_lpf_cutoff(settings.sample_rate, settings.lpf_cutoff_hz);
+  audio_in_set_rate(settings.sample_rate);
+  settings.sample_rate = audio_in_rate();
+  dsp_init(settings.sample_rate);
+  apply_dsp_settings();
 
 #if defined(CONFIG_WILDSONIC_VERBOSE_LOGS)
   char last_folder[64] = {0};
@@ -2012,6 +2077,17 @@ int main(void) {
       0,
       K_NO_WAIT);
   k_thread_name_set(recorder_tid, "recorder");
+
+  scheduler_tid = k_thread_create(
+      &scheduler_thread_data,
+      scheduler_thread_stack,
+      K_THREAD_STACK_SIZEOF(scheduler_thread_stack),
+      scheduler_thread_fn,
+      NULL, NULL, NULL,
+      SCHEDULER_THREAD_PRIORITY,
+      0,
+      K_NO_WAIT);
+  k_thread_name_set(scheduler_tid, "scheduler");
 
   /* Prioritize serial console responsiveness while awaiting interactive input */
   k_thread_priority_set(k_current_get(), 1);

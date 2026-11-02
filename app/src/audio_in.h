@@ -66,6 +66,13 @@ struct audio_dma_stats {
 	uint32_t acquisition_process_avg_cycles;
 	uint32_t acquisition_process_max_cycles;
 	uint32_t event_queue_high_water;
+	uint32_t dma_queue_full_drops;
+	uint32_t slab_alloc_drops;
+	uint32_t half_unstable_drops;
+	uint32_t half_overwritten_drops;
+	uint32_t queue_submit_drops;
+	uint32_t worker_deadline_drops;
+	uint32_t boundary_discarded_samples;
 };
 
 /* Configure hardware. Returns 0 or a negative errno. */
@@ -100,6 +107,12 @@ int audio_in_set_block_size(uint32_t samples);
 int audio_in_start(void);
 int audio_in_stop(void);
 
+/* Check whether audio DMA is actively running */
+bool audio_in_is_dma_active(void);
+
+/* Check whether acquisition worker is processing or has pending events */
+bool audio_in_is_worker_active(void);
+
 /* Retrieve diagnostics snapshot */
 void audio_in_get_diag(struct audio_diag *diag);
 
@@ -110,5 +123,6 @@ void audio_in_reset_diag(void);
 void audio_in_get_callback_counts(uint32_t *ht_count, uint32_t *tc_count);
 void audio_in_get_dma_stats(struct audio_dma_stats *stats);
 uint32_t audio_in_get_missed_event_count(void);
+uint64_t audio_in_get_source_samples(void);
 
 #endif

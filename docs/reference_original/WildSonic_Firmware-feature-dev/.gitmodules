@@ -1,0 +1,9 @@
+[submodule "externals/maxim/ai8x-synthesis"]
+	path = externals/maxim/ai8x-synthesis
+	url = git@github.com:wildsonictech/ai8x-synthesis.git
+[submodule "externals/tiny-regex-c"]
+	path = externals/tiny-regex-c
+	url = git@github.com:wildsonictech/tiny-regex-c.git
+[submodule "externals/printf"]
+	path = externals/printf
+	url = git@github.com:wildsonictech/printf.git

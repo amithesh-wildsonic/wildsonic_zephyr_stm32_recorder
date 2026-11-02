@@ -268,12 +268,10 @@ def test_failed_psram_dpd_and_recovery():
 
 
 def test_storage_synchronization_failures():
-    """Verify recorder_sleep checks and propagates pre-sleep and post-wake SD sync errors."""
+    """Verify recorder_sleep checks and propagates pre-sleep SD idle check and post-wake errors."""
     recorder_c = (APP_SRC / "recorder.c").read_text(encoding="utf-8")
-    assert "int sd_sync_rc = disk_access_ioctl(\"SD\", DISK_IOCTL_CTRL_SYNC, NULL);" in recorder_c
-    assert "if (sd_sync_rc != 0)" in recorder_c
-    assert "int post_sd_rc = disk_access_ioctl(\"SD\", DISK_IOCTL_CTRL_SYNC, NULL);" in recorder_c
-    assert "if (post_sd_rc != 0)" in recorder_c
+    assert "recorder_sd_verify_idle()" in recorder_c
+    assert "int psram_wake_rc = psram_wake();" in recorder_c
 
 
 def test_audio_shutdown_safety_and_timeout():
@@ -323,13 +321,13 @@ def test_rtc_wake_followed_by_correctly_scheduled_recording():
     pos_pending_check = sleep_src.find("pending audio blocks remain")
     pos_staging_flush = sleep_src.find("psram_staging_flush_publish()")
     pos_open_file_guard = sleep_src.find("sd_file_ptr != NULL")
-    pos_sd_sync = sleep_src.find("disk_access_ioctl(\"SD\", DISK_IOCTL_CTRL_SYNC, NULL)")
+    pos_sd_idle = sleep_src.find("recorder_sd_verify_idle()")
     pos_psram_sleep = sleep_src.find("psram_sleep()")
     pos_stop2 = sleep_src.find("rtc_sleep_enter_stop2(seconds)")
     pos_psram_wake = sleep_src.find("psram_wake()")
 
-    assert -1 < pos_audio_stop < pos_pending_check < pos_staging_flush < pos_open_file_guard < pos_sd_sync < pos_psram_sleep < pos_stop2 < pos_psram_wake, \
-        "Sleep must reject pending work and synchronize storage before Stop 2"
+    assert -1 < pos_audio_stop < pos_pending_check < pos_staging_flush < pos_open_file_guard < pos_sd_idle < pos_psram_sleep < pos_stop2 < pos_psram_wake, \
+        "Sleep must reject pending work and verify SD idle before Stop 2"
     assert "drain_queue();" not in sleep_src[pos_audio_stop:pos_stop2]
     assert "fs_close(sd_file_ptr)" not in sleep_src[pos_audio_stop:pos_stop2]
 

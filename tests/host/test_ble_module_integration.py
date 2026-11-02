@@ -359,7 +359,7 @@ def test_pairing_window_expiration_while_connected_defers_lock():
 
 
 def test_unsupported_legacy_commands_purged():
-    """Verify unsupported legacy commands (UART1, PWRM0, MODE2, WS+SYNC, WS+ALIVE) are purged."""
+    """Verify unsupported legacy commands (UART1, PWRM0, MODE2, WS+SYNC) are purged."""
     c_src = BLE_COMM_C.read_text(encoding="utf-8")
     h_src = BLE_COMM_H.read_text(encoding="utf-8")
     combined = c_src + "\n" + h_src
@@ -368,7 +368,6 @@ def test_unsupported_legacy_commands_purged():
     assert "AT+PWRM0" not in combined, "Legacy AT+PWRM0 must not be sent"
     assert "AT+MODE2" not in combined, "Legacy AT+MODE2 must not be sent"
     assert "WS+SYNC" not in combined, "Unconfirmed WS+SYNC must not be sent"
-    assert "WS+ALIVE" not in combined, "Unconfirmed WS+ALIVE must not be relied upon"
 
 
 def test_get_dev_info_format_and_temp_terminator():

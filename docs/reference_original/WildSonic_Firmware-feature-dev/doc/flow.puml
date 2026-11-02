@@ -1,0 +1,177 @@
+@startuml
+autonumber
+participant "Admin Task" as admin
+participant "Audio Task" as audio
+queue "OCM Request\nand Response Queues" as ocmQ
+participant "OCM Task" as ocm
+queue "Detect Request\nand Response Queues" as detectQ
+participant "Detect Task" as detect
+queue "Comm  Request\nand Response Queues" as commQ
+participant "Comm Task" as comm
+queue "Storage Request\nand Response Queues" as storQ
+participant "Storage Task" as stor
+participant HAL
+
+title WildSonic Firmware Flow with conditional transmission
+
+admin <-> HAL : Check if I2S has data
+alt I2S has data
+    admin -> audio : Wake Audio Task
+end
+
+audio <-> HAL : Check if I2S has data
+alt I2S has data
+    note over audio : number of audio samples to get\ninterrupt is configurable
+    audio -> HAL : Read N audio samples
+
+    note over audio : Keep aggregating samples in \nthe same buffer until buffer is full
+end
+
+alt audio buffer is fully populated
+    audio -> audio : Allocate new audio buffer from pool\nand switch to it from full audio buffer
+
+    audio -> audio : active_counter[buffer_id] = 2
+
+    audio -> ocmQ : Request to write data to off-chip memory
+    ocm <- ocmQ : Dequeue OCM request
+
+    ocm -> HAL : Write data buffer to off-chip memory
+    ocm -> ocmQ : Enqueue OCM response
+
+    audio -> audio : decrement active_counter[buffer_id]
+
+    alt active_counter[buffer_id] = 0
+        audio -> audio : release audio buffer to pool
+    end
+
+    audio -> detectQ : Request to transfer data from audio buffer to detect memory
+    detect <- detectQ : Dequeue detect request
+
+    detect -> detect : Transfer data from audio buffer to detect memory
+    detect -> detectQ : Enqueue transfer response
+    audio <- detectQ : Dequeue transfer response
+
+    audio -> audio : decrement active_counter[buffer_id]
+
+    alt active_counter[buffer_id] = 0
+        audio -> audio : release audio buffer to pool
+    end
+
+    alt detect memory full
+        alt sound event detection enabled
+            detect -> HAL : Run sound event detection
+        else sound event detection disabled
+            note over detect
+            Assume sound event is detected to enable
+            unconditional continuous transmission
+            end note
+            detect -> detect : soi_detected = true
+        end
+    end
+
+    audio -> detectQ : Request to get detect result
+    detect <- detectQ : Dequeue detect request
+    detect -> detectQ : Enqueue detect response
+    audio <- detectQ : Dequeue detect response
+
+    alt soi_detected
+        loop detected data and N data buffers after
+            audio -> audio : Allocate new audio buffer from pool
+            audio -> ocmQ : Request to read data from off-chip memory
+            ocm <- ocmQ : Dequeue read request
+            ocm -> HAL : Read data buffer from off-chip memory
+            ocm -> ocmQ : Enqueue read response
+        end
+    end
+
+    audio <- ocmQ : Dequeue OCM read response
+
+    audio -> audio : active_counter[buffer_id] = 2
+
+    audio -> storQ : Request to save full audio buffer
+
+    stor <- storQ : Dequeue save data request
+
+    alt Received only one request
+        alt remaining bytes in buffer < min(remaining bytes in file, remaining bytes in fs sector)
+            stor <- storQ : Try to dequeue another save data request
+        end
+    end
+
+    alt Received two active requests
+        alt wav file not currently open
+            alt folder for current year does not exist
+                stor -> HAL : create_folder(year)
+            end
+            alt folder for current month does not exist
+                stor -> HAL : create_folder(month)
+            end
+            alt folder for current day_in_month does not exist
+                stor -> HAL : create_folder(day_in_month)
+            end
+            alt folder for current hour does not exist
+                stor -> HAL : create_folder(hour)
+            end
+            alt folder for current min does not exist
+                stor -> HAL : create_folder(min)
+            end
+            stor -> HAL : create_file
+            stor -> HAL : write_to_file(wav_file_header, size of wav header)
+        end
+
+        alt buffers are contiguous in memory
+            stor -> stor : use data from two request buffers
+        else
+            stor -> stor : use data only from first request buffer
+        end
+
+        note right stor: The number of bytes to write cannot\nexceed buffer(s) length, end of file,\nor file system sector size
+        stor -> HAL : write_to_file(first request buffer + current_offset_in_buffer, bytes_to_write)
+
+        alt bytes written to file == WAV FILE SIZE
+            stor -> HAL : close_file
+        end
+
+        stor -> stor : current_offset_in_buffer += bytes_to_write
+
+        alt current_offset_in_buffer >= BUFFER_SIZE
+            stor -> storQ : Enqueue response for first request
+            stor -> stor : current_offset_in_buffer -= BUFFER_SIZE
+        end
+
+        alt current_offset_in_buffer == BUFFER_SIZE
+            stor -> storQ : Enqueue response for second request
+            stor -> stor : current_offset_in_buffer = 0
+        end
+    end
+
+    audio <- storQ : Dequeue response
+    audio -> audio : decrement active_counter[buffer_id]
+    alt active_counter[buffer_id] = 0
+        audio -> audio : release audio buffer to pool
+    end
+
+    detect -> detectQ : Enqueue response
+    audio <- detectQ : Dequeue SOI detection result
+
+    alt soi_detected
+        audio -> commQ : Request to transfer audio buffer
+        commQ -> comm : Dequeue request to transfer audio data
+        alt post request not open
+            comm -> HAL : Open post request
+        end
+        comm -> HAL : Upload data
+        alt post request data uploaded == post request size
+            comm -> HAL : Close post request
+        end
+        comm -> commQ : Enqueue response with completion success
+
+        audio <-  commQ: Dequeue response
+    end
+    audio -> audio : decrement active_counter[buffer_id]
+    alt active_counter[buffer_id] = 0
+        audio -> audio : release audio buffer to pool
+    end
+end
+
+@enduml

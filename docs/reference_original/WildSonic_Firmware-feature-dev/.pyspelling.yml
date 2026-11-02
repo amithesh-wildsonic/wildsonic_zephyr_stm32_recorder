@@ -1,0 +1,15 @@
+matrix:
+- name: cpp
+  aspell:
+    lang: en
+    d: en
+    camel-case: true
+  dictionary:
+    wordlists:
+    - build/pyspelling-en-custom.txt
+    output: build/dictionary/cpp.dic
+  pipeline:
+  - pyspelling.filters.cpp
+  sources:
+  - 'app/**/*.{c,h,cpp,hpp}'
+  - 'lib/**/*.{c,h,cpp,hpp}'

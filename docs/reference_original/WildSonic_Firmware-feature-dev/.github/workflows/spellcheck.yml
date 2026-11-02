@@ -1,0 +1,15 @@
+name: Spellcheck Action
+on: [pull_request]
+jobs:
+  build:
+    name: Spellcheck
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v3
+    - name: pyspelling
+      run: |
+        sudo apt-get update
+        sudo apt-get install aspell
+        pip3 install pyspelling==2.7.2
+        pyspelling -v
+

@@ -189,12 +189,21 @@ config AUDIO_RECORD_CYCLES
 
 config AUDIO_PREALLOCATE_FILE
 	bool "Pre-allocate audio file clusters prior to recording"
-	default n
+	default y
 	help
 	  When enabled (and if CONFIG_FS_FATFS_EXTRA_NATIVE_API is active),
-	  calls FatFs f_expand() to pre-allocate contiguous clusters on exFAT.
-	  Disabled by default because standard streaming writes operate reliably
-	  without pre-allocation and avoid fragmentation errors.
+	  calls FatFs f_expand() to pre-allocate contiguous clusters on exFAT,
+	  preventing dynamic cluster allocation stalls during recording.
+
+config WILDSONIC_SDMMC_CLK_DIV
+	int "SDMMC clock divider"
+	default 6
+	range 0 16
+	help
+	  Clock divider for SDMMC1 on STM32L4 (48 MHz / (clk_div + 2)).
+	  clk_div = 0: 24 MHz (12 MB/s bus bandwidth, high-speed production)
+	  clk_div = 2: 12 MHz (6 MB/s bus bandwidth, high-speed)
+	  clk_div = 6: 6 MHz (3 MB/s bus bandwidth, safe jumper-wire default)
 
 config PSRAM_TEST_ENABLE
     bool "Run external ISSI IS66WVS4M8 PSRAM detection and memory test on boot"
@@ -217,13 +226,14 @@ config AUDIO_PSRAM_STAGING
 
 config AUDIO_PSRAM_BUFFER_SIZE_KB
 	int "PSRAM staging buffer size in KiB"
-	default 1024
+	default 3072
 	range 256 3072
 	depends on AUDIO_PSRAM_STAGING
 	help
 	  Size of circular buffer in external PSRAM in KiB.
-	  Default is 1024 KiB (1 MiB), providing ~2.73 seconds of buffer at 192 kHz 16-bit
-	  and ~10.92 seconds at 48 kHz 16-bit.
+	  Default is 3072 KiB (3 MiB, 12 slots x 256 KiB, 75% of physical 4 MB PSRAM),
+	  providing ~8.19 seconds of buffer at 192 kHz 16-bit mono and ~32.76 seconds at 48 kHz.
+	  1024 KiB (1 MiB, 25%) is reserved for diagnostics and safety.
 
 config AUDIO_SD_BATCH_SIZE_KB
 	int "SD card write batch size in KiB"
@@ -233,6 +243,26 @@ config AUDIO_SD_BATCH_SIZE_KB
 	help
 	  Size of multi-block SD card write batch in KiB. Must be a multiple of 4 KiB
 	  and aligned to 512-byte sectors. Default is 256 KiB (512 sectors).
+
+choice AUDIO_STORAGE_PIPELINE
+	prompt "Audio Storage Pipeline Mode"
+	default AUDIO_STORAGE_PIPELINE_PSRAM_SYNC
+	depends on AUDIO_PSRAM_STAGING
+	help
+	  Select the storage pipeline architecture for draining PSRAM staging to SD card.
+
+config AUDIO_STORAGE_PIPELINE_PSRAM_SYNC
+	bool "Mode B: Synchronous PSRAM Read and SD Write (Production Default)"
+	help
+	  Performs sequential PSRAM read to internal SRAM bounce buffer followed by SDMMC write.
+	  Ensures zero bus contention and zero interrupt jitter between Quad-SPI polling and
+	  SDMMC interrupt-driven transfers, completely preventing SDMMC FIFO underruns.
+
+config AUDIO_STORAGE_PIPELINE_PSRAM_ASYNC
+	bool "Mode C: Asynchronous Ping-Pong PSRAM Staging"
+	help
+	  Uses dual SRAM ping-pong buffers with separate reader and writer threads.
+endchoice
 
 endmenu
 

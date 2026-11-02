@@ -105,6 +105,13 @@ static atomic_t acquisition_max_latency_cycles;
 static atomic_t acquisition_max_queue_depth;
 static atomic_t acquisition_events_pending;
 static atomic_t acquisition_worker_active;
+static atomic_t dma_queue_full_drops;
+static atomic_t slab_alloc_drops;
+static atomic_t half_unstable_drops;
+static atomic_t half_overwritten_drops;
+static atomic_t queue_submit_drops;
+static atomic_t worker_deadline_drops;
+static atomic_t boundary_discarded_samples;
 
 /* Diagnostics tracking */
 static struct k_spinlock diag_lock;
@@ -186,13 +193,15 @@ static bool process_half(const uint16_t *src, void *dst_block,
 	uint32_t max_raw = ((1U << 12) - 1U) * (1U << ovs);
 	bool is_synth = (current_capture_source == AUDIO_SRC_SYNTHETIC);
 
-	/* Always track diagnostics regardless of pool availability */
+#if defined(CONFIG_WILDSONIC_VERBOSE_LOGS)
+	/* Track diagnostics only in verbose / test builds */
 	uint16_t local_min = 0xFFFF;
 	uint16_t local_max = 0;
 	uint64_t local_sum = 0;
 	uint64_t local_sum_sq = 0;
 	uint32_t local_clip_l = 0;
 	uint32_t local_clip_h = 0;
+#endif
 
 	for (uint32_t n = 0; n < active_block_samples; n++) {
 #if CONFIG_AUDIO_SAMPLE_BITS == 32
@@ -212,6 +221,7 @@ static bool process_half(const uint16_t *src, void *dst_block,
 			raw = src[i];
 		}
 
+#if defined(CONFIG_WILDSONIC_VERBOSE_LOGS)
 		if (raw < local_min) local_min = raw;
 		if (raw > local_max) local_max = raw;
 		local_sum += raw;
@@ -223,6 +233,7 @@ static bool process_half(const uint16_t *src, void *dst_block,
 		if (raw >= max_raw) {
 			local_clip_h++;
 		}
+#endif
 
 #if CONFIG_AUDIO_SAMPLE_BITS == 32
 		if (is_synth) {
@@ -244,6 +255,7 @@ static bool process_half(const uint16_t *src, void *dst_block,
 #endif
 	}
 
+#if defined(CONFIG_WILDSONIC_VERBOSE_LOGS)
 	/* Update global diagnostics */
 	k_spinlock_key_t key = k_spin_lock(&diag_lock);
 	if (local_min < diag_raw_min) diag_raw_min = local_min;
@@ -255,6 +267,7 @@ static bool process_half(const uint16_t *src, void *dst_block,
 	diag_total_samples += active_block_samples;
 	diag_total_blocks++;
 	k_spin_unlock(&diag_lock, key);
+#endif
 
 	ARG_UNUSED(sample_start);
 
@@ -313,13 +326,16 @@ static void acquisition_thread_fn(void *p1, void *p2, void *p3)
 		const uint16_t *src = &dma_buf[event.half ? block : 0];
 		void *dst_block = (sink && sink->alloc) ? sink->alloc(sink->user) : NULL;
 		if (!dst_block) {
+			atomic_add(&slab_alloc_drops, block);
 			atomic_add(&acquisition_lost_samples, block);
 			atomic_add(&acquisition_samples_accounted, block);
 			atomic_set(&acquisition_worker_active, 0);
 			continue;
 		}
 		bool stable_before = dma_half_is_stable(event.half, block);
-		if (stable_before) {
+		if (!stable_before) {
+			atomic_add(&half_unstable_drops, block);
+		} else {
 			memcpy(dst_block, src, block * sizeof(uint16_t));
 		}
 		uint64_t copy_end = k_cycle_get_64();
@@ -329,6 +345,11 @@ static void acquisition_thread_fn(void *p1, void *p2, void *p3)
 		/* A late copy may overlap DMA reuse; reject it and account for the loss. */
 		bool stable_after = stable_before && dma_half_is_stable(event.half, block);
 		if (!stable_after || copy_end - event.cycle >= reuse_cycles) {
+			if (!stable_after) {
+				atomic_add(&half_overwritten_drops, block);
+			} else {
+				atomic_add(&worker_deadline_drops, block);
+			}
 			if (sink && sink->release) {
 				sink->release(dst_block, sink->user);
 			}
@@ -356,6 +377,7 @@ static void acquisition_thread_fn(void *p1, void *p2, void *p3)
 		if (submitted) {
 			atomic_add(&acquisition_processed_samples, block);
 		} else {
+			atomic_add(&queue_submit_drops, block);
 			atomic_add(&acquisition_lost_samples, block);
 		}
 		atomic_add(&acquisition_samples_accounted, block);
@@ -398,6 +420,7 @@ static void dma_cb(const struct device *dev, void *user, uint32_t ch, int status
 	}
 	dma_source_sample_index += active_block_samples;
 	if (k_msgq_put(&dma_event_q, &event, K_NO_WAIT) != 0) {
+		atomic_add(&dma_queue_full_drops, active_block_samples);
 		atomic_add(&acquisition_events_missed, 1);
 		atomic_add(&acquisition_lost_samples, active_block_samples);
 		atomic_add(&acquisition_samples_accounted, active_block_samples);
@@ -446,6 +469,18 @@ void audio_in_get_dma_stats(struct audio_dma_stats *stats)
 		(uint32_t)(acquisition_process_cycles_sum / acquisition_process_blocks) : 0;
 	stats->acquisition_process_max_cycles = acquisition_process_cycles_max;
 	stats->event_queue_high_water = (uint32_t)atomic_get(&acquisition_max_queue_depth);
+	stats->dma_queue_full_drops = (uint32_t)atomic_get(&dma_queue_full_drops);
+	stats->slab_alloc_drops = (uint32_t)atomic_get(&slab_alloc_drops);
+	stats->half_unstable_drops = (uint32_t)atomic_get(&half_unstable_drops);
+	stats->half_overwritten_drops = (uint32_t)atomic_get(&half_overwritten_drops);
+	stats->queue_submit_drops = (uint32_t)atomic_get(&queue_submit_drops);
+	stats->worker_deadline_drops = (uint32_t)atomic_get(&worker_deadline_drops);
+	stats->boundary_discarded_samples = (uint32_t)atomic_get(&boundary_discarded_samples);
+}
+
+uint64_t audio_in_get_source_samples(void)
+{
+	return (uint64_t)dma_source_sample_index;
 }
 
 uint32_t audio_in_get_missed_event_count(void)
@@ -715,6 +750,13 @@ int audio_in_start(void)
 	atomic_set(&acquisition_max_queue_depth, 0);
 	atomic_set(&acquisition_events_pending, 0);
 	atomic_set(&acquisition_worker_active, 0);
+	atomic_set(&dma_queue_full_drops, 0);
+	atomic_set(&slab_alloc_drops, 0);
+	atomic_set(&half_unstable_drops, 0);
+	atomic_set(&half_overwritten_drops, 0);
+	atomic_set(&queue_submit_drops, 0);
+	atomic_set(&worker_deadline_drops, 0);
+	atomic_set(&boundary_discarded_samples, 0);
 	acquisition_process_cycles_sum = 0;
 	acquisition_process_cycles_max = 0;
 	acquisition_process_blocks = 0;
@@ -828,6 +870,9 @@ int audio_in_stop(void)
 	LL_TIM_DisableCounter(tim);
 	LL_TIM_SetCounter(tim, 0);
 	LL_TIM_ClearFlag_UPDATE(tim);
+#if defined(CONFIG_WILDSONIC_VERBOSE_LOGS)
+	printk("[TEST] TIM6_STOPPED\n");
+#endif
 
 	/* 2. Stop ongoing ADC regular conversion with bounded timeout */
 	if (LL_ADC_REG_IsConversionOngoing(adc)) {
@@ -841,8 +886,26 @@ int audio_in_stop(void)
 			ret = -ETIMEDOUT;
 		}
 	}
+#if defined(CONFIG_WILDSONIC_VERBOSE_LOGS)
+	printk("[TEST] ADC_STOPPED\n");
+#endif
 
-	/* 3. Stop DMA while the hardware stream is still enabled:
+	/* 3. Bounded wait for in-flight acquisition copy from DMA buffer to complete
+	 *    BEFORE stopping DMA (Phase 1: Do not stop DMA while worker is copying) */
+	uint32_t drain_timeout_ms = 100;
+	while ((atomic_get(&acquisition_worker_active) != 0 ||
+	        atomic_get(&acquisition_events_pending) != 0) && --drain_timeout_ms) {
+		k_sleep(K_MSEC(1));
+	}
+	if (drain_timeout_ms == 0 && ret == 0) {
+		LOG_ERR("Timeout waiting for in-progress acquisition block copy");
+		ret = -ETIMEDOUT;
+	}
+#if defined(CONFIG_WILDSONIC_VERBOSE_LOGS)
+	printk("[TEST] DMA_WORKER_DRAINED\n");
+#endif
+
+	/* 4. Stop DMA while hardware stream is still enabled:
 	 *    Zephyr's dma_stm32_stop() checks stm32_dma_is_enabled_stream(),
 	 *    clears IRQ, disables stream, and sets stream->busy = false.
 	 *    This safely releases driver ownership for the next session!
@@ -856,27 +919,16 @@ int audio_in_stop(void)
 		}
 	}
 
-	/* 4. Bounded wait for acquisition worker to finish active processing (max 100 ms) */
-	uint32_t drain_timeout_ms = 100;
-	while ((atomic_get(&acquisition_events_pending) != 0 ||
-	        atomic_get(&acquisition_worker_active) != 0) &&
-	       --drain_timeout_ms) {
-		k_sleep(K_MSEC(1));
-	}
-	if (drain_timeout_ms == 0 && ret == 0) {
-		LOG_ERR("Timeout draining acquisition worker (%d events pending, worker active=%d)",
-		        (int)atomic_get(&acquisition_events_pending),
-		        (int)atomic_get(&acquisition_worker_active));
-		ret = -ETIMEDOUT;
-	}
-
-	/* 5. Correct cleanup of pending DMA events and explicit residual sample accounting */
+	/* 5. Correct cleanup of pending DMA events and boundary sample accounting */
 	struct dma_event leftover_event;
 	while (k_msgq_get(&dma_event_q, &leftover_event, K_NO_WAIT) == 0) {
 		atomic_dec(&acquisition_events_pending);
-		atomic_add(&acquisition_lost_samples, active_block_samples);
+		atomic_add(&boundary_discarded_samples, active_block_samples);
 		atomic_add(&acquisition_samples_accounted, active_block_samples);
 	}
+#if defined(CONFIG_WILDSONIC_VERBOSE_LOGS)
+	printk("[TEST] DMA_EVENTS_DRAINED\n");
+#endif
 
 	/* 6. Disable ADC with bounded timeout */
 	if (LL_ADC_IsEnabled(adc)) {
@@ -902,6 +954,17 @@ int audio_in_stop(void)
 	LL_ADC_DisableInternalRegulator(adc);
 
 	return ret;
+}
+
+bool audio_in_is_dma_active(void)
+{
+	return dma_active;
+}
+
+bool audio_in_is_worker_active(void)
+{
+	return (atomic_get(&acquisition_worker_active) != 0 ||
+	        atomic_get(&acquisition_events_pending) != 0);
 }
 
 uint32_t audio_in_requested_rate(void)

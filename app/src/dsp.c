@@ -206,20 +206,58 @@ int dsp_configure(const struct dsp_config *cfg, uint32_t sample_rate_hz)
 
 	/* Stages 4 & 5: 4th-Order Butterworth Low-Pass Filter (2 cascaded biquads) */
 	if (cfg->lpf_enabled && cfg->lpf_cutoff_hz > 0) {
-		/* Normalized Butterworth 4th order: Q1 = 0.54119610, Q2 = 1.30656296 */
-		biquad_calc_lpf(&stages[4], (float)cfg->lpf_cutoff_hz, (float)sample_rate_hz, 0.54119610f);
-		biquad_calc_lpf(&stages[5], (float)cfg->lpf_cutoff_hz, (float)sample_rate_hz, 1.30656296f);
+		float nyquist_bound = (float)sample_rate_hz * 0.49f;
+		if ((float)cfg->lpf_cutoff_hz >= nyquist_bound) {
+			LOG_WRN("LPF cutoff %u Hz is >= Nyquist boundary (%.0f Hz); bypassing stage to maintain filter stability",
+			        cfg->lpf_cutoff_hz, (double)nyquist_bound);
+			biquad_set_bypass(&stages[4]);
+			biquad_set_bypass(&stages[5]);
+		} else {
+			/* Normalized Butterworth 4th order: Q1 = 0.54119610, Q2 = 1.30656296 */
+			biquad_calc_lpf(&stages[4], (float)cfg->lpf_cutoff_hz, (float)sample_rate_hz, 0.54119610f);
+			biquad_calc_lpf(&stages[5], (float)cfg->lpf_cutoff_hz, (float)sample_rate_hz, 1.30656296f);
+		}
 	} else {
 		biquad_set_bypass(&stages[4]);
 		biquad_set_bypass(&stages[5]);
 	}
 
-	LOG_INF("DSP configured for %u Hz: DC_Block=%d, HPF=%d (%u Hz), Notch=%d (%u Hz, Q=%.1f), LPF=%d (%u Hz, 4th-order)",
+	LOG_INF("DSP configured for %u Hz: DC_Block=%d, HPF=%d (%u Hz), Notch=%d (%u Hz, Q=%.1f), LPF=%d (%u Hz, %s)",
 	        sample_rate_hz, cfg->dc_block_enabled, cfg->hpf_enabled, cfg->hpf_cutoff_hz,
 	        cfg->notch_enabled, cfg->notch_freq_hz, (double)cfg->notch_q,
-	        cfg->lpf_enabled, cfg->lpf_cutoff_hz);
+	        cfg->lpf_enabled, cfg->lpf_cutoff_hz,
+	        stages[4].enabled ? "4th-order" : "bypassed");
 
 	return 0;
+}
+
+uint32_t dsp_validate_lpf_cutoff(uint32_t sample_rate_hz, uint32_t requested_cutoff_hz)
+{
+	if (sample_rate_hz == 0 || requested_cutoff_hz == 0) {
+		return 0;
+	}
+
+	uint32_t nyquist_bound = (uint32_t)((float)sample_rate_hz * 0.49f);
+	if (requested_cutoff_hz < nyquist_bound) {
+		return requested_cutoff_hz;
+	}
+
+	/* Requested cutoff exceeds or equals the safe 0.49 * fs Nyquist boundary.
+	 * Adjust to the highest supported valid cutoff with sufficient filter stability margin. */
+	if (sample_rate_hz >= 192000U) {
+		return 90000U;
+	} else if (sample_rate_hz >= 96000U) {
+		return 45000U;
+	} else if (sample_rate_hz >= 48000U) {
+		return 20000U;
+	} else {
+		return (sample_rate_hz * 45U) / 100U;
+	}
+}
+
+bool dsp_is_lpf_effective(void)
+{
+	return (active_cfg.lpf_enabled && active_cfg.lpf_cutoff_hz > 0 && stages[4].enabled);
 }
 
 int dsp_init(uint32_t sample_rate_hz)
@@ -306,46 +344,65 @@ void dsp_process_i16(int16_t *samples, uint32_t count)
 
 	uint64_t t0 = k_cycle_get_64();
 
-	for (uint32_t i = 0; i < count; i++) {
-		int16_t in_val = samples[i];
-		if (in_val >= 32767 || in_val <= -32768) {
-			dsp_input_clipping_count++;
+	/* Identify active filter stages */
+	struct biquad_df2t *active_stages[NUM_STAGES];
+	uint32_t num_active = 0;
+	for (int s = 0; s < NUM_STAGES; s++) {
+		if (stages[s].enabled) {
+			active_stages[num_active++] = &stages[s];
 		}
+	}
 
-		float x = (float)in_val;
-
-		/* Cascade through all active filter stages */
-		x = biquad_step(&stages[0], x); /* DC block */
-		x = biquad_step(&stages[1], x); /* HPF */
-		x = biquad_step(&stages[2], x); /* Notch */
-		x = biquad_step(&stages[3], x); /* Harmonic Notch */
-		x = biquad_step(&stages[4], x); /* LPF 1 */
-		x = biquad_step(&stages[5], x); /* LPF 2 */
-
-		/* Detect filter overshoot before digital gain */
-		if ((x > 32767.0f || x < -32768.0f) && !(in_val >= 32767 || in_val <= -32768)) {
-			dsp_filter_overshoot_count++;
-		}
-
-		/* Apply post-filtering software digital gain */
-		if (digital_gain != 1.0f) {
-			float x_pre_gain = x;
-			x *= digital_gain;
-			if ((x > 32767.0f || x < -32768.0f) &&
-			    (x_pre_gain <= 32767.0f && x_pre_gain >= -32768.0f)) {
-				dsp_gain_clipping_count++;
+	if (num_active > 0 || digital_gain != 1.0f) {
+		for (uint32_t i = 0; i < count; i++) {
+			int16_t in_val = samples[i];
+#if defined(CONFIG_WILDSONIC_VERBOSE_LOGS)
+			if (in_val >= 32767 || in_val <= -32768) {
+				dsp_input_clipping_count++;
 			}
-		}
+#endif
+			float x = (float)in_val;
 
-		/* Saturate to 16-bit signed PCM range without integer wraparound */
-		if (x > 32767.0f) {
-			x = 32767.0f;
-			digital_clipping_count++;
-		} else if (x < -32768.0f) {
-			x = -32768.0f;
-			digital_clipping_count++;
+			/* Cascade through active filter stages only */
+			for (uint32_t s = 0; s < num_active; s++) {
+				struct biquad_df2t *bq = active_stages[s];
+				float out = bq->b0 * x + bq->s1;
+				bq->s1 = bq->b1 * x - bq->a1 * out + bq->s2;
+				bq->s2 = bq->b2 * x - bq->a2 * out;
+				x = out;
+			}
+
+#if defined(CONFIG_WILDSONIC_VERBOSE_LOGS)
+			/* Detect filter overshoot before digital gain */
+			if ((x > 32767.0f || x < -32768.0f) && !(in_val >= 32767 || in_val <= -32768)) {
+				dsp_filter_overshoot_count++;
+			}
+#endif
+
+			/* Apply post-filtering software digital gain */
+			if (digital_gain != 1.0f) {
+#if defined(CONFIG_WILDSONIC_VERBOSE_LOGS)
+				float x_pre_gain = x;
+#endif
+				x *= digital_gain;
+#if defined(CONFIG_WILDSONIC_VERBOSE_LOGS)
+				if ((x > 32767.0f || x < -32768.0f) &&
+				    (x_pre_gain <= 32767.0f && x_pre_gain >= -32768.0f)) {
+					dsp_gain_clipping_count++;
+				}
+#endif
+			}
+
+			/* Saturate to 16-bit signed PCM range without integer wraparound */
+			if (x > 32767.0f) {
+				x = 32767.0f;
+				digital_clipping_count++;
+			} else if (x < -32768.0f) {
+				x = -32768.0f;
+				digital_clipping_count++;
+			}
+			samples[i] = (int16_t)x;
 		}
-		samples[i] = (int16_t)x;
 	}
 
 	uint64_t t1 = k_cycle_get_64();
@@ -370,45 +427,65 @@ void dsp_process_i32(int32_t *samples, uint32_t count)
 
 	uint64_t t0 = k_cycle_get_64();
 
-	for (uint32_t i = 0; i < count; i++) {
-		int32_t in_val = samples[i];
-		if (in_val >= 2147483647 || in_val <= -2147483648) {
-			dsp_input_clipping_count++;
+	/* Identify active filter stages */
+	struct biquad_df2t *active_stages[NUM_STAGES];
+	uint32_t num_active = 0;
+	for (int s = 0; s < NUM_STAGES; s++) {
+		if (stages[s].enabled) {
+			active_stages[num_active++] = &stages[s];
 		}
+	}
 
-		float x = (float)in_val;
-
-		x = biquad_step(&stages[0], x);
-		x = biquad_step(&stages[1], x);
-		x = biquad_step(&stages[2], x);
-		x = biquad_step(&stages[3], x);
-		x = biquad_step(&stages[4], x);
-		x = biquad_step(&stages[5], x);
-
-		/* Detect filter overshoot before digital gain */
-		if ((x > 2147483647.0f || x < -2147483648.0f) &&
-		    !(in_val >= 2147483647 || in_val <= -2147483648)) {
-			dsp_filter_overshoot_count++;
-		}
-
-		/* Apply post-filtering software digital gain */
-		if (digital_gain != 1.0f) {
-			float x_pre_gain = x;
-			x *= digital_gain;
-			if ((x > 2147483647.0f || x < -2147483648.0f) &&
-			    (x_pre_gain <= 2147483647.0f && x_pre_gain >= -2147483648.0f)) {
-				dsp_gain_clipping_count++;
+	if (num_active > 0 || digital_gain != 1.0f) {
+		for (uint32_t i = 0; i < count; i++) {
+			int32_t in_val = samples[i];
+#if defined(CONFIG_WILDSONIC_VERBOSE_LOGS)
+			if (in_val >= 2147483647 || in_val <= -2147483648) {
+				dsp_input_clipping_count++;
 			}
-		}
+#endif
+			float x = (float)in_val;
 
-		if (x > 2147483647.0f) {
-			x = 2147483647.0f;
-			digital_clipping_count++;
-		} else if (x < -2147483648.0f) {
-			x = -2147483648.0f;
-			digital_clipping_count++;
+			/* Cascade through active filter stages only */
+			for (uint32_t s = 0; s < num_active; s++) {
+				struct biquad_df2t *bq = active_stages[s];
+				float out = bq->b0 * x + bq->s1;
+				bq->s1 = bq->b1 * x - bq->a1 * out + bq->s2;
+				bq->s2 = bq->b2 * x - bq->a2 * out;
+				x = out;
+			}
+
+#if defined(CONFIG_WILDSONIC_VERBOSE_LOGS)
+			/* Detect filter overshoot before digital gain */
+			if ((x > 2147483647.0f || x < -2147483648.0f) &&
+			    !(in_val >= 2147483647 || in_val <= -2147483648)) {
+				dsp_filter_overshoot_count++;
+			}
+#endif
+
+			/* Apply post-filtering software digital gain */
+			if (digital_gain != 1.0f) {
+#if defined(CONFIG_WILDSONIC_VERBOSE_LOGS)
+				float x_pre_gain = x;
+#endif
+				x *= digital_gain;
+#if defined(CONFIG_WILDSONIC_VERBOSE_LOGS)
+				if ((x > 2147483647.0f || x < -2147483648.0f) &&
+				    (x_pre_gain <= 2147483647.0f && x_pre_gain >= -2147483648.0f)) {
+					dsp_gain_clipping_count++;
+				}
+#endif
+			}
+
+			if (x > 2147483647.0f) {
+				x = 2147483647.0f;
+				digital_clipping_count++;
+			} else if (x < -2147483648.0f) {
+				x = -2147483648.0f;
+				digital_clipping_count++;
+			}
+			samples[i] = (int32_t)x;
 		}
-		samples[i] = (int32_t)x;
 	}
 
 	uint64_t t1 = k_cycle_get_64();

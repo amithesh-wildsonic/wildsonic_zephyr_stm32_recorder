@@ -91,7 +91,49 @@ struct rec_stats {
   uint32_t dsp_filter_overshoot_count;
   uint32_t dsp_gain_clipping_count;
   uint64_t samples_discarded_tail;
+  char first_error_stage[32];
+  uint64_t hardware_source_samples;
+  uint64_t copied_samples;
+  uint64_t processed_samples;
+  uint64_t boundary_discarded_samples;
+
+  /* Enhanced SD Writer & Batch Pipeline Metrics */
+  uint64_t sd_writer_wall_us;
+  uint64_t sd_writer_psram_read_us;
+  uint64_t sd_writer_active_fs_us;
+  uint64_t sd_writer_commit_us;
+  uint64_t sd_writer_starve_us;
+  uint32_t sd_active_throughput_kb_s;
+  uint32_t sd_aggregate_throughput_kb_s;
+  uint64_t pingpong_overlap_us;
+  uint32_t pingpong_swaps;
+  uint32_t psram_qspi_txn_count;
+  uint32_t psram_read_throughput_kb_s;
+  uint32_t psram_write_throughput_kb_s;
+  uint8_t pipeline_mode;
 };
+
+enum storage_pipeline_mode {
+  STORAGE_PIPELINE_DIRECT_SRAM = 0, /* Mode A: Direct SRAM queue to SD (no PSRAM) */
+  STORAGE_PIPELINE_PSRAM_SYNC = 1,   /* Mode B: PSRAM Staging with Synchronous SD batch drain */
+  STORAGE_PIPELINE_PSRAM_ASYNC = 2,  /* Mode C: PSRAM Staging with Asynchronous Ping-Pong */
+};
+
+void recorder_set_pipeline_mode(enum storage_pipeline_mode mode);
+enum storage_pipeline_mode recorder_get_pipeline_mode(void);
+const char *recorder_get_pipeline_mode_str(enum storage_pipeline_mode mode);
+
+enum recorder_power_state {
+  REC_PWR_ACTIVE = 0,
+  REC_PWR_RECORDING,
+  REC_PWR_FINALIZING,
+  REC_PWR_SLEEP_PREP,
+  REC_PWR_RTC_ARMED,
+  REC_PWR_STOP2,
+  REC_PWR_WAKE_RECOVERY,
+};
+
+enum recorder_power_state recorder_get_power_state(void);
 
 enum recorder_mode {
   REC_MODE_NORMAL = 0,
@@ -131,6 +173,7 @@ void recorder_request_stop_reason(enum recorder_stop_reason reason);
 void recorder_request_stop(void);
 bool recorder_is_active(void);
 bool recorder_is_shutdown_ready(void);
+int recorder_sd_verify_idle(void);
 bool recorder_is_abort_requested(void);
 int recorder_wait_idle(uint32_t timeout_ms);
 int recorder_get_last_error(void);

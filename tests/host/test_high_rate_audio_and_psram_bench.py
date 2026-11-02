@@ -369,10 +369,11 @@ def test_psram_benchmark_address_space_isolation():
 
     staging_h = (SRC_DIR / "psram_staging.h").read_text(encoding="utf-8")
     assert "PSRAM_STAGING_BASE_ADDR                0x00000000U" in staging_h
-    assert "PSRAM_STAGING_DEFAULT_CAPACITY_BYTES   (1024U * 1024U)" in staging_h
+    assert "PSRAM_AUDIO_BUFFER_BYTES   (3U * 1024U * 1024U)" in staging_h
+    assert "PSRAM_STAGING_DEFAULT_CAPACITY_BYTES   PSRAM_AUDIO_BUFFER_BYTES" in staging_h
 
-    # Staging ends at 0x00000000 + 1MB = 0x00100000, Benchmark starts at 0x00300000
-    staging_end = 0x00000000 + 1024 * 1024
+    # Staging ends at 0x00000000 + 3MB = 0x00300000, Benchmark starts at 0x00300000
+    staging_end = 0x00000000 + 3 * 1024 * 1024
     bench_start = 0x00300000
     assert staging_end <= bench_start, "Benchmark address space overlaps audio staging region!"
 
