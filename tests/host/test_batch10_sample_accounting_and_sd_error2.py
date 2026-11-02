@@ -192,9 +192,8 @@ def test_source_code_preserves_first_error_and_skips_wav_finalization():
     # 3. Closes file safely
     assert "fs_close(&f);" in rec_c
 
-    # 4. Frees bounce buffer
-    assert "if (sd_bounce_buf)" in rec_c
-    assert "k_mem_slab_free(&pool, sd_bounce_buf);" in rec_c
+    # 4. Cleans up bounce buffer and file pointer
+    assert "sd_bounce_buf = NULL;" in rec_c
     assert "sd_file_ptr = NULL;" in rec_c
 
     # 5. Interrupted batch log exists

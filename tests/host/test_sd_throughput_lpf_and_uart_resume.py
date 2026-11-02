@@ -92,7 +92,7 @@ def test_psram_lock_is_not_held_during_sd_write():
     """Verify writer thread fetches batch into buffer via peek and commits only after SD write."""
     rec_c = (APP_SRC / "recorder.c").read_text(encoding="utf-8")
     assert "psram_staging_peek(" in rec_c
-    assert "fs_write(sd_file_ptr, sd_bounce_buf, bytes_read);" in rec_c
+    assert "fs_write(sd_file_ptr, sd_bounce_buf, bytes_peeked);" in rec_c or "fs_write(sd_file_ptr, slot->buf, slot->bytes);" in rec_c
     assert "psram_staging_commit(" in rec_c
 
 

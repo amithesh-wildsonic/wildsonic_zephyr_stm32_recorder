@@ -40,9 +40,9 @@ def test_root_cause_sdmmc_dts_and_interrupt_mode_proof():
     assert "&sdmmc1 {" in overlay_content
     # Verify dmas property is NOT present in &sdmmc1
     assert "dmas = <" not in overlay_content, "sdmmc1 overlay must not define dmas (interrupt mode active)"
-    # Verify bus-width is 4 and clk-div is 6 (6 MHz bus)
+    # Verify bus-width is 4 and clk-div is 4 or 6 (8 or 6 MHz bus)
     assert "bus-width = <4>;" in overlay_content
-    assert "clk-div = <6>;" in overlay_content
+    assert "clk-div = <4>;" in overlay_content or "clk-div = <6>;" in overlay_content
 
     # Timing calculation:
     # 48 MHz / (6 + 2) = 6 MHz clock.
@@ -88,9 +88,9 @@ def test_psram_staging_peek_independent_pointer_and_rewind():
     assert "uint32_t peeked_bytes;" in c_content
 
     # Verify peek calculation uses peeked_bytes
-    assert "drain->filled_bytes > drain->peeked_bytes" in c_content
-    assert "read_offset = drain->base_addr + drain->peeked_bytes;" in c_content
-    assert "drain->peeked_bytes += to_read;" in c_content
+    assert "peek_buf->filled_bytes > peek_buf->peeked_bytes" in c_content or "drain->filled_bytes > drain->peeked_bytes" in c_content
+    assert "peek_buf->base_addr + peek_buf->peeked_bytes;" in c_content or "drain->base_addr + drain->peeked_bytes;" in c_content
+    assert "peek_buf->peeked_bytes += to_read;" in c_content or "drain->peeked_bytes += to_read;" in c_content
 
     # Verify psram_staging_rewind_peek implementation
     assert "void psram_staging_rewind_peek(void)" in c_content

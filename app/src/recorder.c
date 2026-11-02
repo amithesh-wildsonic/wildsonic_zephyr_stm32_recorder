@@ -143,10 +143,9 @@ static k_tid_t psram_reader_tid;
 /* Asynchronous Ping-Pong Buffer Architecture (Buffer A + Buffer B) */
 enum pingpong_buf_state {
   PINGPONG_BUF_FREE = 0,
-  PINGPONG_BUF_READING_PSRAM,
-  PINGPONG_BUF_READY_FOR_SD,
-  PINGPONG_BUF_WRITING_SD,
-  PINGPONG_BUF_COMMITTED,
+  PINGPONG_BUF_FILLING,
+  PINGPONG_BUF_READY,
+  PINGPONG_BUF_WRITING,
 };
 
 struct pingpong_slot {
@@ -160,7 +159,12 @@ struct pingpong_slot {
   uint64_t write_end_cyc;
 };
 
-static uint8_t __aligned(4) s_pingpong_buf_b[BLOCK_BYTES];
+static uint8_t s_sd_bounce_buf_a[SD_IO_CHUNK_BYTES] __aligned(4);
+static uint8_t s_sd_bounce_buf_b[SD_IO_CHUNK_BYTES] __aligned(4);
+
+uint8_t *recorder_get_bounce_buf_a(void) { return s_sd_bounce_buf_a; }
+uint8_t *recorder_get_bounce_buf_b(void) { return s_sd_bounce_buf_b; }
+
 static struct pingpong_slot s_pingpong[2];
 
 static struct k_sem s_reader_start_sem;
@@ -171,6 +175,8 @@ static volatile uint32_t s_reader_to_read = 0;
 
 static volatile uint64_t sd_writer_overlap_us_sum = 0;
 static volatile uint32_t sd_writer_swap_count = 0;
+static volatile uint64_t s_staging_first_accept_cyc = 0;
+static volatile uint64_t s_staging_final_commit_cyc = 0;
 
 static struct k_sem sd_writer_sem;
 static struct k_sem sd_writer_done_sem;
@@ -295,8 +301,8 @@ static void psram_reader_thread_fn(void *p1, void *p2, void *p3) {
       }
 
       struct pingpong_slot *slot = &s_pingpong[r_idx];
-      slot->state = PINGPONG_BUF_READING_PSRAM;
-      uint32_t chunk = (s_reader_to_read > BLOCK_BYTES) ? BLOCK_BYTES : s_reader_to_read;
+      slot->state = PINGPONG_BUF_FILLING;
+      uint32_t chunk = (s_reader_to_read > SD_IO_CHUNK_BYTES) ? SD_IO_CHUNK_BYTES : s_reader_to_read;
       uint32_t bytes_read = 0;
 
       slot->peek_start_cyc = k_cycle_get_64();
@@ -317,7 +323,7 @@ static void psram_reader_thread_fn(void *p1, void *p2, void *p3) {
         LOG_ERR("PSRAM reader peek failed (%d)", peek_ret);
         slot->err = peek_ret ? peek_ret : -EIO;
         slot->bytes = 0;
-        slot->state = PINGPONG_BUF_READY_FOR_SD;
+        slot->state = PINGPONG_BUF_READY;
         if (sd_writer_err == 0) {
           sd_writer_err = slot->err;
         }
@@ -327,7 +333,7 @@ static void psram_reader_thread_fn(void *p1, void *p2, void *p3) {
 
       slot->bytes = bytes_read;
       slot->err = 0;
-      slot->state = PINGPONG_BUF_READY_FOR_SD;
+      slot->state = PINGPONG_BUF_READY;
       s_reader_to_read -= bytes_read;
 
       k_sem_give(&s_slot_ready_sem);
@@ -389,7 +395,7 @@ static void sd_writer_thread_fn(void *p1, void *p2, void *p3) {
         if (g_storage_pipeline_mode == STORAGE_PIPELINE_PSRAM_SYNC) {
           /* MODE B: Synchronous Sequential Peek -> Write -> Commit */
           while (to_write > 0 && sd_writer_err == 0) {
-            uint32_t chunk = (to_write > BLOCK_BYTES) ? BLOCK_BYTES : to_write;
+            uint32_t chunk = (to_write > SD_IO_CHUNK_BYTES) ? SD_IO_CHUNK_BYTES : to_write;
             uint32_t bytes_peeked = 0;
 
             uint64_t t_p0 = k_cycle_get_64();
@@ -448,6 +454,7 @@ static void sd_writer_thread_fn(void *p1, void *p2, void *p3) {
             uint64_t t_c1 = k_cycle_get_64();
             uint32_t commit_us = (uint32_t)k_cyc_to_us_floor64((t_c1 >= t_c0) ? (t_c1 - t_c0) : 0);
             sd_writer_commit_us_sum += commit_us;
+            s_staging_final_commit_cyc = t_c1;
 
             if (commit_ret != 0) {
               LOG_ERR("SD writer staging commit failed after successful write (%d)", commit_ret);
@@ -502,11 +509,9 @@ static void sd_writer_thread_fn(void *p1, void *p2, void *p3) {
               break;
             }
 
-            slot->state = PINGPONG_BUF_WRITING_SD;
+            slot->state = PINGPONG_BUF_WRITING;
             slot->write_start_cyc = k_cycle_get_64();
 
-            /* Ping-pong writer: slot 0 uses sd_bounce_buf, slot 1 uses s_pingpong_buf_b.
-             * fs_write(sd_file_ptr, sd_bounce_buf, bytes_read); */
             ssize_t w = fs_write(sd_file_ptr, slot->buf, slot->bytes);
             slot->write_end_cyc = k_cycle_get_64();
 
@@ -558,12 +563,12 @@ static void sd_writer_thread_fn(void *p1, void *p2, void *p3) {
             sd_writer_swap_count++;
 
             /* Commit consumer index ONLY after successful SD write */
-            slot->state = PINGPONG_BUF_COMMITTED;
             uint64_t t_c0 = k_cycle_get_64();
             int commit_ret = psram_staging_commit(slot->bytes);
             uint64_t t_c1 = k_cycle_get_64();
             uint32_t commit_us = (uint32_t)k_cyc_to_us_floor64((t_c1 >= t_c0) ? (t_c1 - t_c0) : 0);
             sd_writer_commit_us_sum += commit_us;
+            s_staging_final_commit_cyc = t_c1;
 
             if (commit_ret != 0) {
               LOG_ERR("SD writer staging commit failed after successful write (%d)",
@@ -1782,14 +1787,8 @@ int recorder_record_session(uint32_t seconds, uint32_t cycle,
     return -ENODEV;
   }
   st.sample_rate = audio_in_rate();
-  struct app_settings *cur_settings = main_get_settings();
-  if (cur_settings) {
-    st.sample_bits = cur_settings->sample_bits ? cur_settings->sample_bits : 16;
-    st.channels = cur_settings->channels ? cur_settings->channels : 1;
-  } else {
-    st.sample_bits = 16;
-    st.channels = 1;
-  }
+  st.sample_bits = 16;
+  st.channels = 1;
 
   uint32_t bytes_per_frame = (uint32_t)st.channels * ((uint32_t)st.sample_bits / 8U);
   st.expected_samples = (uint64_t)seconds * st.sample_rate;
@@ -1940,30 +1939,14 @@ int recorder_record_session(uint32_t seconds, uint32_t cycle,
     st.psram_staging_capacity = psram_staging_capacity();
     st.sd_batch_bytes = psram_staging_batch_size();
 
-    /* Borrow 1 block from pool as SD writer bounce buffer */
-    ret = k_mem_slab_alloc(&pool, &sd_bounce_buf, K_NO_WAIT);
-    if (ret != 0) {
-      LOG_WRN("Failed to allocate SD bounce buffer from pool (%d); bypassing "
-              "PSRAM staging",
-              ret);
-      use_psram = false;
-      st.psram_used = false;
-      sd_bounce_buf = NULL;
-      s_pingpong[0].buf = NULL;
-      s_pingpong[0].state = PINGPONG_BUF_FREE;
-      s_pingpong[0].bytes = 0;
-      s_pingpong[1].buf = NULL;
-      s_pingpong[1].state = PINGPONG_BUF_FREE;
-      s_pingpong[1].bytes = 0;
-    } else {
-      /* Ping-pong buffers setup */
-      s_pingpong[0].buf = (uint8_t *)sd_bounce_buf;
-      s_pingpong[0].state = PINGPONG_BUF_FREE;
-      s_pingpong[0].bytes = 0;
-      s_pingpong[1].buf = s_pingpong_buf_b;
-      s_pingpong[1].state = PINGPONG_BUF_FREE;
-      s_pingpong[1].bytes = 0;
-    }
+    /* Dedicated static SRAM bounce buffers (zero pool borrowing) */
+    sd_bounce_buf = s_sd_bounce_buf_a;
+    s_pingpong[0].buf = s_sd_bounce_buf_a;
+    s_pingpong[0].state = PINGPONG_BUF_FREE;
+    s_pingpong[0].bytes = 0;
+    s_pingpong[1].buf = s_sd_bounce_buf_b;
+    s_pingpong[1].state = PINGPONG_BUF_FREE;
+    s_pingpong[1].bytes = 0;
   } else {
     st.psram_used = false;
     st.psram_staging_capacity = 0;
@@ -2046,10 +2029,7 @@ int recorder_record_session(uint32_t seconds, uint32_t cycle,
     led_indicator_set(LED_IND_ERROR);
     fs_close(&f);
     fs_unlink(st.file);
-    if (sd_bounce_buf) {
-      k_mem_slab_free(&pool, sd_bounce_buf);
-      sd_bounce_buf = NULL;
-    }
+    sd_bounce_buf = NULL;
     s_pingpong[0].buf = NULL;
     s_pingpong[0].state = PINGPONG_BUF_FREE;
     s_pingpong[0].bytes = 0;
@@ -2084,6 +2064,9 @@ int recorder_record_session(uint32_t seconds, uint32_t cycle,
       k_us_to_cyc_ceil64((uint64_t)seconds * 1000000ULL + 100000ULL);
   uint64_t t_first_block_cyc = 0;
   uint64_t t_last_block_cyc = 0;
+  uint32_t min_free_pool = NUM_BLOCKS;
+  s_staging_first_accept_cyc = 0;
+  s_staging_final_commit_cyc = 0;
   int err = 0;
   uint64_t samples_remaining = st.expected_samples;
 
@@ -2160,11 +2143,14 @@ int recorder_record_session(uint32_t seconds, uint32_t cycle,
     if (st.sample_bits == 16 && st.channels == 1) {
       uint32_t bytes_to_write = samples_in_block * SAMPLE_BYTES;
       if (use_psram) {
+        if (s_staging_first_accept_cyc == 0) {
+          s_staging_first_accept_cyc = k_cycle_get_64();
+        }
         int p_ret = psram_staging_push(blk, bytes_to_write, samples_in_block);
         if (p_ret == -ENOBUFS) {
           k_sem_give(&sd_writer_sem);
           uint32_t free_pool = k_mem_slab_num_free_get(&pool);
-          if (free_pool > 2) {
+          if (free_pool >= 1) {
             /* Headroom exists in DMA pool: wait boundedly up to 5 ms for writer to release a batch buffer */
             if (psram_staging_wait_free(5) == 0) {
               p_ret = psram_staging_push(blk, bytes_to_write, samples_in_block);
@@ -2172,6 +2158,11 @@ int recorder_record_session(uint32_t seconds, uint32_t cycle,
           }
         }
         k_mem_slab_free(&pool, blk);
+
+        uint32_t cur_free = k_mem_slab_num_free_get(&pool);
+        if (cur_free < min_free_pool) {
+          min_free_pool = cur_free;
+        }
 
         if (p_ret == -ENOBUFS) {
           /* PSRAM staging buffer is full */
@@ -2302,7 +2293,7 @@ int recorder_record_session(uint32_t seconds, uint32_t cycle,
       }
     } else {
       /* Experimental format conversion (32-bit PCM, stereo duplication, synthetic tone) */
-      static uint8_t format_chunk_buf[8192] __aligned(4);
+      uint8_t *format_chunk_buf = s_sd_bounce_buf_a;
       uint32_t chunk_frames = 1024;
       bool chunk_failed = false;
       const int16_t *src_s16 = (const int16_t *)blk;
@@ -2510,11 +2501,8 @@ int recorder_record_session(uint32_t seconds, uint32_t cycle,
   printk("[TEST] SD_WRITER_COMPLETE\n");
 #endif
 
-  /* Release borrowed bounce buffer back to pool if allocated */
-  if (sd_bounce_buf) {
-    k_mem_slab_free(&pool, sd_bounce_buf);
-    sd_bounce_buf = NULL;
-  }
+  /* Reset bounce buffer pointers */
+  sd_bounce_buf = NULL;
   s_pingpong[0].buf = NULL;
   s_pingpong[0].state = PINGPONG_BUF_FREE;
   s_pingpong[0].bytes = 0;
@@ -2585,6 +2573,17 @@ int recorder_record_session(uint32_t seconds, uint32_t cycle,
   } else {
     st.sd_aggregate_throughput_kb_s = 0;
   }
+  uint64_t e2e_cyc = (s_staging_final_commit_cyc > s_staging_first_accept_cyc)
+                         ? (s_staging_final_commit_cyc - s_staging_first_accept_cyc)
+                         : 0;
+  st.sd_e2e_duration_us = k_cyc_to_us_floor64(e2e_cyc);
+  if (st.sd_e2e_duration_us > 0 && sd_writer_bytes_written > 0) {
+    st.sd_e2e_throughput_kb_s = (uint32_t)(((uint64_t)sd_writer_bytes_written * 1000000ULL) / (st.sd_e2e_duration_us * 1024ULL));
+  } else {
+    st.sd_e2e_throughput_kb_s = 0;
+  }
+  st.pool_min_free_blocks = min_free_pool;
+  st.sd_chunk_bytes = SD_IO_CHUNK_BYTES;
   st.pingpong_overlap_us = sd_writer_overlap_us_sum;
   st.pingpong_swaps = sd_writer_swap_count;
   st.psram_qspi_txn_count = (uint32_t)((sd_writer_bytes_written + 1023ULL) / 1024ULL);
@@ -2802,10 +2801,15 @@ int recorder_record_session(uint32_t seconds, uint32_t cycle,
   printk("  PSRAM Free Slots                   : %u\n", pstat.free_slots);
   printk("  PSRAM Full Events                  : %u\n", st.psram_full_events);
   printk("  PSRAM Rejected Audio Blocks        : %u\n", st.psram_full_events);
-  printk("  SD Writer Average Throughput       : %u KB/s (avg latency %u us)\n", sd_avg_kb_s, st.avg_write_us);
-  printk("  SD Writer Worst-Case Latency       : %u us\n", st.worst_write_us);
+  printk("  SD Storage Active Throughput       : %u KB/s (active write: %llu ms)\n",
+         st.sd_active_throughput_kb_s, (unsigned long long)(st.sd_writer_active_fs_us / 1000ULL));
+  printk("  SD Storage End-to-End Throughput   : %u KB/s (e2e duration: %llu ms)\n",
+         st.sd_e2e_throughput_kb_s, (unsigned long long)(st.sd_e2e_duration_us / 1000ULL));
   printk("  SD Writer Aggregate Throughput     : %u KB/s (batch wall: %llu ms, worst batch: %u ms)\n",
          st.sd_aggregate_throughput_kb_s, (unsigned long long)(st.sd_writer_wall_us / 1000ULL), sd_writer_worst_batch_ms);
+  printk("  SD Configured I/O Chunk            : %u KB\n", st.sd_chunk_bytes >> 10);
+  printk("  Audio DMA Pool Min Free Blocks     : %u / %u (32 KB dedicated DMA pool)\n",
+         st.pool_min_free_blocks, NUM_BLOCKS);
   printk("  SD Writer Ping-Pong Overlap        : %llu ms (%u buffer swaps)\n",
          (unsigned long long)(st.pingpong_overlap_us / 1000ULL), st.pingpong_swaps);
   printk("  PSRAM QSPI Transaction Count       : %u (read throughput: %u KB/s)\n",

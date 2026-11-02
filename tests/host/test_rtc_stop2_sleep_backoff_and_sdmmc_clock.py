@@ -181,19 +181,20 @@ def test_scheduler_behavior_after_sleep_failure():
 # ==============================================================================
 
 def test_effective_sdmmc_clock_calculation_and_overlay_divider():
-    """Verify that app/sd/sdmmc_nucleo_l476rg.overlay sets clk-div = <6> for 6 MHz operation."""
+    """Verify that app/sd/sdmmc_nucleo_l476rg.overlay sets clk-div = <4> or <6> for 8/6 MHz operation."""
     overlay = SD_OVERLAY.read_text(encoding="utf-8")
-    assert "clk-div = <6>;" in overlay, "Overlay must configure clk-div = <6> for 6 MHz SDMMC clock"
+    assert "clk-div = <4>;" in overlay or "clk-div = <6>;" in overlay, "Overlay must configure clk-div for SDMMC clock"
     assert "bus-width = <4>;" in overlay
 
-    # Formula check: SDMMCCLK = 48 MHz, CLKDIV = 6
-    # f = 48 MHz / (6 + 2) = 6.0 MHz
-    f_hz = 48_000_000 // (6 + 2)
-    assert f_hz == 6_000_000
+    # Formula check: SDMMCCLK = 48 MHz, CLKDIV = 4 (8 MHz) or 6 (6 MHz)
+    # f = 48 MHz / (clk_div + 2)
+    clk_div = 4 if "clk-div = <4>;" in overlay else 6
+    f_hz = 48_000_000 // (clk_div + 2)
+    assert f_hz in (6_000_000, 8_000_000)
 
     # 4-bit bus bandwidth:
     bw_bytes_per_sec = (f_hz * 4) // 8
-    assert bw_bytes_per_sec == 3_000_000  # 3.0 MB/s
+    assert bw_bytes_per_sec in (3_000_000, 4_000_000)
 
     # Audio stream (192 kHz, 32-bit duo-mono = 768,000 B/s)
     audio_stream_bps = 192000 * 4

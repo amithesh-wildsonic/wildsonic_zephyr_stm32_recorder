@@ -26,8 +26,8 @@ __attribute__((weak)) bool recorder_is_active(void) { return false; }
 #endif
 
 #define BENCH_CHUNK_SIZE 4096U
-static uint8_t bench_tx_buf[BENCH_CHUNK_SIZE] __aligned(4);
-static uint8_t bench_rx_buf[BENCH_CHUNK_SIZE] __aligned(4);
+#define bench_tx_buf (recorder_get_bounce_buf_a())
+#define bench_rx_buf (recorder_get_bounce_buf_b())
 
 static inline uint64_t bench_get_us(void)
 {

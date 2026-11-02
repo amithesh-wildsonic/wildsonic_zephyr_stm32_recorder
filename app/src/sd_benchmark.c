@@ -10,13 +10,14 @@
 #include <stdio.h>
 #include <string.h>
 
-#define BENCH_BUF_SIZE 4096U /* 4 KB aligned chunk buffer fits comfortably in SRAM */
-static uint8_t __aligned(4) s_bench_buf[BENCH_BUF_SIZE];
+#define BENCH_BUF_SIZE SD_IO_CHUNK_BYTES
+#define s_bench_buf (recorder_get_bounce_buf_a())
 
 static void init_bench_buffer(void)
 {
+	uint8_t *buf = s_bench_buf;
 	for (uint32_t i = 0; i < BENCH_BUF_SIZE; i++) {
-		s_bench_buf[i] = (uint8_t)(0xA5 ^ (i & 0xFF));
+		buf[i] = (uint8_t)(0xA5 ^ (i & 0xFF));
 	}
 }
 
@@ -184,14 +185,27 @@ int sd_benchmark_run_matrix(void)
 	printk("=========================================================================================================\n");
 	printk("Target Audio Requirement: 384 KB/s (192 kHz, 16-bit mono PCM)\n");
 	printk("Operating Margin Target : 768 KB/s (2.0x margin)\n");
-	printk("SDMMC Interface Clock   : 6 MHz 4-bit bus (3.0 MB/s raw bus capacity)\n");
+#if defined(CONFIG_SOC_SERIES_STM32L4X)
+	uint32_t clkcr = SDMMC1->CLKCR;
+	uint32_t clk_div = clkcr & SDMMC_CLKCR_CLKDIV_Msk;
+	uint32_t bus_w = ((clkcr & SDMMC_CLKCR_WIDBUS_Msk) == SDMMC_CLKCR_WIDBUS_0) ? 4 :
+	                 ((clkcr & SDMMC_CLKCR_WIDBUS_Msk) == SDMMC_CLKCR_WIDBUS_1) ? 8 : 1;
+	uint32_t clk_hz = 48000000U / (clk_div + 2U);
+	printk("SDMMC Interface Clock   : %u MHz %u-bit bus (%.1f MB/s raw bus capacity, CLKDIV=%u)\n",
+	       clk_hz / 1000000U, bus_w, (double)(clk_hz * bus_w) / 8000000.0, clk_div);
+#else
+	printk("SDMMC Interface Clock   : 8 MHz 4-bit bus (4.0 MB/s raw bus capacity)\n");
+#endif
 	printk("Filesystem Type         : exFAT (FatFs ELM)\n");
+	printk("Configured I/O Chunk    : %u KB\n", (unsigned)(SD_IO_CHUNK_BYTES / 1024U));
 	printk("---------------------------------------------------------------------------------------------------------\n");
 	printk("%-18s | %-10s | %-10s | %-6s | %-12s | %-12s | %-12s | %-8s\n",
 	       "Mode", "Block Size", "Total Data", "Ops", "Avg Latency", "Max Latency", "Throughput", "Margin");
 	printk("-------------------+------------+------------+--------+--------------+--------------+--------------+----------\n");
 
 	const uint32_t test_sizes[] = {
+		8 * 1024,
+		16 * 1024,
 		32 * 1024,
 		64 * 1024,
 		128 * 1024,

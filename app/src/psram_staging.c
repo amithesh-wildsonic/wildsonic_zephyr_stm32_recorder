@@ -37,6 +37,7 @@ static uint32_t num_batch_buffers = PSRAM_AUDIO_SLOT_COUNT;
 static struct psram_batch_buf batch_bufs[PSRAM_MAX_BATCH_BUFFERS];
 static uint32_t active_fill_idx = 0;
 static uint32_t active_drain_idx = 0;
+static uint32_t active_peek_idx = 0;
 static uint32_t batch_seq_counter = 0;
 
 static uint32_t head_pos = 0;
@@ -118,6 +119,7 @@ int psram_staging_init(uint32_t capacity_bytes, uint32_t batch_size_bytes)
 
 	active_fill_idx = 0;
 	active_drain_idx = 0;
+	active_peek_idx = 0;
 	batch_seq_counter = 0;
 
 	head_pos = 0;
@@ -161,6 +163,7 @@ void psram_staging_reset(void)
 	}
 	active_fill_idx = 0;
 	active_drain_idx = 0;
+	active_peek_idx = 0;
 	batch_seq_counter = 0;
 	head_pos = 0;
 	tail_pos = 0;
@@ -375,22 +378,33 @@ int psram_staging_peek(void *dst, uint32_t bytes_requested, uint32_t *bytes_read
 		return 0;
 	}
 
-	struct psram_batch_buf *drain = &batch_bufs[active_drain_idx];
-	if (drain->state == BATCH_STATE_READY) {
-		drain->state = BATCH_STATE_WRITING;
-	} else if (drain->state != BATCH_STATE_WRITING) {
-		/* If flush requested or session end, active fill buffer might have data */
-		if (drain->state == BATCH_STATE_FILLING && drain->filled_bytes > 0) {
-			drain->state = BATCH_STATE_WRITING;
-		} else {
-			STAGING_UNLOCK();
-			if (bytes_read) *bytes_read = 0;
-			return 0;
+	struct psram_batch_buf *peek_buf = &batch_bufs[active_peek_idx];
+	if (peek_buf->state == BATCH_STATE_READY) {
+		peek_buf->state = BATCH_STATE_WRITING;
+	} else if (peek_buf->state != BATCH_STATE_WRITING) {
+		if (peek_buf->state == BATCH_STATE_FILLING && peek_buf->filled_bytes > 0) {
+			peek_buf->state = BATCH_STATE_WRITING;
 		}
 	}
 
-	uint32_t uncommitted = (drain->filled_bytes > drain->peeked_bytes) ?
-	                       (drain->filled_bytes - drain->peeked_bytes) : 0;
+	uint32_t uncommitted = (peek_buf->filled_bytes > peek_buf->peeked_bytes) ?
+	                       (peek_buf->filled_bytes - peek_buf->peeked_bytes) : 0;
+	if (uncommitted == 0) {
+		/* Current peek buffer is fully peeked; check if next buffer has data ready to peek */
+		uint32_t next_peek = (active_peek_idx + 1U) % num_batch_buffers;
+		struct psram_batch_buf *next_buf = &batch_bufs[next_peek];
+		if ((next_buf->state == BATCH_STATE_READY ||
+		     (next_buf->state == BATCH_STATE_FILLING && next_buf->filled_bytes > 0)) &&
+		    (next_buf->filled_bytes > next_buf->peeked_bytes)) {
+			active_peek_idx = next_peek;
+			peek_buf = next_buf;
+			if (peek_buf->state == BATCH_STATE_READY) {
+				peek_buf->state = BATCH_STATE_WRITING;
+			}
+			uncommitted = peek_buf->filled_bytes - peek_buf->peeked_bytes;
+		}
+	}
+
 	if (uncommitted == 0) {
 		STAGING_UNLOCK();
 		if (bytes_read) *bytes_read = 0;
@@ -398,8 +412,8 @@ int psram_staging_peek(void *dst, uint32_t bytes_requested, uint32_t *bytes_read
 	}
 
 	to_read = (bytes_requested < uncommitted) ? bytes_requested : uncommitted;
-	read_offset = drain->base_addr + drain->peeked_bytes;
-	drain->peeked_bytes += to_read;
+	read_offset = peek_buf->base_addr + peek_buf->peeked_bytes;
+	peek_buf->peeked_bytes += to_read;
 	tail_pos = read_offset % buf_capacity;
 	STAGING_UNLOCK();
 
@@ -408,8 +422,8 @@ int psram_staging_peek(void *dst, uint32_t bytes_requested, uint32_t *bytes_read
 		LOG_ERR("PSRAM physical peek failed at addr 0x%06X (code %d)",
 		        read_offset, ret);
 		STAGING_LOCK();
-		if (drain->peeked_bytes >= to_read) {
-			drain->peeked_bytes -= to_read;
+		if (peek_buf->peeked_bytes >= to_read) {
+			peek_buf->peeked_bytes -= to_read;
 		}
 		STAGING_UNLOCK();
 		if (bytes_read) *bytes_read = 0;
@@ -425,8 +439,15 @@ int psram_staging_peek(void *dst, uint32_t bytes_requested, uint32_t *bytes_read
 void psram_staging_rewind_peek(void)
 {
 	STAGING_LOCK();
-	struct psram_batch_buf *drain = &batch_bufs[active_drain_idx];
-	drain->peeked_bytes = drain->committed_bytes;
+	uint32_t idx = active_drain_idx;
+	while (1) {
+		batch_bufs[idx].peeked_bytes = batch_bufs[idx].committed_bytes;
+		if (idx == active_peek_idx) {
+			break;
+		}
+		idx = (idx + 1U) % num_batch_buffers;
+	}
+	active_peek_idx = active_drain_idx;
 	STAGING_UNLOCK();
 }
 
@@ -466,6 +487,9 @@ int psram_staging_commit(uint32_t bytes_committed)
 			buffer_freed = true;
 		}
 		active_drain_idx = (active_drain_idx + 1U) % num_batch_buffers;
+		if (batch_bufs[active_peek_idx].state == BATCH_STATE_FREE) {
+			active_peek_idx = active_drain_idx;
+		}
 	}
 	STAGING_UNLOCK();
 #if defined(__ZEPHYR__)

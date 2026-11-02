@@ -197,12 +197,13 @@ config AUDIO_PREALLOCATE_FILE
 
 config WILDSONIC_SDMMC_CLK_DIV
 	int "SDMMC clock divider"
-	default 6
+	default 4
 	range 0 16
 	help
 	  Clock divider for SDMMC1 on STM32L4 (48 MHz / (clk_div + 2)).
 	  clk_div = 0: 24 MHz (12 MB/s bus bandwidth, high-speed production)
 	  clk_div = 2: 12 MHz (6 MB/s bus bandwidth, high-speed)
+	  clk_div = 4: 8 MHz (4 MB/s bus bandwidth, confirmed baseline)
 	  clk_div = 6: 6 MHz (3 MB/s bus bandwidth, safe jumper-wire default)
 
 config PSRAM_TEST_ENABLE
@@ -243,6 +244,17 @@ config AUDIO_SD_BATCH_SIZE_KB
 	help
 	  Size of multi-block SD card write batch in KiB. Must be a multiple of 4 KiB
 	  and aligned to 512-byte sectors. Default is 256 KiB (512 sectors).
+
+config AUDIO_SD_IO_CHUNK_KB
+	int "SD storage I/O chunk size in KiB"
+	default 16
+	range 8 64
+	depends on AUDIO_PSRAM_STAGING
+	help
+	  Filesystem I/O chunk size in KiB for SD card writes. Independent of the
+	  audio block size (4096 samples = 8 KiB) and PSRAM slot size (256 KiB).
+	  Configuring 16 or 32 KiB reduces SD card CMD12/CMD25 transactions and
+	  flash write programming delays.
 
 choice AUDIO_STORAGE_PIPELINE
 	prompt "Audio Storage Pipeline Mode"

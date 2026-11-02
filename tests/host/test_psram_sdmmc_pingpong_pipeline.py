@@ -216,13 +216,11 @@ def test_sram_layout_and_zero_heap_allocation():
     """Verify ping-pong buffers respect SRAM1 / SRAM2 memory architecture."""
     rec_c = (APP_SRC / "recorder.c").read_text(encoding="utf-8")
 
-    # Buffer A is allocated from pool (SRAM2, 0x10000000)
-    assert "k_mem_slab_alloc(&pool, &sd_bounce_buf, K_NO_WAIT)" in rec_c
-    assert "s_pingpong[0].buf = (uint8_t *)sd_bounce_buf;" in rec_c
-
-    # Buffer B is statically placed in SRAM1
-    assert "s_pingpong_buf_b[BLOCK_BYTES];" in rec_c
-    assert "s_pingpong[1].buf = s_pingpong_buf_b;" in rec_c
+    # Dedicated static bounce buffers in SRAM1 (zero pool borrowing)
+    assert "s_sd_bounce_buf_a[SD_IO_CHUNK_BYTES]" in rec_c
+    assert "s_sd_bounce_buf_b[SD_IO_CHUNK_BYTES]" in rec_c
+    assert "s_pingpong[0].buf = s_sd_bounce_buf_a;" in rec_c
+    assert "s_pingpong[1].buf = s_sd_bounce_buf_b;" in rec_c
 
     # Ensure no dynamic malloc is used in recorder.c fast path
     assert "malloc(" not in rec_c

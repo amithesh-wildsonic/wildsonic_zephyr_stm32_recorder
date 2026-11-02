@@ -105,6 +105,10 @@ struct rec_stats {
   uint64_t sd_writer_starve_us;
   uint32_t sd_active_throughput_kb_s;
   uint32_t sd_aggregate_throughput_kb_s;
+  uint32_t sd_e2e_throughput_kb_s;
+  uint64_t sd_e2e_duration_us;
+  uint32_t pool_min_free_blocks;
+  uint32_t sd_chunk_bytes;
   uint64_t pingpong_overlap_us;
   uint32_t pingpong_swaps;
   uint32_t psram_qspi_txn_count;
@@ -112,6 +116,15 @@ struct rec_stats {
   uint32_t psram_write_throughput_kb_s;
   uint8_t pipeline_mode;
 };
+
+#if defined(CONFIG_AUDIO_SD_IO_CHUNK_KB)
+#define SD_IO_CHUNK_BYTES (CONFIG_AUDIO_SD_IO_CHUNK_KB * 1024U)
+#else
+#define SD_IO_CHUNK_BYTES (16U * 1024U)
+#endif
+
+uint8_t *recorder_get_bounce_buf_a(void);
+uint8_t *recorder_get_bounce_buf_b(void);
 
 enum storage_pipeline_mode {
   STORAGE_PIPELINE_DIRECT_SRAM = 0, /* Mode A: Direct SRAM queue to SD (no PSRAM) */
