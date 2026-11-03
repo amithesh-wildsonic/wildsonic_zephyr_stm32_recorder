@@ -1,0 +1,13 @@
+# SPDX-License-Identifier: Apache-2.0
+
+config BOOTLOADER_STM32_HAL_FLASH
+	bool "STM32 HAL flash programming support for bootloader"
+	default y
+	depends on SOC_SERIES_STM32L4X
+	select USE_STM32_HAL_FLASH
+	select USE_STM32_HAL_FLASH_EX
+	help
+	  Include the STM32Cube HAL flash program and erase functions used by the
+	  dual-bank firmware updater.
+
+source "Kconfig.zephyr"
