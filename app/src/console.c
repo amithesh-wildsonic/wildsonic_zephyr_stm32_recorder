@@ -28,6 +28,10 @@
 #include "psram_is66wvs.h"
 #include "audio_format.h"
 #include "ble_comm.h"
+
+#ifndef WILDSONIC_GIT_COMMIT
+#define WILDSONIC_GIT_COMMIT "unknown"
+#endif
 #include "dsp.h"
 #include "sd_benchmark.h"
 #include "solar_calculator.h"
@@ -246,14 +250,12 @@ static int console_commit_and_ack_config(const char *cmd_name, const char *val_s
 		return save_rc;
 	}
 
-#if defined(CONFIG_WILDSONIC_VERBOSE_LOGS)
 	if (recording_active) {
 		printk("\nOK: Value staged for next session (active session unaffected)\n");
 	}
 	printk("[ACK] Command %s received and validated. Saved to persistent flash (seq %u, pending gen %u).\n",
 	       cmd_name, config_store_get_sequence_number(), config_store_get_pending_generation());
 	printk("[PENDING] Configuration pending application after reboot.\n");
-#endif
 
 	if (s_current_out_resp && s_current_out_resp_size > 0) {
 		snprintf(s_current_out_resp, s_current_out_resp_size,
@@ -1469,7 +1471,7 @@ static void handle_stor(void)
 static void handle_version(void)
 {
 	printk("\nVersion: v1.2.0\n");
-	printk("GIT Branch: production, SHA: d7a4f91\n");
+	printk("Git commit: %s\n", WILDSONIC_GIT_COMMIT);
 	printk("Build Date: %s %s\n", __DATE__, __TIME__);
 }
 

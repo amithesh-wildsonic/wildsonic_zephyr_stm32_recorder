@@ -539,17 +539,11 @@ int rtc_sleep_enter_stop2(uint32_t seconds)
 	/* Restore console UART RX interrupts after Stop 2 wakeup */
 	console_async_resume();
 	ble_comm_resume();
-#if defined(CONFIG_WILDSONIC_VERBOSE_LOGS)
-	/* Emit wake milestones cleanly only after system clocks and UART are 100% operational */
-	printk("[TEST] STOP2_EXITED\n");
-	if (last_wake_source == RTC_WAKE_TIMER) {
-		printk("[TEST] RTC_WAKE_ISR\n");
+	/* Keep one useful operational message after clocks and console are restored. */
+	if (wake_rc == 0 && last_wake_source == RTC_WAKE_TIMER) {
+		printk("\nRTC wake received. System clock restored; console and BLE communications resumed.\n");
+		printk("Wake initialization complete; scheduler continuing.\n");
 	}
-	if (clk_ret == 0 && LL_RCC_GetSysClkSource() == LL_RCC_SYS_CLKSOURCE_STATUS_PLL) {
-		printk("[TEST] CLOCKS_RESTORED\n");
-	}
-	printk("[TEST] UART_RESTORED\n");
-#endif
 
 	/* Disarm RTC Wakeup Timer and clear pending flags */
 	rtc_sleep_disarm();

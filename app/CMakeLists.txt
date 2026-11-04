@@ -26,6 +26,16 @@ if(FORMAT_SD_CARD)
   message(WARNING "FORMAT_SD_CARD=ON: formatter firmware WILL ERASE the SD card on boot")
   target_sources(app PRIVATE src/format_sd.c)
 else()
+  execute_process(
+    COMMAND git -C ${CMAKE_CURRENT_SOURCE_DIR}/.. rev-parse --short=12 HEAD
+    OUTPUT_VARIABLE WILDSONIC_GIT_COMMIT
+    OUTPUT_STRIP_TRAILING_WHITESPACE
+    ERROR_QUIET
+  )
+  if(NOT WILDSONIC_GIT_COMMIT)
+    set(WILDSONIC_GIT_COMMIT "unknown")
+  endif()
+
   target_sources(app PRIVATE
     src/main.c
     src/recorder.c
@@ -45,6 +55,7 @@ else()
     src/scheduler_retention.c
     src/solar_calculator.c
   )
+  target_compile_definitions(app PRIVATE WILDSONIC_GIT_COMMIT=\"${WILDSONIC_GIT_COMMIT}\")
   target_sources_ifdef(CONFIG_WILDSONIC_VERBOSE_LOGS app PRIVATE src/psram_benchmark.c)
   target_sources_ifdef(CONFIG_WILDSONIC_VERBOSE_LOGS app PRIVATE src/sd_benchmark.c)
   zephyr_include_directories(src)

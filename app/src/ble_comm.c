@@ -1,5 +1,9 @@
 /* SPDX-License-Identifier: Apache-2.0 */
 #include "ble_comm.h"
+
+#ifndef WILDSONIC_GIT_COMMIT
+#define WILDSONIC_GIT_COMMIT "unknown"
+#endif
 #include "console.h"
 #include "main.h"
 #include "recorder.h"
@@ -359,8 +363,17 @@ static void ble_comm_process_line(char *line) {
   /* 4. Configuration & Control Commands (Forwarded to existing dispatcher) */
   s_ble_module_awake = true;
 
+  /* Show the command source in the local console without exposing its value
+   * (for example, a password or other credential-bearing argument). */
+  const char *cmd_end = p;
+  while (*cmd_end && !isspace((unsigned char)*cmd_end)) {
+    cmd_end++;
+  }
+
   char resp_buf[128] = {0};
   int rc = console_process_line_source(p, true, resp_buf, sizeof(resp_buf));
+  printk("[BLE] Command %.*s %s\n", (int)(cmd_end - p), p,
+         rc == 0 ? "accepted" : "rejected");
   if (rc == 0) {
     if (resp_buf[0] != '\0') {
       ble_comm_printf("%s\r\n", resp_buf);
@@ -1045,7 +1058,7 @@ void ble_comm_send_dev_info(void) {
   ble_comm_printf("SLEEP %u\r\n", sleep_sec);
 
   /* 2. Version info */
-  ble_comm_printf("VER 1.2.0, SHA d7a4f91, DT %s %s\r\n", __DATE__, __TIME__);
+  ble_comm_printf("VER 1.2.0, SHA %s, DT %s %s\r\n", WILDSONIC_GIT_COMMIT, __DATE__, __TIME__);
 
   /* 3. Storage status */
   uint64_t sd_used = 0, sd_total = 0;

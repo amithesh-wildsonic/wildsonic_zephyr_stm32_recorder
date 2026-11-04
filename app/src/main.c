@@ -282,6 +282,13 @@ static void __maybe_unused print_reset_reason(void) {
 }
 
 static void print_banner(void) {
+  printk("Version: %s\n", "v1.2.0");
+#ifdef WILDSONIC_GIT_COMMIT
+  printk("Git commit: %s\n", WILDSONIC_GIT_COMMIT);
+#else
+  printk("Git commit: unknown\n");
+#endif
+  printk("Build Date: %s %s\n", __DATE__, __TIME__);
 #if defined(CONFIG_WILDSONIC_VERBOSE_LOGS)
   printk("\n=========================================================================\n");
   printk("      WildSonic STM32L476RG Audio Recorder — Unified Firmware             \n");
@@ -290,9 +297,6 @@ static void print_banner(void) {
   print_reset_reason();
   printk("=========================================================================\n\n");
 #else
-  printk("Version: %s\n", "v1.2.0");
-  printk("GIT Branch: %s, SHA: %s\n", "production", "d7a4f91");
-  printk("Build Date: %s %s\n", __DATE__, __TIME__);
 #endif
 }
 
@@ -1602,6 +1606,8 @@ void main_scheduler_service_step(void) {
     printk("\n[SCHEDULER] Standby wait: %lld s remaining until Session %u (Target: %s Local)\n",
            (long long)interval.wait_seconds, s_schedule_cycle, start_str);
     printk("  Entering STM32L476 Stop 2 low-power standby (strict RTC-only wake)...\n");
+#else
+    printk("\nNext scheduled session at %s local; entering Stop2 standby.\n", start_str);
 #endif
 
     while (!atomic_get(&s_schedule_paused) && !recorder_is_abort_requested()) {
@@ -1949,6 +1955,9 @@ int main(void) {
     }
     printk("  Quad I/O Verified : %s\n",
            psram_report.quad_mode_verified ? "YES (Active)" : "NO (1-line SPI)");
+#else
+    printk("PSRAM initialized and verified; recording staging %s.\n",
+           psram_report.quad_mode_verified ? "enabled" : "disabled (SRAM fallback)");
 #endif
     if (!psram_report.quad_mode_verified) {
 #if defined(CONFIG_WILDSONIC_VERBOSE_LOGS)
@@ -1974,6 +1983,8 @@ int main(void) {
     printk("  PSRAM Status      : NOT PRESENT / UNPOPULATED (%s)\n",
            psram_report.status_msg);
     printk("  Recording Path    : Direct SRAM Queue\n");
+#else
+    printk("PSRAM not available; using internal SRAM recording buffers.\n");
 #endif
     settings.psram_staging_enabled = false;
     recorder_set_psram_staging_enabled(false);
@@ -1984,9 +1995,7 @@ int main(void) {
 #endif
 
   /* 2. Initialize Recorder Storage & Audio Backend */
-#if defined(CONFIG_WILDSONIC_VERBOSE_LOGS)
-  printk("---- Initializing Storage and Acquisition Pipeline ----\n");
-#endif
+  printk("Initializing audio acquisition and SD card storage...\n");
   int ret = recorder_init();
   if (ret) {
     LOG_ERR("recorder_init failed: %d", ret);
@@ -2020,10 +2029,7 @@ int main(void) {
     struct rtc_calendar_time cal;
     scheduler_epoch_to_calendar(retained_end_utc, &cal);
     rtc_calendar_format(&cal, buf, sizeof(buf));
-#if defined(CONFIG_WILDSONIC_VERBOSE_LOGS)
-    printk("[SCHEDULER] Restored previous session end from RTC backup: %s UTC (timestamp=%lld)\n",
-           buf, (long long)retained_end_utc);
-#endif
+    printk("Scheduler restored from RTC backup; previous session ended %s UTC.\n", buf);
   } else {
     s_last_end_time_local = 0;
   }
@@ -2038,7 +2044,13 @@ int main(void) {
   }
 
   config_store_init();
-  config_store_import_sd();
+  int config_import_rc = config_store_import_sd();
+  if (config_import_rc == 0) {
+    printk("SD configuration import complete.\n");
+  } else {
+    printk("SD configuration import failed (%d); previous settings retained.\n",
+           config_import_rc);
+  }
 
   /* Validate and apply final audio sampling rate and DSP parameters ONCE */
   settings.lpf_cutoff_hz = dsp_validate_lpf_cutoff(settings.sample_rate, settings.lpf_cutoff_hz);
@@ -2130,10 +2142,8 @@ int main(void) {
   }
 
   /* 3. Interactive Serial Configuration Console (WildSonic Reference Style) */
-#if defined(CONFIG_WILDSONIC_VERBOSE_LOGS)
   printk("Interactive console ready. Type 'help' for commands, 'config' for "
          "guided setup.\n\n");
-#endif
 
   /* Main Interactive REPL loop - waits indefinitely for user commands */
   char line_buf[CONSOLE_LINE_MAX];
