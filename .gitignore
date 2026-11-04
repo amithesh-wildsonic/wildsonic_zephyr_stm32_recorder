@@ -50,3 +50,4 @@ user_log*.txt
 *_backup/
 backup_*/
 
+data/
