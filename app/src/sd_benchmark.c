@@ -11,7 +11,12 @@
 #include <string.h>
 
 #define BENCH_BUF_SIZE 4096U /* 4 KB aligned chunk buffer fits comfortably in SRAM */
+#if defined(__ZEPHYR__)
+extern uint8_t s_sd_writer_buf[];
+#define s_bench_buf (&s_sd_writer_buf[8192])
+#else
 static uint8_t __aligned(4) s_bench_buf[BENCH_BUF_SIZE];
+#endif
 
 static void init_bench_buffer(void)
 {

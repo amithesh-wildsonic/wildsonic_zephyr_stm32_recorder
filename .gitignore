@@ -51,3 +51,7 @@ user_log*.txt
 backup_*/
 
 data/
+docs/
+tests/
+measurement_tool/
+config/

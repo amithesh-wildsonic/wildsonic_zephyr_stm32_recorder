@@ -197,12 +197,17 @@ class PPK2Processor:
     def get_summary_phase_metrics(self) -> Dict[str, PhaseMetrics]:
         """Fallback when raw time-series is a single row summary (like ppk2_sample.csv)."""
         metrics = self.summary_metrics
-        avg_a = metrics.get("average_current", 0.032)
-        min_a = metrics.get("minimum_current", 0.028)
-        max_a = metrics.get("maximum_current", 0.042)
-        peak_a = metrics.get("peak_current", 0.051)
-        dur_s = metrics.get("measurement_duration", 12.5)
-        volt_v = metrics.get("voltage", 3.3)
+        required = ("average_current", "minimum_current", "maximum_current", "measurement_duration", "voltage")
+        missing = [key for key in required if metrics.get(key) is None]
+        if missing:
+            # An absent/summary-only capture is not a zero-current measurement.
+            return {}
+        avg_a = metrics["average_current"]
+        min_a = metrics["minimum_current"]
+        max_a = metrics["maximum_current"]
+        peak_a = metrics.get("peak_current", max_a)
+        dur_s = metrics["measurement_duration"]
+        volt_v = metrics["voltage"]
 
         # Convert A to mA
         avg_ma = avg_a * 1e3

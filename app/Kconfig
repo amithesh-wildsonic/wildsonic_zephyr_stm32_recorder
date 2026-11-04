@@ -317,6 +317,14 @@ config WILDSONIC_VERBOSE_LOGS
 	  matrices, per-session banners, and standby countdown messages.
 	  Enable this symbol for test and engineering builds.
 
+config WILDSONIC_TEST_BUILD
+	bool "Mark firmware as a test build"
+	default n
+	select WILDSONIC_VERBOSE_LOGS
+	help
+	  Explicitly labels the image as test-only and enables engineering
+	  diagnostics. Production configurations must leave this disabled.
+
 config LOG_DEFAULT_LEVEL_WRN
 	bool "Default log level WARNING"
 	default n

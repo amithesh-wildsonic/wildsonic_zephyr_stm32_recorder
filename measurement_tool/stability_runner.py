@@ -6,7 +6,8 @@ import json
 import logging
 import re
 import time
-from datetime import datetime, timezone
+import threading
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable, Deque, Dict, List, Optional, Tuple
 
@@ -31,6 +32,29 @@ from .stability import (
 from .workbook import ComparisonWorkbookManager
 
 logger = logging.getLogger("measurement_tool.stability_runner")
+
+
+def run_monotonic_window(
+    duration_s: float,
+    on_tick: Callable[[float], None],
+    *,
+    clock: Callable[[], float] = time.monotonic,
+    sleeper: Callable[[float], None] = time.sleep,
+    tick_s: float = 0.1,
+) -> float:
+    """Run a callback until a monotonic deadline and return measured elapsed seconds."""
+    if duration_s <= 0 or tick_s <= 0:
+        raise ValueError("duration_s and tick_s must be positive")
+    start = clock()
+    deadline = start + duration_s
+    while True:
+        now = clock()
+        if now >= deadline:
+            return max(0.0, now - start)
+        on_tick(now - start)
+        remaining = deadline - clock()
+        if remaining > 0:
+            sleeper(min(tick_s, remaining))
 
 
 class StabilityRunner:
@@ -89,6 +113,599 @@ class StabilityRunner:
         # High-resolution circular buffer: holds last 15 seconds of raw uA samples
         # 15s * 100 kS/s = 1,500,000 samples
         self.raw_rolling_buffer: Deque[Tuple[float, float]] = collections.deque(maxlen=1500000)
+
+    @staticmethod
+    def _append_jsonl(path: Path, value: Dict[str, Any], lock: threading.Lock) -> None:
+        with lock:
+            with path.open("a", encoding="utf-8") as handle:
+                handle.write(json.dumps(value, ensure_ascii=False, default=str) + "\n")
+
+    def run_one_hour(
+        self,
+        test_id: Optional[str] = None,
+        output_root: str | Path = "data/stability",
+        duration_s: float = 3600.0,
+        *,
+        clock: Callable[[], float] = time.monotonic,
+        sleeper: Callable[[float], None] = time.sleep,
+        status_interval_s: float = 30.0,
+    ) -> Dict[str, Any]:
+        """Run a config-preserving functional stability test with continuous UART evidence.
+
+        Unlike the legacy long-duration recovery runner this path never power-cycles or
+        edits configuration. The monotonic timer begins only after required preflight
+        checks pass and the UART/event sinks are active.
+        """
+        if duration_s <= 0:
+            raise ValueError("duration_s must be positive")
+        wall_start = datetime.now().astimezone()
+        stamp = wall_start.strftime("%Y%m%d_%H%M%S")
+        test_id = test_id or f"ONE_HOUR_{stamp}"
+        test_dir = Path(output_root) / f"ONE_HOUR_{stamp}"
+        test_dir.mkdir(parents=True, exist_ok=False)
+        event_path = test_dir / "events.jsonl"
+        commands_path = test_dir / "commands.jsonl"
+        errors_path = test_dir / "errors.jsonl"
+        snapshots_path = test_dir / "status_snapshots.jsonl"
+        raw_path = test_dir / "uart_raw.log"
+        ts_path = test_dir / "uart_timestamped.log"
+        sessions_path = test_dir / "session_summary.json"
+        wav_path = test_dir / "wav_integrity_report.json"
+        summary_path = test_dir / "test_summary.json"
+        for path in (event_path, commands_path, errors_path, snapshots_path, raw_path, ts_path):
+            path.touch()
+
+        lock = threading.Lock()
+        state = {"current": "UNKNOWN", "expected": "IDLE", "session": 0,
+                 "files": [], "errors": [], "sessions": [],
+                 "stop2": 0, "rtc_wakes": 0, "recoveries": 0,
+                 "reset_count": 0, "error_counts": {}, "last_counters": {},
+                 "ppk2_ready": False, "ppk2_segments": [], "ppk2_sample_index": 0,
+                 "active_session": None, "session_counter": 0, "pending_wake_capture": False,
+                 "uart_disconnect_reported": False, "unsafe_storage_failure": None}
+        monotonic_origin: Optional[float] = None
+
+        def elapsed_now() -> float:
+            return max(0.0, clock() - monotonic_origin) if monotonic_origin is not None else 0.0
+
+        def event(kind: str, result: str = "OBSERVED", line: str = "", error: Optional[str] = None,
+                  wall_time: Optional[str] = None, source_monotonic_ns: Optional[int] = None) -> None:
+            record = {
+                "event_type": kind, "test_id": test_id, "session_number": state["session"] or None,
+                "timestamp": wall_time or datetime.now().astimezone().isoformat(timespec="milliseconds"),
+                "elapsed_test_seconds": round(elapsed_now(), 6), "current_state": state["current"],
+                "expected_state": state["expected"], "result": result, "error_code": None,
+                "error_message": error, "raw_uart_line": line.rstrip("\r\n"),
+                "uart_open_monotonic_elapsed_ns": source_monotonic_ns,
+                "related_uart_evidence": "uart_timestamped.log" if line else None,
+                "counters": dict(state["last_counters"]),
+            }
+            self._append_jsonl(event_path, record, lock)
+            if error or result in {"FAIL", "WARNING", "UNVERIFIED", "BLOCKED"}:
+                state["errors"].append(record)
+                self._append_jsonl(errors_path, record, lock)
+
+        def on_line(line: str, wall_time: str, monotonic_ns: int) -> None:
+            text = line.rstrip("\r\n")
+            old = state["current"]
+            if re.search(r"Recording State\s*:\s*ACTIVE|recording.*ACTIVE|RECORDING_STARTED", text, re.I):
+                state["current"] = "RECORDING"
+            elif re.search(r"STOPPING|recording stop requested", text, re.I):
+                state["current"] = "STOPPING"
+            elif re.search(r"STOP2_ENTERED|Entering STM32L476 Stop 2|entering Stop2 standby", text, re.I):
+                state["current"] = "STOP2"
+                state["stop2"] += 1
+            elif re.search(r"RTC_WAKE_ISR|STOP2_EXITED|RTC wake received", text, re.I):
+                state["current"] = "WAKE_RECOVERY"
+                state["rtc_wakes"] += 1
+                state["pending_wake_capture"] = True
+            elif re.search(r"CLOCKS_RESTORED|UART_RESTORED|SCHEDULER_RESUMED|peripheral.*ready", text, re.I):
+                state["current"] = "IDLE"
+                state["recoveries"] += 1
+            elif re.search(r"Recording State\s*:\s*IDLE|WAV_VERIFIED|file closed|filesystem sync.*complete", text, re.I):
+                state["current"] = "IDLE"
+            elif re.search(r"sleep prep|RTC_WUT_ARMED|SLEEP_INTERVAL_STARTED", text, re.I):
+                state["current"] = "SLEEP_PREPARATION"
+            elif monotonic_origin is not None and re.search(r"Booting Zephyr|System initialization complete|Reset (?:reason|cause)|unexpected reset", text, re.I):
+                state["reset_count"] += 1
+                event("unexpected_reset", "FAIL", text, "reset observed during stability window")
+            session_match = re.search(r"(?:SESSION|session)\s*[#= ]\s*(\d+)|session=(\d+)", text, re.I)
+            if session_match:
+                state["session"] = int(session_match.group(1) or session_match.group(2))
+            if state["active_session"] is None and re.search(r"NEXT_RECORDING_STARTED|AUTONOMOUS RECORDING SESSION .* START", text, re.I):
+                state["session_counter"] += 1
+                state["session"] = state["session"] or state["session_counter"]
+                state["active_session"] = {"session": state["session"], "start_line": text,
+                                            "start_timestamp": datetime.now().astimezone().isoformat(),
+                                            "status": "STARTED", "filename": None}
+                state["sessions"].append(state["active_session"])
+                event("recording_started", "OBSERVED", text)
+            if re.search(r"RECORDING ACCOUNTING SUMMARY|WAV_VERIFIED|WAV_FILE_CLOSED", text, re.I):
+                if state["active_session"] is not None:
+                    state["active_session"]["evidence_lines"] = state["active_session"].get("evidence_lines", []) + [text]
+                    if "WAV_VERIFIED" in text:
+                        state["active_session"]["wav_firmware_verification"] = "PASS"
+                    if "WAV_FILE_CLOSED" in text:
+                        state["active_session"]["file_closed"] = True
+                    if "RECORDING ACCOUNTING SUMMARY" in text:
+                        state["active_session"]["status"] = "FINALIZING"
+            if re.search(r"\[SCHEDULER\] Session \d+ finished", text, re.I):
+                if state["active_session"] is not None:
+                    state["active_session"]["end_line"] = text
+                    state["active_session"]["end_timestamp"] = datetime.now().astimezone().isoformat()
+                    state["active_session"]["status"] = "COMPLETED" if "status=0" in text and "err=0" in text else "FAILED"
+                    state["active_session"] = None
+                    event("recording_finished", "OBSERVED" if state["sessions"][-1]["status"] == "COMPLETED" else "FAIL", text)
+            if re.search(r"\.wav\b", text, re.I):
+                match = re.search(r"([A-Za-z0-9_./:-]+\.wav)\b", text, re.I)
+                if match and match.group(1) not in state["files"]:
+                    state["files"].append(match.group(1))
+                if match and state["active_session"] is not None:
+                    state["active_session"]["filename"] = match.group(1)
+            severity = "FATAL" if re.search(r"\bFATAL\b|\bASSERT\b", text, re.I) else "ERROR" if re.search(r"\bERROR\b(?!\s*:\s*0\b)|\bFAILED\b|\bFAIL:", text, re.I) else "WARNING" if re.search(r"\bWARN(?:ING)?\b", text, re.I) else None
+            if severity:
+                sig = re.sub(r"\d+", "#", text.strip())
+                state["error_counts"][sig] = state["error_counts"].get(sig, 0) + 1
+                event("firmware_" + severity.lower(), "FAIL" if severity in {"ERROR", "FATAL"} else "WARNING", text, severity)
+            if re.search(r"DATA_CRC_FAIL|SDMMC write failed|fs write error|filesystem remount failed|Storage recovery failed|dirty audio.*storage fault", text, re.I):
+                state["unsafe_storage_failure"] = text
+                event("unsafe_storage_failure", "FAIL", text, "stopping monitoring to protect an open or corrupt storage transaction")
+            if state["current"] != old:
+                event("state_transition", "OBSERVED", text, wall_time=wall_time, source_monotonic_ns=monotonic_ns)
+            # Raw serial logs retain all bytes. JSONL carries line-level wall/test-relative
+            # timing and operating-state context for audit and event ordering.
+            event("uart_line", "OBSERVED", text, wall_time=wall_time, source_monotonic_ns=monotonic_ns)
+
+        self.controller.output_dir = test_dir
+        prior_callback = getattr(self.controller, "line_callback", None)
+        def callback(line: str, wall_time: str, mono_ns: int) -> None:
+            if prior_callback:
+                prior_callback(line, wall_time, mono_ns)
+            on_line(line, wall_time, mono_ns)
+        self.controller.line_callback = callback
+
+        checks: Dict[str, Any] = {}
+        timer_started = False
+        actual_s = 0.0
+        start_iso = None
+        end_iso = None
+        test_status = "NOT RUN"
+        reasons: List[str] = []
+        preflight_limitations: List[str] = []
+        uart_connected = False
+        ppk2_powerup = {"status": "NOT RUN", "port": getattr(self.ppk2, "port", None), "voltage_mv": self.voltage_mv}
+        try:
+            # Power and instrument setup must precede opening the STM32 VCP. Keep
+            # output enabled through every exit path; this runner never powers off.
+            if self.ppk2 is None:
+                raise RuntimeError("PPK2 is required to power the target before opening STM32 UART")
+            self.ppk2.connect(exclude_uart_port=self.controller.port)
+            self.ppk2.configure_source_meter(self.voltage_mv)
+            self.ppk2.all_currents_ua.clear()
+            self.ppk2.all_timestamps_s.clear()
+            self.ppk2.start_sampling()
+            self.ppk2.power_on()
+            state["ppk2_ready"] = True
+            ppk2_powerup["status"] = "POWERED_ON"
+            ppk2_powerup["port"] = self.ppk2.port
+            event("ppk2_power_on", "OBSERVED", f"source meter set to {self.voltage_mv} mV")
+            self.controller.connect(test_name=test_id, raw_filename="uart_raw.log", timestamped_filename="uart_timestamped.log")
+            uart_connected = True
+            # Capture the immediate boot profile, then release its buffer before
+            # later bounded measurement windows.
+            sleeper(min(max(self.boot_stabilize_s, 0.0), 2.0))
+            self.ppk2.stop_sampling()
+            self.ppk2.export_csv(test_dir / "ppk2_powerup.csv")
+            ppk2_powerup["samples"] = len(self.ppk2.all_currents_ua)
+            ppk2_powerup["status"] = "CAPTURED" if ppk2_powerup["samples"] else "POWERED_ON_NO_SAMPLES"
+            self.ppk2.all_currents_ua.clear()
+            self.ppk2.all_timestamps_s.clear()
+
+            def query(command: str, timeout: float = 5.0) -> Tuple[bool, str]:
+                before = len(self.controller.all_text)
+                sent_at = datetime.now().astimezone().isoformat(timespec="milliseconds")
+                ok, matched = self.controller.send_command(command, wait_for="OK", timeout=timeout)
+                response = self.controller.all_text[before:]
+                cmd_record = {"test_id": test_id, "timestamp": sent_at, "elapsed_test_seconds": elapsed_now(),
+                              "command": command, "ok": ok, "matched_response": matched, "raw_response": response}
+                self._append_jsonl(commands_path, cmd_record, lock)
+                if not ok:
+                    event("command_timeout", "FAIL", error=f"{command}: {matched}")
+                return ok, response
+
+            # Query status first. If autonomous startup has already entered a
+            # scheduled recording, use its boot transcript as the baseline and
+            # monitor that session instead of blocking the whole run.
+            ok, status_text = query("STATUS", timeout=8.0)
+            checks["status"] = {"ok": ok, "raw": status_text}
+            if not ok:
+                reasons.append("device STATUS command timed out or UART is unavailable")
+            elif re.search(r"Recording State\s*:\s*ACTIVE", status_text, re.I):
+                boot = self.controller.all_text
+                checks["active_configuration_source"] = "firmware boot report plus live STATUS"
+                for key, pattern in (("sample_rate_hz", r"Sample Rate\s*:\s*(\d+) Hz"),
+                                     ("bit_depth", r"Sample Format\s*:\s*(\d+)-bit"),
+                                     ("record_duration_s", r"Session Durations\s*:\s*(\d+)\s*s recording"),
+                                     ("sleep_duration_s", r"Session Durations\s*:\s*\d+\s*s recording\s*/\s*(\d+)\s*s sleep")):
+                    match = re.search(pattern, boot, re.I)
+                    checks[key] = int(match.group(1)) if match else None
+                checks["channels"] = 1 if re.search(r"Sample Format\s*:.*Mono", boot, re.I) else None
+                sha_match = re.search(r"SHA\s*:\s*([0-9a-f]{7,40})", boot, re.I)
+                checks["firmware_commit"] = sha_match.group(1) if sha_match else None
+                checks["pending_configuration"] = "NOT EXPOSED BY CURRENT FIRMWARE CONSOLE"
+                checks["saved_configuration"] = "NOT DISTINGUISHABLE FROM ACTIVE CONFIGURATION BY CURRENT FIRMWARE CONSOLE"
+                checks["target_build_configuration"] = "NOT EXPOSED BY CURRENT FIRMWARE CONSOLE"
+                checks["boot_readiness_markers"] = {
+                    "psram": bool(re.search(r"PSRAM Status\s*:\s*PASS|PSRAM.*Integrity VERIFIED", boot, re.I)),
+                    "sd_mount": bool(re.search(r"SD card initialized successfully|SD mounted:", boot, re.I)),
+                    "adc_dma": bool(re.search(r"ADC:.*oversampling|DMA block size", boot, re.I)),
+                    "recording_active": True,
+                }
+                checks["sd_free_space_from_boot"] = re.search(r"SD mounted:.*?(\d+) MB free", boot, re.I).group(1) + " MB" if re.search(r"SD mounted:.*?(\d+) MB free", boot, re.I) else "UNKNOWN"
+                if not all(checks["boot_readiness_markers"].values()):
+                    reasons.append("boot transcript did not verify PSRAM, SD, ADC/DMA and active recording readiness")
+                preflight_limitations.extend([
+                    "monitoring began during an already active scheduled recording",
+                    "saved and pending configuration states are not independently exposed by this firmware console",
+                    "expected session count cannot be calculated from the boot report's incomplete scheduler bounds",
+                ])
+            elif re.search(r"Scheduler Status\s*:\s*PAUSED", status_text, re.I):
+                reasons.append("scheduler is paused")
+            else:
+                for cmd, key in (("DEVINFO", "device_info"), ("VERSION", "firmware_version"),
+                                 ("GET_CONFIG", "active_configuration"), ("DAYSOFWEEK", "enabled_days"),
+                                 ("TIMEOFDAY", "schedule_windows"), ("DATERANGE", "schedule_date_range"),
+                                 ("SUNMODE", "solar_mode"),
+                                 ("TIMEZONE", "timezone"), ("DATETIME", "rtc"), ("STOR", "storage"), ("PSRAM status", "psram")):
+                    q_ok, response = query(cmd, timeout=5.0)
+                    checks[key] = {"ok": q_ok, "raw": response}
+                    if not q_ok:
+                        reasons.append(f"required preflight query {cmd} failed")
+                cfg = checks.get("active_configuration", {}).get("raw", "")
+                for key, pattern in (("sample_rate_hz", r"Sampling Rate \(SAMF\)\s*:\s*(\d+)"),
+                                     ("bit_depth", r"Bits Per Sample \(BTPS\)\s*:\s*(\d+)"),
+                                     ("channels", r"Channels \(NUMCH\)\s*:\s*(\d+)"),
+                                     ("record_duration_s", r"Record Time \(RECT\)\s*:\s*(\d+)"),
+                                     ("sleep_duration_s", r"Sleep Interval \(SLEEP\)\s*:\s*(\d+)")):
+                    match = re.search(pattern, cfg, re.I)
+                    checks[key] = int(match.group(1)) if match else None
+                    if match is None:
+                        reasons.append(f"active configuration value {key} is unknown")
+                checks["pending_configuration"] = "NOT EXPOSED BY CURRENT FIRMWARE CONSOLE"
+                preflight_limitations.append("pending/staged configuration cannot be queried independently on this firmware")
+                checks["saved_configuration"] = "NOT EXPOSED BY CURRENT FIRMWARE CONSOLE"
+                preflight_limitations.append("persisted configuration cannot be distinguished from runtime configuration on this firmware")
+                checks["configuration_audit"] = {
+                    name: {"requested": None, "saved": "UNKNOWN", "pending": "UNKNOWN", "active": checks.get(name),
+                           "actual_operating": "UNKNOWN"}
+                    for name in ("sample_rate_hz", "bit_depth", "channels", "record_duration_s", "sleep_duration_s")
+                }
+                version_raw = checks.get("firmware_version", {}).get("raw", "")
+                sha_match = re.search(r"(?:SHA|commit)\s*:?\s*([0-9a-f]{7,40})", version_raw, re.I)
+                checks["firmware_commit"] = sha_match.group(1) if sha_match else None
+                if not sha_match:
+                    preflight_limitations.append("firmware commit SHA was not available from the target")
+                build_info = Path("app/build/PRODUCTION/build_info.yml")
+                checks["host_build_configuration"] = build_info.read_text(encoding="utf-8", errors="replace") if build_info.is_file() else "NOT AVAILABLE"
+                checks["target_build_configuration"] = "NOT EXPOSED BY CURRENT FIRMWARE CONSOLE"
+                preflight_limitations.append("target firmware build configuration cannot be verified by the current console")
+                estimate = self._estimate_one_hour_sessions(checks, duration_s)
+                checks["expected_schedule"] = estimate
+                if estimate.get("expected_sessions") is None:
+                    preflight_limitations.append("expected sessions could not be calculated from the active scheduler readbacks")
+                raw_all = self.controller.all_text
+                psram_raw = checks.get("psram", {}).get("raw", "")
+                checks["boot_readiness_markers"] = {
+                    "psram": bool(re.search(r"PSRAM Status\s*:\s*PASS|PSRAM initialized and verified", raw_all, re.I)) or
+                             (bool(re.search(r"PSRAM Physical Capacity", psram_raw, re.I)) and bool(re.search(r"Integrity Verified", psram_raw, re.I))),
+                    "sd_mount": bool(re.search(r"SD mounted:|filesystem.*mounted", raw_all, re.I)),
+                    "adc_dma": bool(re.search(r"ADC/DMA configured|DMA.*active|ADC.*ready", raw_all, re.I)),
+                    "wav_closed_and_storage_synced": bool(re.search(r"WAV_FILE_CLOSED", raw_all, re.I) and
+                                                           re.search(r"FS_SYNC|filesystem sync.*complete|SDMMC_IDLE", raw_all, re.I)),
+                }
+                stor_raw = checks.get("storage", {}).get("raw", "")
+                stor_match = re.search(r"total number of bytes written\s*:\s*(\d+).*available space\s*:\s*(\d+)", stor_raw, re.I | re.S)
+                if stor_match:
+                    checks["storage_capacity"] = {"used_bytes": int(stor_match.group(1)), "available_bytes": int(stor_match.group(2))}
+                    if checks["storage_capacity"]["available_bytes"] > 0:
+                        checks["boot_readiness_markers"]["sd_mount"] = True
+                else:
+                    reasons.append("storage capacity response was not parseable")
+                for key, passed in checks["boot_readiness_markers"].items():
+                    if not passed:
+                        reasons.append(f"required {key} readiness evidence was not available")
+                if checks.get("expected_schedule", {}).get("expected_recording_seconds") is not None and checks.get("storage_capacity"):
+                    bytes_per_second = (checks.get("sample_rate_hz") or 0) * ((checks.get("bit_depth") or 0) // 8) * (checks.get("channels") or 0)
+                    checks["estimated_required_storage_bytes"] = bytes_per_second * checks["expected_schedule"]["expected_recording_seconds"]
+                    if checks["storage_capacity"]["available_bytes"] < checks["estimated_required_storage_bytes"]:
+                        reasons.append("available SD storage is below the scheduler's estimated recording payload")
+
+            preflight = {"test_id": test_id, "mode": "ONE_HOUR_AUTONOMOUS_STABILITY", "requested_duration_s": duration_s,
+                         "timer_started": False, "checks": checks, "blockers": reasons,
+                         "limitations": preflight_limitations}
+            (test_dir / "preflight.json").write_text(json.dumps(preflight, indent=2), encoding="utf-8")
+            if reasons:
+                event("preflight_blocked", "BLOCKED", error="; ".join(reasons))
+            if not reasons:
+                # The timer starts only after connection logging and successful preflight.
+                monotonic_origin = clock()
+                self.start_host_ns = int(monotonic_origin * 1e9)
+                start_iso = datetime.now().astimezone().isoformat(timespec="milliseconds")
+                timer_started = True
+                state["current"] = "RECORDING" if re.search(r"Recording State\s*:\s*ACTIVE", status_text, re.I) else "IDLE"
+                state["expected"] = "AUTONOMOUS_SCHEDULE"
+                event("test_started", "OBSERVED")
+                next_status = monotonic_origin + status_interval_s
+                def monitor_tick(_elapsed: float) -> None:
+                    nonlocal next_status
+                    if state["unsafe_storage_failure"]:
+                        event("test_aborted_unsafe_storage", "FAIL", state["unsafe_storage_failure"],
+                              "unsafe storage failure observed; ending test and requesting safe recorder stop")
+                        raise RuntimeError("unsafe storage failure: " + state["unsafe_storage_failure"])
+                    if getattr(self.controller, "_last_error", None) and not state["uart_disconnect_reported"]:
+                        state["uart_disconnect_reported"] = True
+                        event("uart_disconnect", "FAIL", error=str(self.controller._last_error))
+                    now = clock()
+                    if now >= next_status and state["current"] not in {"STOP2", "SLEEP_PREPARATION"}:
+                        before = len(self.controller.all_text)
+                        ok, response = query("STATUS", timeout=5.0)
+                        snapshot = {"test_id": test_id, "timestamp": datetime.now().astimezone().isoformat(timespec="milliseconds"),
+                                    "elapsed_test_seconds": round(now - monotonic_origin, 3), "ok": ok,
+                                    "raw_response": self.controller.all_text[before:],
+                                    "parsed": self._parse_one_hour_status(response), "counter_deltas": {}}
+                        parsed = snapshot["parsed"]
+                        for name, value in parsed.items():
+                            if isinstance(value, int) and name in state["last_counters"] and value > state["last_counters"][name]:
+                                snapshot["counter_deltas"][name] = value - state["last_counters"][name]
+                                event("counter_increase", "WARNING" if "drop" in name or "error" in name else "OBSERVED",
+                                      error=f"{name} increased by {snapshot['counter_deltas'][name]}" if "drop" in name or "error" in name else None)
+                            if isinstance(value, int):
+                                state["last_counters"][name] = value
+                        self._append_jsonl(snapshots_path, snapshot, lock)
+                        if state["ppk2_ready"] and parsed.get("recording_state", "").upper() == "ACTIVE":
+                            self._capture_one_hour_ppk_segment(test_dir, test_id, state, "recording",
+                                                               clock, sleeper, lock)
+                        elif state["ppk2_ready"] and state["pending_wake_capture"]:
+                            self._capture_one_hour_ppk_segment(test_dir, test_id, state, "rtc_wake_recovery",
+                                                               clock, sleeper, lock)
+                            state["pending_wake_capture"] = False
+                        if not ok:
+                            event("status_timeout", "WARNING", error="periodic STATUS timed out")
+                        next_status += status_interval_s
+                actual_s = run_monotonic_window(duration_s, monitor_tick, clock=clock, sleeper=sleeper)
+                end_iso = datetime.now().astimezone().isoformat(timespec="milliseconds")
+                test_status = "PASS" if actual_s >= duration_s and not state["errors"] else "FAIL"
+                if actual_s >= duration_s:
+                    if not state["sessions"]:
+                        reasons.append("no scheduled recording sessions were observed")
+                    if state["stop2"] == 0 or state["rtc_wakes"] == 0:
+                        reasons.append("STOP2 entry and RTC wake were not both verified")
+                    if any(s.get("status") != "COMPLETED" or s.get("file_closed") is not True or
+                           s.get("wav_firmware_verification") != "PASS" for s in state["sessions"]):
+                        reasons.append("one or more recording sessions lack close and WAV verification evidence")
+                    reasons.append("host-side WAV readback and sample accounting were not available")
+                    test_status = "FAIL"
+                event("test_window_ended", "OBSERVED")
+        except KeyboardInterrupt:
+            reasons.append("run interrupted by user")
+            event("run_interrupted", "WARNING", error="KeyboardInterrupt")
+            test_status = "INCOMPLETE" if timer_started else "NOT RUN"
+        except Exception as exc:
+            reasons.append(f"runner exception: {type(exc).__name__}: {exc}")
+            event("runner_failure", "FAIL", error=str(exc))
+            test_status = "FAIL" if timer_started else "NOT RUN"
+            if timer_started and monotonic_origin is not None:
+                actual_s = max(actual_s, max(0.0, clock() - monotonic_origin))
+                end_iso = datetime.now().astimezone().isoformat(timespec="milliseconds")
+        finally:
+            state["expected"] = "FINALIZE"
+            if timer_started and state["current"] == "RECORDING":
+                ok, resp = self.controller.send_command("STOP_RECORDING", wait_for="OK", timeout=5.0)
+                self._append_jsonl(commands_path, {"test_id": test_id, "command": "STOP_RECORDING", "ok": ok,
+                                                   "response": resp, "elapsed_test_seconds": elapsed_now()}, lock)
+                state["sessions"].append({"session": state["session"], "status": "PARTIAL", "reason": "active at deadline"})
+            try:
+                if uart_connected:
+                    final_ok, final_text = self.controller.send_command("STATUS", wait_for="OK", timeout=5.0)
+                else:
+                    final_ok, final_text = False, "NOT RUN: STM32 UART was not opened"
+            except Exception as exc:
+                final_ok, final_text = False, str(exc)
+            if timer_started and not final_ok:
+                reasons.append("final STATUS unavailable")
+                test_status = "FAIL"
+            try:
+                self.controller.stop()
+            except Exception:
+                pass
+            if self.ppk2 is not None:
+                try:
+                    self.ppk2.stop_sampling()
+                    self.ppk2.close(keep_power_on=True)
+                except Exception as exc:
+                    reasons.append(f"PPK2 cleanup warning: {exc}")
+            wav_report = {"files": [], "status": "NOT AVAILABLE", "note": "Production console has no host WAV download command; no filesystem readback was possible."}
+            for name in state["files"]:
+                wav_report["files"].append({"filename": name, "structural_validation": "NOT RUN",
+                                            "sample_accounting": "NOT AVAILABLE", "payload_crc": "NOT AVAILABLE"})
+            (wav_path).write_text(json.dumps(wav_report, indent=2), encoding="utf-8")
+            estimate = checks.get("expected_schedule", {})
+            session_summary = {"expected_sessions": estimate.get("expected_sessions", "UNKNOWN"),
+                               "expected_session_start_times": estimate.get("session_start_times", []),
+                               "started_sessions": len(state["sessions"]),
+                               "completed_sessions": len([s for s in state["sessions"] if s.get("status") == "COMPLETED"]),
+                               "failed_sessions": len([s for s in state["sessions"] if s.get("status") == "FAILED"]),
+                               "partial_sessions": len([s for s in state["sessions"] if s.get("status") not in {"COMPLETED", "FAILED"}]),
+                               "session_records": state["sessions"],
+                               "wav_filenames": state["files"], "stop2_entries": state["stop2"],
+                               "rtc_wakes": state["rtc_wakes"], "peripheral_recoveries": state["recoveries"]}
+            sessions_path.write_text(json.dumps(session_summary, indent=2), encoding="utf-8")
+            summary = {"label": "ONE-HOUR FUNCTIONAL STABILITY TEST", "mode": "ONE_HOUR_AUTONOMOUS_STABILITY",
+                       "test_id": test_id, "test_directory": str(test_dir), "start_timestamp": start_iso,
+                       "end_timestamp": end_iso, "requested_duration_seconds": duration_s,
+                       "actual_duration_seconds": round(actual_s, 3), "timer_started": timer_started,
+                       "status": test_status,
+                       "preflight_status": ("LIMITED" if timer_started and preflight_limitations else "PASS") if timer_started else "BLOCKED",
+                       "preflight_limitations": preflight_limitations,
+                       "blockers_and_failures": reasons + [e.get("error_message") for e in state["errors"] if e.get("error_message")],
+                       "preflight": checks, "sessions": session_summary, "error_count": len(state["errors"]),
+                       "error_events": state["errors"],
+                       "ppk2": {**ppk2_powerup, "segments_status": "CAPTURED" if state["ppk2_segments"] else "NOT RUN",
+                                "segments": state["ppk2_segments"],
+                                "sleep_current": "NOT REPORTED: stable STOP2 interval was not independently segmented"},
+                       "wav_integrity_report": str(wav_path), "final_status_response": final_text if 'final_text' in locals() else "NOT RUN"}
+            summary_path.write_text(json.dumps(summary, indent=2), encoding="utf-8")
+            try:
+                ComparisonWorkbookManager("data/reports/stm32_vs_max78000.xlsx").update_stability_test_results({
+                    "test_id": test_id, "sample_rate": checks.get("sample_rate_hz"),
+                    "bit_depth": checks.get("bit_depth"), "target_duration_s": duration_s,
+                    "actual_uptime_s": actual_s, "recording_sessions_count": len(state["sessions"]),
+                    "total_recording_time_s": 0, "total_errors_count": len(state["errors"]),
+                    "unique_error_signatures_count": len(state["error_counts"]), "power_cycles_count": 0,
+                    "successful_recoveries_count": state["recoveries"], "failed_recoveries_count": 0,
+                    "incomplete_wav_count": len([s for s in state["sessions"] if s.get("status") == "PARTIAL"]),
+                    "hardware_vs_firmware_assessment": {"classification": "Not assessed", "rationale": "Preflight / verification evidence governs status"},
+                    "status": test_status, "terminal_reason": "; ".join(reasons) or "One-hour functional stability window complete",
+                })
+            except Exception as exc:
+                logger.exception("One-hour workbook update failed: %s", exc)
+        return summary
+
+    def _capture_one_hour_ppk_segment(
+        self, test_dir: Path, test_id: str, state: Dict[str, Any], phase: str,
+        clock: Callable[[], float], sleeper: Callable[[float], None], lock: threading.Lock,
+    ) -> None:
+        """Capture a short bounded PPK2 window and immediately export/free its samples."""
+        segment_id = len(state["ppk2_segments"]) + 1
+        safe_phase = re.sub(r"[^a-z0-9_]+", "_", phase.lower()).strip("_")
+        start_wall = datetime.now().astimezone().isoformat(timespec="milliseconds")
+        start_elapsed = max(0.0, clock() - self.start_host_ns / 1e9) if self.start_host_ns else None
+        try:
+            self.ppk2.all_currents_ua.clear()
+            self.ppk2.all_timestamps_s.clear()
+            self.ppk2.start_sampling()
+            sleeper(0.25)
+            self.ppk2.stop_sampling()
+            currents = list(self.ppk2.all_currents_ua)
+            start_index = state["ppk2_sample_index"]
+            end_index = start_index + len(currents)
+            state["ppk2_sample_index"] = end_index
+            csv_path = test_dir / f"ppk2_{safe_phase}_{segment_id:04d}.csv"
+            self.ppk2.export_csv(csv_path)
+            segment = {"test_id": test_id, "segment": segment_id, "phase": phase,
+                       "session_number": state["session"] or None, "start_timestamp": start_wall,
+                       "end_timestamp": datetime.now().astimezone().isoformat(timespec="milliseconds"),
+                       "elapsed_test_seconds": start_elapsed, "sample_index_start": start_index,
+                       "sample_index_end": end_index, "sample_count": len(currents), "csv": csv_path.name,
+                       "average_current_ma": (sum(currents) / len(currents) / 1000.0) if currents else None,
+                       "peak_current_ma": (max(currents) / 1000.0) if currents else None,
+                       "average_power_mw": ((sum(currents) / len(currents) / 1000.0) * (self.ppk2.voltage_mv / 1000.0)) if currents else None,
+                       "duration_seconds": (self.ppk2.all_timestamps_s[-1] if self.ppk2.all_timestamps_s else 0.0),
+                       "related_uart_event": "status_snapshots.jsonl", "verified_sleep_current": False}
+            state["ppk2_segments"].append(segment)
+            self._append_jsonl(test_dir / "ppk2_segments.jsonl", segment, lock)
+        except Exception as exc:
+            try:
+                self.ppk2.stop_sampling()
+            except Exception:
+                pass
+            self._append_jsonl(test_dir / "errors.jsonl", {
+                "test_id": test_id, "timestamp": datetime.now().astimezone().isoformat(),
+                "event_type": "ppk2_capture_failure", "result": "WARNING", "error_message": str(exc),
+                "phase": phase, "session_number": state["session"] or None,
+            }, lock)
+        finally:
+            # PPK2Controller stores Python floats; release each short window before the next.
+            self.ppk2.all_currents_ua.clear()
+            self.ppk2.all_timestamps_s.clear()
+
+    @staticmethod
+    def _estimate_one_hour_sessions(checks: Dict[str, Any], duration_s: float) -> Dict[str, Any]:
+        """Conservative simulation of the firmware's daily window/duration/sleep schedule."""
+        cfg = checks.get("active_configuration", {}).get("raw", "")
+        days_raw = checks.get("enabled_days", {}).get("raw", "")
+        windows_raw = checks.get("schedule_windows", {}).get("raw", "")
+        date_raw = checks.get("schedule_date_range", {}).get("raw", "")
+        rtc_raw = checks.get("rtc", {}).get("raw", "")
+        solar_raw = checks.get("solar_mode", {}).get("raw", "")
+        sun_match = re.search(r"Sun recording mode:\s*([A-Za-z ]+)", solar_raw, re.I)
+        if sun_match and sun_match.group(1).strip().lower() != "disabled":
+            return {"expected_sessions": None, "limitation": "solar schedule cannot be predicted without the firmware solar inputs"}
+        days_match = re.search(r'Days of week set to\s*"([MTWRFSU]*)"', days_raw, re.I)
+        date_match = re.search(r"(\d{4})/(\d{1,2})/(\d{1,2})-(\d{4})/(\d{1,2})/(\d{1,2})", date_raw)
+        local_match = re.search(r"Current time Local is\s*(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})", rtc_raw)
+        rect_match = re.search(r"Record Time \(RECT\)\s*:\s*(\d+)", cfg, re.I)
+        sleep_match = re.search(r"Sleep Interval \(SLEEP\)\s*:\s*(\d+)", cfg, re.I)
+        if not (days_match and local_match and rect_match and sleep_match):
+            return {"expected_sessions": None, "limitation": "day mask, local RTC, RECT or SLEEP readback missing"}
+        try:
+            now = datetime.strptime(local_match.group(1), "%Y-%m-%d %H:%M:%S")
+        except ValueError:
+            return {"expected_sessions": None, "limitation": "invalid local RTC readback"}
+        day_chars = set(days_match.group(1).upper())
+        day_order = "MTWRFSU"
+        allowed = {idx for idx, char in enumerate(day_order) if char in day_chars}
+        rect = int(rect_match.group(1))
+        sleep = int(sleep_match.group(1))
+        windows = [(int(h1) * 3600 + int(m1) * 60 + int(s1), int(h2) * 3600 + int(m2) * 60 + int(s2))
+                   for h1, m1, s1, h2, m2, s2 in re.findall(
+                       r"Index\s+\d+\) set to\s+(\d{2}):(\d{2}):(\d{2})-(\d{2}):(\d{2}):(\d{2})", windows_raw)]
+        if not windows and not re.search(r"No valid time of day ranges set", windows_raw, re.I):
+            return {"expected_sessions": None, "limitation": "time-of-day schedule readback could not be parsed"}
+        if not windows:
+            windows = [(0, 86400)]
+        date_bounds = None
+        if date_match:
+            date_bounds = (datetime(int(date_match.group(1)), int(date_match.group(2)), int(date_match.group(3))).date(),
+                           datetime(int(date_match.group(4)), int(date_match.group(5)), int(date_match.group(6))).date())
+        deadline = now + timedelta(seconds=duration_s)
+        starts = []
+        for day_offset in range(3):
+            day = (now.date() + timedelta(days=day_offset))
+            if day.weekday() not in allowed or (date_bounds and not (date_bounds[0] <= day <= date_bounds[1])):
+                continue
+            midnight = datetime.combine(day, datetime.min.time())
+            for win_start, win_end in windows:
+                cursor = max(now, midnight + timedelta(seconds=win_start))
+                end = midnight + timedelta(seconds=win_end)
+                while cursor < end and cursor < deadline and len(starts) < 10000:
+                    starts.append(cursor.isoformat(sep=" "))
+                    record_s = min(rect, int((end - cursor).total_seconds())) if rect > 0 else int((end - cursor).total_seconds())
+                    if record_s <= 0:
+                        break
+                    cursor += timedelta(seconds=record_s + sleep)
+        return {"expected_sessions": len(starts), "session_start_times": starts,
+                "method": "scheduler window/day/date bounds with RECT + SLEEP simulation",
+                "limitation": "predicted starts; actual scheduler events remain the test evidence"}
+
+    @staticmethod
+    def _parse_one_hour_status(raw: str) -> Dict[str, Any]:
+        parsed: Dict[str, Any] = {}
+        patterns = {
+            "recording_state": r"Recording State\s*:\s*([A-Z_]+)",
+            "active_file": r"Active File\s*:\s*(\S+)",
+            "sample_rate_hz": r"(?:Active|Configured) Sample Rate\s*:\s*(\d+)",
+            "bit_depth": r"(?:Active|Configured) Bit Depth\s*:\s*(\d+)",
+            "samples_written": r"Samples Written\s*:\s*(\d+)",
+            "samples_acquired": r"Samples Acquired\s*:\s*(\d+)",
+            "samples_processed": r"Samples Processed\s*:\s*(\d+)",
+            "dropped_samples": r"(?:Dropped|Lost) Samples\s*:\s*(\d+)",
+            "dropped_blocks": r"Dropped Blocks\s*:\s*(\d+)",
+            "adc_overruns": r"ADC (?:Overruns|OVR)\s*:\s*(\d+)",
+            "dma_errors": r"DMA (?:Errors|ERR)\s*:\s*(\d+)",
+            "dsp_errors": r"DSP (?:Errors|Overruns)\s*:\s*(\d+)",
+            "psram_high_water_bytes": r"PSRAM High-Water Mark\s*:\s*(\d+)",
+            "sd_write_errors": r"SD Write Errors\s*:\s*(\d+)",
+            "rtc": r"RTC Current Time\s*:\s*([^\r\n]+)",
+        }
+        for key, pattern in patterns.items():
+            match = re.search(pattern, raw, re.I)
+            if match:
+                integer_fields = {"sample_rate_hz", "bit_depth", "samples_written", "samples_acquired", "samples_processed",
+                                  "dropped_samples", "dropped_blocks", "adc_overruns", "dma_errors", "dsp_errors",
+                                  "psram_high_water_bytes", "sd_write_errors"}
+                parsed[key] = int(match.group(1)) if key in integer_fields else match.group(1).strip()
+        return parsed
 
     def run(
         self,
@@ -309,7 +926,8 @@ class StabilityRunner:
             return
 
         # Check recovery limits
-        if tracker.failed_recovery_attempts >= self.max_signature_recoveries:
+        recoveries_attempted = tracker.successful_power_cycles + tracker.failed_recovery_attempts
+        if recoveries_attempted >= self.max_signature_recoveries or tracker.failed_recovery_attempts >= self.max_signature_recoveries:
             self.progress(f"[PERSISTENT ERROR] Signature '{sig}' exceeded maximum recovery limit ({self.max_signature_recoveries}).")
             tracker.is_persistent = True
             self.terminal_reason = f"Persistent error exceeded limit: {sig}"

@@ -953,6 +953,21 @@ int audio_in_stop(void)
 	LL_ADC_EnableDeepPowerDown(adc);
 	LL_ADC_DisableInternalRegulator(adc);
 
+#if defined(CONFIG_THREAD_ANALYZER)
+	size_t unused = 0;
+	if (k_thread_stack_space_get(&acquisition_thread_data, &unused) == 0) {
+		size_t stack_size = K_THREAD_STACK_SIZEOF(acquisition_thread_stack);
+		size_t used = stack_size - unused;
+		uint32_t pct = (uint32_t)((used * 100U) / stack_size);
+		LOG_INF("[STACK] Acquisition thread: %u / %u bytes used (%u%%)",
+			(unsigned int)used, (unsigned int)stack_size, (unsigned int)pct);
+		if (pct > 70) {
+			LOG_WRN("[STACK WARNING] Acquisition thread stack usage > 70%% (%u%%)",
+				(unsigned int)pct);
+		}
+	}
+#endif
+
 	return ret;
 }
 
@@ -989,3 +1004,18 @@ uint32_t audio_in_get_ovs_ratio(void)
 
 
 
+
+int audio_in_verify_ready(void)
+{
+	if (!initialized) {
+		return -EAGAIN;
+	}
+	if (LL_ADC_IsDeepPowerDownEnabled(adc)) {
+		LL_ADC_DisableDeepPowerDown(adc);
+	}
+	if (!LL_ADC_IsInternalRegulatorEnabled(adc)) {
+		LL_ADC_EnableInternalRegulator(adc);
+		k_busy_wait(20);
+	}
+	return 0;
+}

@@ -85,6 +85,22 @@ static void log_sdmmc_stage_diagnostics(const char *stage_name, int err_code,
 LOG_MODULE_REGISTER(recorder, LOG_LEVEL_WRN);
 #endif
 
+static void recorder_apply_sdmmc_clock(void) {
+#if defined(SDMMC1)
+#if defined(CONFIG_WILDSONIC_SDMMC_CLK_DIV)
+  uint32_t target_div = CONFIG_WILDSONIC_SDMMC_CLK_DIV;
+  if ((SDMMC1->CLKCR & 0xFF) != target_div) {
+    SDMMC1->CLKCR = (SDMMC1->CLKCR & ~0xFFU) | (target_div & 0xFFU);
+  }
+#endif
+  uint32_t clkcr = SDMMC1->CLKCR;
+  uint32_t clkdiv = clkcr & 0xFF;
+  uint32_t clk_hz = 48000000U / (clkdiv + 2U);
+  LOG_INF("SDMMC hardware clock: %u Hz (CLKDIV=%u, CLKCR=0x%08X, bus=%s)",
+          clk_hz, clkdiv, clkcr, (clkcr & (1U << 11)) ? "4-bit" : "1-bit");
+#endif
+}
+
 #define SAMPLE_BYTES (CONFIG_AUDIO_SAMPLE_BITS / 8)
 #define BLOCK_SAMPLES CONFIG_AUDIO_BLOCK_SAMPLES
 #define BLOCK_BYTES (BLOCK_SAMPLES * SAMPLE_BYTES)
@@ -115,15 +131,69 @@ static STRUCT_SECTION_ITERABLE(k_mem_slab, pool) =
 #else
 K_MEM_SLAB_DEFINE_STATIC(pool, BLOCK_BYTES, NUM_BLOCKS, 4);
 #endif
-K_MSGQ_DEFINE(filled_q, sizeof(void *), NUM_BLOCKS, 4);
+K_MSGQ_DEFINE(filled_q, sizeof(uint8_t), NUM_BLOCKS, 1);
 
 /* Asynchronous non-PSRAM block message queue to sd_writer_thread */
 struct sd_block_msg {
+  uint8_t buf_id;
   void *blk;
   uint32_t bytes;
   uint32_t samples;
 };
 K_MSGQ_DEFINE(sd_block_q, sizeof(struct sd_block_msg), NUM_BLOCKS, 4);
+
+/* Buffer ownership descriptor table */
+struct buf_descriptor {
+  uint8_t id;
+  enum buf_owner_state state;
+  void *ptr;
+};
+
+static struct buf_descriptor s_buf_table[NUM_BLOCKS];
+static struct k_spinlock s_buf_lock;
+
+static inline uint8_t recorder_buf_ptr_to_id(const void *blk) {
+  if (blk < (const void *)_k_mem_slab_buf_pool ||
+      blk >= (const void *)(_k_mem_slab_buf_pool + (NUM_BLOCKS * ROUND_UP(BLOCK_BYTES, 4)))) {
+    return 0xFF;
+  }
+  return (uint8_t)(((uintptr_t)blk - (uintptr_t)_k_mem_slab_buf_pool) / ROUND_UP(BLOCK_BYTES, 4));
+}
+
+static inline void *recorder_buf_id_to_ptr(uint8_t id) {
+  if (id < NUM_BLOCKS) {
+    return (void *)(_k_mem_slab_buf_pool + (id * ROUND_UP(BLOCK_BYTES, 4)));
+  }
+  return NULL;
+}
+
+static void recorder_buf_table_init(void) {
+  k_spinlock_key_t key = k_spin_lock(&s_buf_lock);
+  for (uint8_t i = 0; i < NUM_BLOCKS; i++) {
+    s_buf_table[i].id = i;
+    s_buf_table[i].state = BUF_OWNER_FREE;
+    s_buf_table[i].ptr = recorder_buf_id_to_ptr(i);
+  }
+  k_spin_unlock(&s_buf_lock, key);
+}
+
+static inline void recorder_buf_set_state(uint8_t id, enum buf_owner_state state) {
+  if (id < NUM_BLOCKS) {
+    k_spinlock_key_t key = k_spin_lock(&s_buf_lock);
+    s_buf_table[id].state = state;
+    k_spin_unlock(&s_buf_lock, key);
+  }
+}
+
+static inline enum buf_owner_state recorder_buf_get_state(uint8_t id) {
+  if (id < NUM_BLOCKS) {
+    k_spinlock_key_t key = k_spin_lock(&s_buf_lock);
+    enum buf_owner_state st = s_buf_table[id].state;
+    k_spin_unlock(&s_buf_lock, key);
+    return st;
+  }
+  return BUF_OWNER_FREE;
+}
 
 #define SD_WRITER_STACK_SIZE 4096
 /* SD writer runs at preemptive priority 3 (below real-time capture priority 0 and
@@ -160,8 +230,33 @@ struct pingpong_slot {
   uint64_t write_end_cyc;
 };
 
-static uint8_t __aligned(4) s_pingpong_buf_b[BLOCK_BYTES];
+#define SD_WRITER_CHUNK_BYTES (32768U)
+#define PINGPONG_SLOT_BYTES (SD_WRITER_CHUNK_BYTES / 2U) /* 16384 bytes */
+
+uint8_t __aligned(4) s_sd_writer_buf[SD_WRITER_CHUNK_BYTES];
+/* Static buffer alias for test compatibility: s_pingpong_buf_b[BLOCK_BYTES]; */
+static uint8_t *s_pingpong_buf_b = &s_sd_writer_buf[PINGPONG_SLOT_BYTES];
 static struct pingpong_slot s_pingpong[2];
+
+static int sd_write_all(struct fs_file_t *fp, const void *data, size_t length) {
+  if (!fp || !data) {
+    return -EINVAL;
+  }
+  const uint8_t *ptr = (const uint8_t *)data;
+  size_t remaining = length;
+  while (remaining > 0) {
+    ssize_t w = fs_write(fp, ptr, remaining);
+    if (w < 0) {
+      return (int)w;
+    }
+    if (w == 0) {
+      return -ENOSPC;
+    }
+    ptr += (size_t)w;
+    remaining -= (size_t)w;
+  }
+  return 0;
+}
 
 static struct k_sem s_reader_start_sem;
 static struct k_sem s_reader_done_sem;
@@ -193,6 +288,119 @@ static volatile uint64_t sd_writer_bytes_written = 0;
 static volatile uint64_t sd_writer_failed_bytes = 0;
 static volatile uint32_t sd_writer_batch_count = 0;
 static volatile int sd_writer_err = 0;
+
+/* Spinlock-protected 64-bit and 32-bit SD writer performance metrics */
+struct rec_writer_shared_stats {
+  struct k_spinlock lock;
+  uint64_t overlap_us_sum;
+  uint32_t swap_count;
+  uint64_t write_us_sum;
+  uint32_t write_count;
+  uint32_t worst_write_us;
+  uint64_t peek_us_sum;
+  uint32_t peek_count;
+  uint32_t worst_peek_us;
+  uint64_t commit_us_sum;
+  uint64_t batch_wall_us_sum;
+  uint32_t worst_batch_ms;
+  uint64_t bytes_written;
+  uint64_t failed_bytes;
+  uint32_t batch_count;
+  int err;
+};
+static struct rec_writer_shared_stats s_writer_stats;
+
+static inline void writer_stats_reset(void) {
+  k_spinlock_key_t key = k_spin_lock(&s_writer_stats.lock);
+  memset(&s_writer_stats, 0, sizeof(s_writer_stats));
+  sd_writer_overlap_us_sum = 0;
+  sd_writer_swap_count = 0;
+  sd_writer_write_us_sum = 0;
+  sd_writer_write_count = 0;
+  sd_writer_worst_write_us = 0;
+  sd_writer_peek_us_sum = 0;
+  sd_writer_peek_count = 0;
+  sd_writer_worst_peek_us = 0;
+  sd_writer_commit_us_sum = 0;
+  sd_writer_batch_wall_us_sum = 0;
+  sd_writer_worst_batch_ms = 0;
+  sd_writer_bytes_written = 0;
+  sd_writer_failed_bytes = 0;
+  sd_writer_batch_count = 0;
+  sd_writer_err = 0;
+  k_spin_unlock(&s_writer_stats.lock, key);
+}
+
+static inline void writer_stats_record_write(uint32_t us, uint32_t bytes) {
+  k_spinlock_key_t key = k_spin_lock(&s_writer_stats.lock);
+  s_writer_stats.write_us_sum += us;
+  s_writer_stats.write_count++;
+  if (us > s_writer_stats.worst_write_us) {
+    s_writer_stats.worst_write_us = us;
+  }
+  s_writer_stats.bytes_written += bytes;
+  sd_writer_write_us_sum = s_writer_stats.write_us_sum;
+  sd_writer_write_count = s_writer_stats.write_count;
+  sd_writer_worst_write_us = s_writer_stats.worst_write_us;
+  sd_writer_bytes_written = s_writer_stats.bytes_written;
+  k_spin_unlock(&s_writer_stats.lock, key);
+}
+
+static inline void writer_stats_record_peek(uint32_t us) {
+  k_spinlock_key_t key = k_spin_lock(&s_writer_stats.lock);
+  s_writer_stats.peek_us_sum += us;
+  s_writer_stats.peek_count++;
+  if (us > s_writer_stats.worst_peek_us) {
+    s_writer_stats.worst_peek_us = us;
+  }
+  sd_writer_peek_us_sum = s_writer_stats.peek_us_sum;
+  sd_writer_peek_count = s_writer_stats.peek_count;
+  sd_writer_worst_peek_us = s_writer_stats.worst_peek_us;
+  k_spin_unlock(&s_writer_stats.lock, key);
+}
+
+static inline void writer_stats_record_commit(uint32_t us) {
+  k_spinlock_key_t key = k_spin_lock(&s_writer_stats.lock);
+  s_writer_stats.commit_us_sum += us;
+  sd_writer_commit_us_sum = s_writer_stats.commit_us_sum;
+  k_spin_unlock(&s_writer_stats.lock, key);
+}
+
+static inline void writer_stats_record_batch(uint64_t wall_us, uint32_t batch_ms) {
+  k_spinlock_key_t key = k_spin_lock(&s_writer_stats.lock);
+  s_writer_stats.batch_wall_us_sum += wall_us;
+  s_writer_stats.batch_count++;
+  if (batch_ms > s_writer_stats.worst_batch_ms) {
+    s_writer_stats.worst_batch_ms = batch_ms;
+  }
+  sd_writer_batch_wall_us_sum = s_writer_stats.batch_wall_us_sum;
+  sd_writer_batch_count = s_writer_stats.batch_count;
+  sd_writer_worst_batch_ms = s_writer_stats.worst_batch_ms;
+  k_spin_unlock(&s_writer_stats.lock, key);
+}
+
+static inline void writer_stats_record_swap(uint64_t overlap_us) {
+  k_spinlock_key_t key = k_spin_lock(&s_writer_stats.lock);
+  s_writer_stats.overlap_us_sum += overlap_us;
+  s_writer_stats.swap_count++;
+  sd_writer_overlap_us_sum = s_writer_stats.overlap_us_sum;
+  sd_writer_swap_count = s_writer_stats.swap_count;
+  k_spin_unlock(&s_writer_stats.lock, key);
+}
+
+static inline void writer_stats_set_err(int err) {
+  k_spinlock_key_t key = k_spin_lock(&s_writer_stats.lock);
+  s_writer_stats.err = err;
+  sd_writer_err = err;
+  k_spin_unlock(&s_writer_stats.lock, key);
+}
+
+static inline int writer_stats_get_err(void) {
+  k_spinlock_key_t key = k_spin_lock(&s_writer_stats.lock);
+  int e = s_writer_stats.err;
+  k_spin_unlock(&s_writer_stats.lock, key);
+  return e;
+}
 static volatile int s_storage_recovery_result = 0;
 static volatile bool s_storage_recovering = false;
 enum recorder_storage_state {
@@ -200,6 +408,72 @@ enum recorder_storage_state {
   STORAGE_STATE_FAULT,
 };
 static volatile enum recorder_storage_state s_storage_state = STORAGE_STATE_HEALTHY;
+
+#define RECORDER_MAX_CONSECUTIVE_DROPS 10U
+#define MAX_SESSION_GAPS 32U
+
+struct rec_gap_entry {
+  uint64_t sample_index;
+  uint32_t sample_count;
+};
+
+static struct rec_gap_entry s_session_gaps[MAX_SESSION_GAPS];
+static uint32_t s_session_gap_count = 0;
+static volatile bool s_backpressure_slowdown = false;
+
+static void recorder_record_gap(uint64_t sample_idx, uint32_t count) {
+  if (s_session_gap_count < MAX_SESSION_GAPS) {
+    s_session_gaps[s_session_gap_count].sample_index = sample_idx;
+    s_session_gaps[s_session_gap_count].sample_count = count;
+    s_session_gap_count++;
+  }
+  LOG_WRN("[RECORDER GAP] Dropped %u samples at index %llu (gap #%u)",
+          count, (unsigned long long)sample_idx, s_session_gap_count);
+  printk("[RECORDER GAP] index=%llu count=%u\n",
+         (unsigned long long)sample_idx, count);
+}
+
+static void recorder_write_gap_sidecar(const char *wav_path) {
+  if (s_session_gap_count == 0 || wav_path == NULL || wav_path[0] == '\0') {
+    return;
+  }
+  char sidecar_path[96];
+  size_t len = strlen(wav_path);
+  if (len >= sizeof(sidecar_path) - 6) {
+    return;
+  }
+  memcpy(sidecar_path, wav_path, len);
+  sidecar_path[len] = '\0';
+  char *dot = strrchr(sidecar_path, '.');
+  if (dot) {
+    strcpy(dot, ".gaps");
+  } else {
+    strcat(sidecar_path, ".gaps");
+  }
+
+  struct fs_file_t gf;
+  fs_file_t_init(&gf);
+  if (fs_open(&gf, sidecar_path, FS_O_CREATE | FS_O_WRITE) == 0) {
+    char hdr[64];
+    int hlen = snprintf(hdr, sizeof(hdr), "SESSION_GAPS: %u\n", s_session_gap_count);
+    if (hlen > 0) {
+      fs_write(&gf, hdr, hlen);
+    }
+    for (uint32_t i = 0; i < s_session_gap_count; i++) {
+      char line[64];
+      int l_len = snprintf(line, sizeof(line), "GAP %u: sample_index=%llu count=%u\n",
+                           i + 1U,
+                           (unsigned long long)s_session_gaps[i].sample_index,
+                           s_session_gaps[i].sample_count);
+      if (l_len > 0) {
+        fs_write(&gf, line, l_len);
+      }
+    }
+    fs_sync(&gf);
+    fs_close(&gf);
+    LOG_INF("Wrote %u gap markers to sidecar log: %s", s_session_gap_count, sidecar_path);
+  }
+}
 
 /* Bound final drain using observed fs_write throughput when it is slower than
  * the 4 KiB/s fallback, with five seconds reserved for filesystem metadata. */
@@ -296,7 +570,7 @@ static void psram_reader_thread_fn(void *p1, void *p2, void *p3) {
 
       struct pingpong_slot *slot = &s_pingpong[r_idx];
       slot->state = PINGPONG_BUF_READING_PSRAM;
-      uint32_t chunk = (s_reader_to_read > BLOCK_BYTES) ? BLOCK_BYTES : s_reader_to_read;
+      uint32_t chunk = (s_reader_to_read > PINGPONG_SLOT_BYTES) ? PINGPONG_SLOT_BYTES : s_reader_to_read;
       uint32_t bytes_read = 0;
 
       slot->peek_start_cyc = k_cycle_get_64();
@@ -389,7 +663,7 @@ static void sd_writer_thread_fn(void *p1, void *p2, void *p3) {
         if (g_storage_pipeline_mode == STORAGE_PIPELINE_PSRAM_SYNC) {
           /* MODE B: Synchronous Sequential Peek -> Write -> Commit */
           while (to_write > 0 && sd_writer_err == 0) {
-            uint32_t chunk = (to_write > BLOCK_BYTES) ? BLOCK_BYTES : to_write;
+            uint32_t chunk = (to_write > SD_WRITER_CHUNK_BYTES) ? SD_WRITER_CHUNK_BYTES : to_write;
             uint32_t bytes_peeked = 0;
 
             uint64_t t_p0 = k_cycle_get_64();
@@ -411,24 +685,26 @@ static void sd_writer_thread_fn(void *p1, void *p2, void *p3) {
             }
 
             uint64_t t_w0 = k_cycle_get_64();
-            ssize_t w = fs_write(sd_file_ptr, sd_bounce_buf, bytes_peeked);
+            /* fs_write(sd_file_ptr, sd_bounce_buf, bytes_read); */
+            /* fs_write(sd_file_ptr, sd_bounce_buf, bytes_peeked); */
+            int w_ret = sd_write_all(sd_file_ptr, sd_bounce_buf, bytes_peeked);
             uint64_t t_w1 = k_cycle_get_64();
             uint32_t us = (uint32_t)k_cyc_to_us_floor64((t_w1 >= t_w0) ? (t_w1 - t_w0) : 0);
 
-            if (w != (ssize_t)bytes_peeked) {
+            if (w_ret != 0) {
               uint64_t file_offset = sd_writer_bytes_written + WAV_HEADER_BYTES;
               uint32_t sector_approx = (uint32_t)(file_offset / 512);
               LOG_ERR("SD writer fs_write failed: ret=%d, expected=%u, file_offset=%llu, approx_sector=%u, write_latency=%u us",
-                      (int)w, bytes_peeked, (unsigned long long)file_offset, sector_approx, us);
+                      w_ret, bytes_peeked, (unsigned long long)file_offset, sector_approx, us);
 #if defined(CONFIG_SOC_SERIES_STM32L4X)
               LOG_ERR("SDMMC hardware registers: STA=0x%08X, DCOUNT=%u, DCTRL=0x%08X, CLKCR=0x%08X",
                       (unsigned int)SDMMC1->STA, (unsigned int)SDMMC1->DCOUNT,
                       (unsigned int)SDMMC1->DCTRL, (unsigned int)SDMMC1->CLKCR);
 #endif
 #if defined(CONFIG_WILDSONIC_VERBOSE_LOGS)
-              log_sdmmc_stage_diagnostics("FILESYSTEM_WRITE_PSRAM", (w < 0) ? (int)w : -EIO, file_offset, bytes_peeked);
+              log_sdmmc_stage_diagnostics("FILESYSTEM_WRITE_PSRAM", w_ret, file_offset, bytes_peeked);
 #endif
-              sd_writer_err = (w < 0) ? (int)w : -EIO;
+              sd_writer_err = w_ret;
               if (s_active_stats_ptr && s_active_stats_ptr->first_error_stage[0] == '\0') {
 #if defined(CONFIG_SOC_SERIES_STM32L4X)
                 if (SDMMC1->STA & (SDMMC_STA_DCRCFAIL | SDMMC_STA_CCRCFAIL | SDMMC_STA_DTIMEOUT | SDMMC_STA_CTIMEOUT | SDMMC_STA_TXUNDERR | SDMMC_STA_RXOVERR)) {
@@ -505,9 +781,9 @@ static void sd_writer_thread_fn(void *p1, void *p2, void *p3) {
             slot->state = PINGPONG_BUF_WRITING_SD;
             slot->write_start_cyc = k_cycle_get_64();
 
-            /* Ping-pong writer: slot 0 uses sd_bounce_buf, slot 1 uses s_pingpong_buf_b.
-             * fs_write(sd_file_ptr, sd_bounce_buf, bytes_read); */
-            ssize_t w = fs_write(sd_file_ptr, slot->buf, slot->bytes);
+            /* Ping-pong writer: slot 0 uses &s_sd_writer_buf[0], slot 1 uses &s_sd_writer_buf[PINGPONG_SLOT_BYTES] */
+            /* fs_write(sd_file_ptr, slot->buf, slot->bytes) */
+            int w_ret = sd_write_all(sd_file_ptr, slot->buf, slot->bytes);
             slot->write_end_cyc = k_cycle_get_64();
 
             uint64_t w_diff = (slot->write_end_cyc >= slot->write_start_cyc)
@@ -515,20 +791,20 @@ static void sd_writer_thread_fn(void *p1, void *p2, void *p3) {
                                   : 0;
             uint32_t us = (uint32_t)k_cyc_to_us_floor64(w_diff);
 
-            if (w != (ssize_t)slot->bytes) {
+            if (w_ret != 0) {
               uint64_t file_offset = sd_writer_bytes_written + WAV_HEADER_BYTES;
               uint32_t sector_approx = (uint32_t)(file_offset / 512);
               LOG_ERR("SD writer fs_write failed: ret=%d, expected=%u, file_offset=%llu, approx_sector=%u, write_latency=%u us",
-                      (int)w, slot->bytes, (unsigned long long)file_offset, sector_approx, us);
+                      w_ret, slot->bytes, (unsigned long long)file_offset, sector_approx, us);
 #if defined(CONFIG_SOC_SERIES_STM32L4X)
               LOG_ERR("SDMMC hardware registers: STA=0x%08X, DCOUNT=%u, DCTRL=0x%08X, CLKCR=0x%08X",
                       (unsigned int)SDMMC1->STA, (unsigned int)SDMMC1->DCOUNT,
                       (unsigned int)SDMMC1->DCTRL, (unsigned int)SDMMC1->CLKCR);
 #endif
 #if defined(CONFIG_WILDSONIC_VERBOSE_LOGS)
-              log_sdmmc_stage_diagnostics("FILESYSTEM_WRITE_PSRAM", (w < 0) ? (int)w : -EIO, file_offset, slot->bytes);
+              log_sdmmc_stage_diagnostics("FILESYSTEM_WRITE_PSRAM", w_ret, file_offset, slot->bytes);
 #endif
-              sd_writer_err = (w < 0) ? (int)w : -EIO;
+              sd_writer_err = w_ret;
               if (s_active_stats_ptr && s_active_stats_ptr->first_error_stage[0] == '\0') {
 #if defined(CONFIG_SOC_SERIES_STM32L4X)
                 if (SDMMC1->STA & (SDMMC_STA_DCRCFAIL | SDMMC_STA_CCRCFAIL | SDMMC_STA_DTIMEOUT | SDMMC_STA_CTIMEOUT | SDMMC_STA_TXUNDERR | SDMMC_STA_RXOVERR)) {
@@ -635,26 +911,28 @@ static void sd_writer_thread_fn(void *p1, void *p2, void *p3) {
       while (k_msgq_get(&sd_block_q, &msg, K_NO_WAIT) == 0) {
         if (sd_writer_err != 0 || !sd_file_ptr) {
           sd_writer_failed_bytes += msg.bytes;
+          recorder_buf_set_state(msg.buf_id, BUF_OWNER_FREE);
           k_mem_slab_free(&pool, msg.blk);
           continue;
         }
 
         uint64_t t0 = k_cycle_get_64();
-        ssize_t w = fs_write(sd_file_ptr, msg.blk, msg.bytes);
+        int w_ret = sd_write_all(sd_file_ptr, msg.blk, msg.bytes);
         uint64_t t1 = k_cycle_get_64();
-        uint64_t diff_cyc = (t1 >= t0) ? (t1 - t0) : 0;
+        uint32_t diff_cyc = (t1 >= t0) ? (t1 - t0) : 0;
         uint32_t us = (uint32_t)k_cyc_to_us_floor64(diff_cyc);
 
+        recorder_buf_set_state(msg.buf_id, BUF_OWNER_FREE);
         k_mem_slab_free(&pool, msg.blk);
 
-        if (w != (ssize_t)msg.bytes) {
-          LOG_ERR("SD writer fs_write failed: ret=%d, expected=%u", (int)w,
+        if (w_ret != 0) {
+          LOG_ERR("SD writer fs_write failed: ret=%d, expected=%u", w_ret,
                   msg.bytes);
 #if defined(CONFIG_WILDSONIC_VERBOSE_LOGS)
-          log_sdmmc_stage_diagnostics("FILESYSTEM_WRITE_QUEUE", (w < 0) ? (int)w : -EIO,
+          log_sdmmc_stage_diagnostics("FILESYSTEM_WRITE_QUEUE", w_ret,
                                       sd_writer_bytes_written + WAV_HEADER_BYTES, msg.bytes);
 #endif
-          sd_writer_err = (w < 0) ? (int)w : -EIO;
+          sd_writer_err = w_ret;
           sd_writer_failed_bytes += msg.bytes;
           break;
         }
@@ -695,49 +973,78 @@ static volatile uint32_t high_water;
 static volatile uint32_t audio_queue_high_water;
 static volatile uint32_t sd_queue_high_water;
 
+/* Atomic variables for drop counters and watermark tracking */
+static atomic_t s_drops;
+static atomic_t s_dma_alloc_drops;
+static atomic_t s_queue_submit_drops;
+static atomic_t s_sram_writer_drops;
+static atomic_t s_high_water;
+static atomic_t s_audio_queue_high_water;
+static atomic_t s_sd_queue_high_water;
+
+static inline void recorder_update_high_water(atomic_t *target, uint32_t val, volatile uint32_t *compat) {
+  atomic_val_t old_val = atomic_get(target);
+  while (val > (uint32_t)old_val) {
+    if (atomic_cas(target, old_val, (atomic_val_t)val)) {
+      if (compat) *compat = val;
+      break;
+    }
+    old_val = atomic_get(target);
+  }
+}
+
 /* ---- audio_sink callbacks: called from the high-priority acquisition thread ---- */
 static void *sink_alloc(void *user) {
-  void *blk;
+  void *blk = NULL;
 
   ARG_UNUSED(user);
   if (k_mem_slab_alloc(&pool, &blk, K_NO_WAIT) != 0) {
-    dma_alloc_drops++;
-    drops++;
+    atomic_inc(&s_dma_alloc_drops);
+    atomic_inc(&s_drops);
+    dma_alloc_drops = (uint32_t)atomic_get(&s_dma_alloc_drops);
+    drops = (uint32_t)atomic_get(&s_drops);
     return NULL;
   }
+  uint8_t id = recorder_buf_ptr_to_id(blk);
+  recorder_buf_set_state(id, BUF_OWNER_DMA);
   return blk;
 }
 
 static int sink_submit(void *blk, void *user) {
   ARG_UNUSED(user);
-  if (k_msgq_put(&filled_q, &blk, K_NO_WAIT) != 0) {
+  uint8_t id = recorder_buf_ptr_to_id(blk);
+  recorder_buf_set_state(id, BUF_OWNER_STAGED);
+  if (k_msgq_put(&filled_q, &id, K_NO_WAIT) != 0) {
     /* cannot happen (queue as deep as the pool) but never leak a block */
-    queue_submit_drops++;
-    drops++;
+    atomic_inc(&s_queue_submit_drops);
+    atomic_inc(&s_drops);
+    queue_submit_drops = (uint32_t)atomic_get(&s_queue_submit_drops);
+    drops = (uint32_t)atomic_get(&s_drops);
+    recorder_buf_set_state(id, BUF_OWNER_FREE);
     k_mem_slab_free(&pool, blk);
     return -ENOBUFS;
   }
   uint32_t queued = k_msgq_num_used_get(&filled_q);
-  if (queued > audio_queue_high_water) audio_queue_high_water = queued;
+  recorder_update_high_water(&s_audio_queue_high_water, queued, &audio_queue_high_water);
   /*
    * Track true buffer high-water mark:
    * Total audio blocks currently held in RAM (in queue + actively being
    * written) is (NUM_BLOCKS - k_mem_slab_num_free_get(&pool)). This accurately
-   * tracks pool buffering even when k_msgq_put hands the block directly to a
-   * waiting thread without incrementing msgq->used_msgs.
+   * reflects pool pressure.
    */
   uint32_t in_use = NUM_BLOCKS - k_mem_slab_num_free_get(&pool);
-  if (in_use > high_water) {
-    high_water = in_use;
-  }
+  recorder_update_high_water(&s_high_water, in_use, &high_water);
   return 0;
 }
 
 static void sink_release(void *blk, void *user) {
   ARG_UNUSED(user);
-  k_mem_slab_free(&pool, blk);
+  if (blk) {
+    uint8_t id = recorder_buf_ptr_to_id(blk);
+    recorder_buf_set_state(id, BUF_OWNER_FREE);
+    k_mem_slab_free(&pool, blk);
+  }
 }
-
 
 static const struct audio_sink sink = {
     .alloc = sink_alloc,
@@ -799,6 +1106,8 @@ void recorder_timing_unit_test(void) {
 }
 
 int recorder_init(void) {
+  recorder_buf_table_init();
+
   /* Run self-test on timing math */
   recorder_timing_unit_test();
 
@@ -874,19 +1183,7 @@ int recorder_init(void) {
     LOG_INF("SD diagnostic: sector count ret=%d count=%u", count_ret,
             sector_count);
     LOG_INF("SD diagnostic: sector size ret=%d size=%u", size_ret, sector_size);
-#if defined(SDMMC1)
-#if defined(CONFIG_WILDSONIC_SDMMC_CLK_DIV)
-    uint32_t target_div = CONFIG_WILDSONIC_SDMMC_CLK_DIV;
-    if ((SDMMC1->CLKCR & 0xFF) != target_div) {
-      SDMMC1->CLKCR = (SDMMC1->CLKCR & ~0xFFU) | (target_div & 0xFFU);
-    }
-#endif
-    uint32_t clkcr = SDMMC1->CLKCR;
-    uint32_t clkdiv = clkcr & 0xFF;
-    uint32_t clk_hz = 48000000U / (clkdiv + 2U);
-    LOG_INF("SDMMC hardware clock: %u Hz (CLKDIV=%u, CLKCR=0x%08X, bus=%s)",
-            clk_hz, clkdiv, clkcr, (clkcr & (1U << 11)) ? "4-bit" : "1-bit");
-#endif
+    recorder_apply_sdmmc_clock();
   }
 
   /* Read-only filesystem diagnostic */
@@ -1004,6 +1301,7 @@ int recorder_storage_recover(void) {
     return ret;
   }
   mounted = true;
+  recorder_apply_sdmmc_clock();
   ret = disk_access_ioctl("SD", DISK_IOCTL_CTRL_DEINIT, NULL);
   if (ret != 0) {
     LOG_WRN("Storage recovery: could not release temporary disk reference: %d", ret);
@@ -1296,11 +1594,15 @@ int recorder_scan_last_file(char *out_folder, size_t folder_len, char *out_file,
 }
 
 static uint32_t drain_queue(void) {
-  void *blk;
+  uint8_t drain_id;
   uint32_t count = 0;
 
-  while (k_msgq_get(&filled_q, &blk, K_NO_WAIT) == 0) {
-    k_mem_slab_free(&pool, blk);
+  while (k_msgq_get(&filled_q, &drain_id, K_NO_WAIT) == 0) {
+    void *blk = recorder_buf_id_to_ptr(drain_id);
+    recorder_buf_set_state(drain_id, BUF_OWNER_FREE);
+    if (blk) {
+      k_mem_slab_free(&pool, blk);
+    }
     count++;
   }
   return count;
@@ -1457,10 +1759,42 @@ void recorder_request_stop(void) {
   recorder_abort_requested = true;
 }
 
+static volatile shutdown_stage_t s_shutdown_stage = SHUTDOWN_STAGE_NONE;
+
+const char *recorder_shutdown_stage_name(shutdown_stage_t stage) {
+  switch (stage) {
+  case SHUTDOWN_STAGE_AUDIO_STOP: return "AUDIO_STOP";
+  case SHUTDOWN_STAGE_WRITER_DRAIN: return "WRITER_DRAIN";
+  case SHUTDOWN_STAGE_FS_SYNC: return "FS_SYNC";
+  case SHUTDOWN_STAGE_PSRAM_SLEEP: return "PSRAM_SLEEP";
+  case SHUTDOWN_STAGE_SD_SLEEP: return "SD_SLEEP";
+  case SHUTDOWN_STAGE_STOP2: return "STOP2";
+  case SHUTDOWN_STAGE_COMPLETE: return "COMPLETE";
+  default: return "NONE";
+  }
+}
+
+shutdown_stage_t recorder_get_shutdown_stage(void) {
+  return s_shutdown_stage;
+}
+
 static volatile enum recorder_power_state s_power_state = REC_PWR_ACTIVE;
 
 enum recorder_power_state recorder_get_power_state(void) {
   return s_power_state;
+}
+
+static int post_wake_check(void) {
+  int psram_wake_rc = psram_wake();
+  if (psram_wake_rc != 0) {
+    LOG_ERR("post_wake_check: PSRAM wake/ID check failed (%d)", psram_wake_rc);
+    return psram_wake_rc;
+  }
+  if (recorder_sd_verify_idle() != 0) {
+    LOG_WRN("post_wake_check: SDMMC not idle after wake");
+  }
+  (void)audio_in_verify_ready();
+  return 0;
 }
 
 int recorder_sleep(uint32_t seconds, uint32_t *wake_recovery_us) {
@@ -1486,6 +1820,7 @@ int recorder_sleep(uint32_t seconds, uint32_t *wake_recovery_us) {
   }
 
   s_power_state = REC_PWR_SLEEP_PREP;
+  s_shutdown_stage = SHUTDOWN_STAGE_AUDIO_STOP;
 
   /* 2-4. Stop audio acquisition pipeline if active (TIM6, ADC, DMA, and wait bounded worker drain) */
   if (audio_in_is_dma_active()) {
@@ -1606,6 +1941,7 @@ int recorder_sleep(uint32_t seconds, uint32_t *wake_recovery_us) {
   printk("[TEST] SDMMC_IDLE\n");
 #endif
 
+  s_shutdown_stage = SHUTDOWN_STAGE_PSRAM_SLEEP;
   /* 9. Put PSRAM into Deep Power Down (DPD) and verify the command succeeded */
   int psram_sleep_rc = psram_sleep();
   if (psram_sleep_rc != 0) {
@@ -1632,6 +1968,7 @@ int recorder_sleep(uint32_t seconds, uint32_t *wake_recovery_us) {
   LOG_INF("Entering STM32L476 Stop 2 low-power mode for %u seconds (RTC Wakeup Timer)...", seconds);
   const uint64_t t_pre = k_uptime_get();
 
+  s_shutdown_stage = SHUTDOWN_STAGE_STOP2;
   s_power_state = REC_PWR_STOP2;
   int res = rtc_sleep_enter_stop2(seconds);
   s_power_state = REC_PWR_WAKE_RECOVERY;
@@ -1654,6 +1991,10 @@ int recorder_sleep(uint32_t seconds, uint32_t *wake_recovery_us) {
     s_power_state = REC_PWR_ACTIVE;
     return psram_wake_rc;
   }
+  int post_wake_rc = post_wake_check();
+  if (post_wake_rc != 0) {
+    LOG_ERR("recorder_sleep: post_wake_check failed (%d)", post_wake_rc);
+  }
 
   /* 13. Snapshot post-wake RTC calendar state and verify calendar advancement */
   struct rtc_calendar_time post_cal;
@@ -1672,6 +2013,7 @@ int recorder_sleep(uint32_t seconds, uint32_t *wake_recovery_us) {
   }
 #endif
 
+  s_shutdown_stage = SHUTDOWN_STAGE_COMPLETE;
   s_power_state = REC_PWR_ACTIVE;
 
   if (res == -EINTR) {
@@ -1739,6 +2081,8 @@ int recorder_record_session(uint32_t seconds, uint32_t cycle,
   recorder_active = true;
   s_active_stats_ptr = &st;
   s_active_file_path[0] = '\0';
+  static uint32_t s_session_no_audio_recoveries = 0;
+  s_session_no_audio_recoveries = 0;
 
   bool apply_dsp = true;
   const char *mode_str = "FILTERED";
@@ -1769,7 +2113,8 @@ int recorder_record_session(uint32_t seconds, uint32_t cycle,
   /* Keep the file object alive if a blocked writer outlives this call. */
   static struct fs_file_t f;
   static uint8_t hdr[WAV_HEADER_BYTES] __aligned(4);
-  int ret;
+  int ret = 0;
+  int err = 0;
 
   if (!mounted) {
     led_indicator_set(LED_IND_ERROR);
@@ -1839,6 +2184,7 @@ int recorder_record_session(uint32_t seconds, uint32_t cycle,
   } else if (ret == -ENOENT) {
     ret = fs_open(&f, st.file, FS_O_CREATE | FS_O_WRITE);
   }
+  bool file_opened = (ret == 0);
   if (ret) {
 #if defined(CONFIG_WILDSONIC_VERBOSE_LOGS)
     log_sdmmc_stage_diagnostics("FILE_OPEN_CREATE", ret, 0, 0);
@@ -1855,6 +2201,8 @@ int recorder_record_session(uint32_t seconds, uint32_t cycle,
     s_recorder_last_sd_error = ret;
     s_active_stats_ptr = NULL;
     s_active_file_path[0] = '\0';
+  static uint32_t s_session_no_audio_recoveries = 0;
+  s_session_no_audio_recoveries = 0;
     recorder_active = false;
     if (out)
       *out = st;
@@ -1898,20 +2246,16 @@ int recorder_record_session(uint32_t seconds, uint32_t cycle,
 #endif
 
   wav_fill_header(hdr, st.sample_rate, st.channels, st.sample_bits, 0);
-  ret = fs_write(&f, hdr, WAV_HEADER_BYTES);
-  if (ret != WAV_HEADER_BYTES) {
+  ret = sd_write_all(&f, hdr, WAV_HEADER_BYTES);
+  if (ret != 0) {
 #if defined(CONFIG_WILDSONIC_VERBOSE_LOGS)
     log_sdmmc_stage_diagnostics("INITIAL_HEADER_WRITE", ret < 0 ? ret : -EIO, 0, WAV_HEADER_BYTES);
 #endif
     led_indicator_set(LED_IND_ERROR);
-    fs_close(&f);
-    fs_unlink(st.file);
-    st.file[0] = '\0';
-    st.err = ret < 0 ? ret : -EIO;
-    st.sd_write_error = st.err;
-    if (out)
-      *out = st;
-    return st.err;
+    err = ret < 0 ? ret : -EIO;
+    st.err = err;
+    st.sd_write_error = err;
+    goto cleanup;
   }
 #if defined(CONFIG_WILDSONIC_VERBOSE_LOGS)
   printk("[PHASE 4] WAV file opened: %s (header %u bytes written)\n", st.file,
@@ -1925,6 +2269,14 @@ int recorder_record_session(uint32_t seconds, uint32_t cycle,
   high_water = 0;
   audio_queue_high_water = 0;
   sd_queue_high_water = 0;
+  atomic_set(&s_drops, 0);
+  atomic_set(&s_dma_alloc_drops, 0);
+  atomic_set(&s_queue_submit_drops, 0);
+  atomic_set(&s_sram_writer_drops, 0);
+  atomic_set(&s_high_water, 0);
+  atomic_set(&s_audio_queue_high_water, 0);
+  atomic_set(&s_sd_queue_high_water, 0);
+  writer_stats_reset();
   drain_queue();
 
   bool use_psram = (g_storage_pipeline_mode != STORAGE_PIPELINE_DIRECT_SRAM) &&
@@ -1940,30 +2292,16 @@ int recorder_record_session(uint32_t seconds, uint32_t cycle,
     st.psram_staging_capacity = psram_staging_capacity();
     st.sd_batch_bytes = psram_staging_batch_size();
 
-    /* Borrow 1 block from pool as SD writer bounce buffer */
-    ret = k_mem_slab_alloc(&pool, &sd_bounce_buf, K_NO_WAIT);
-    if (ret != 0) {
-      LOG_WRN("Failed to allocate SD bounce buffer from pool (%d); bypassing "
-              "PSRAM staging",
-              ret);
-      use_psram = false;
-      st.psram_used = false;
-      sd_bounce_buf = NULL;
-      s_pingpong[0].buf = NULL;
-      s_pingpong[0].state = PINGPONG_BUF_FREE;
-      s_pingpong[0].bytes = 0;
-      s_pingpong[1].buf = NULL;
-      s_pingpong[1].state = PINGPONG_BUF_FREE;
-      s_pingpong[1].bytes = 0;
-    } else {
-      /* Ping-pong buffers setup */
-      s_pingpong[0].buf = (uint8_t *)sd_bounce_buf;
-      s_pingpong[0].state = PINGPONG_BUF_FREE;
-      s_pingpong[0].bytes = 0;
-      s_pingpong[1].buf = s_pingpong_buf_b;
-      s_pingpong[1].state = PINGPONG_BUF_FREE;
-      s_pingpong[1].bytes = 0;
-    }
+    /* Dedicated SD writer bounce & ping-pong buffers (never steals from real-time acquisition pool) */
+    /* Dedicated bounce buffer in SRAM0 avoids pool borrowing */
+    /* k_mem_slab_alloc(&pool, &sd_bounce_buf, K_NO_WAIT) */
+    sd_bounce_buf = s_sd_writer_buf;
+    s_pingpong[0].buf = (uint8_t *)sd_bounce_buf;
+    s_pingpong[0].state = PINGPONG_BUF_FREE;
+    s_pingpong[0].bytes = 0;
+    s_pingpong[1].buf = s_pingpong_buf_b;
+    s_pingpong[1].state = PINGPONG_BUF_FREE;
+    s_pingpong[1].bytes = 0;
   } else {
     st.psram_used = false;
     st.psram_staging_capacity = 0;
@@ -2044,31 +2382,14 @@ int recorder_record_session(uint32_t seconds, uint32_t cycle,
 #endif
     LOG_ERR("audio_in_start failed: %d", ret);
     led_indicator_set(LED_IND_ERROR);
-    fs_close(&f);
-    fs_unlink(st.file);
-    if (sd_bounce_buf) {
-      k_mem_slab_free(&pool, sd_bounce_buf);
-      sd_bounce_buf = NULL;
-    }
-    s_pingpong[0].buf = NULL;
-    s_pingpong[0].state = PINGPONG_BUF_FREE;
-    s_pingpong[0].bytes = 0;
-    s_pingpong[1].buf = NULL;
-    s_pingpong[1].state = PINGPONG_BUF_FREE;
-    s_pingpong[1].bytes = 0;
-    sd_file_ptr = NULL;
     recorder_active = false;
-    st.file[0] = '\0';
-    st.err = ret;
-    st.sd_write_error = ret;
+    err = ret;
+    st.err = err;
+    st.sd_write_error = err;
     if (st.first_error_stage[0] == '\0') {
       strncpy(st.first_error_stage, "FILE_OPEN_CREATE", sizeof(st.first_error_stage) - 1);
     }
-    s_active_stats_ptr = NULL;
-    if (out) {
-      *out = st;
-    }
-    return ret;
+    goto cleanup;
   }
 
   led_indicator_set(LED_IND_RECORDING);
@@ -2084,8 +2405,16 @@ int recorder_record_session(uint32_t seconds, uint32_t cycle,
       k_us_to_cyc_ceil64((uint64_t)seconds * 1000000ULL + 100000ULL);
   uint64_t t_first_block_cyc = 0;
   uint64_t t_last_block_cyc = 0;
-  int err = 0;
+  err = 0;
   uint64_t samples_remaining = st.expected_samples;
+  uint32_t consecutive_drops = 0;
+  s_session_gap_count = 0;
+  s_backpressure_slowdown = false;
+  memset(s_session_gaps, 0, sizeof(s_session_gaps));
+  st.gap_count = 0;
+  st.consecutive_drop_abort_count = 0;
+  st.slowdown_active = false;
+  st.slowdown_events = 0;
 
   while (samples_remaining > 0) {
     if (recorder_abort_requested) {
@@ -2103,11 +2432,22 @@ int recorder_record_session(uint32_t seconds, uint32_t cycle,
         break;
       }
     }
-    void *blk;
+    uint8_t buf_id = 0xFF;
+    void *blk = NULL;
 
     /* a healthy source delivers a block every ~10 ms; 2 s means it died */
-    if (k_msgq_get(&filled_q, &blk, K_SECONDS(2)) != 0) {
+    if (k_msgq_get(&filled_q, &buf_id, K_SECONDS(2)) != 0) {
       LOG_ERR("no audio for 2 s");
+      if (s_session_no_audio_recoveries >= 3U) {
+        LOG_ERR("Maximum no-audio recovery retries (3) exceeded; aborting session");
+        err = -ETIMEDOUT;
+        if (st.first_error_stage[0] == '\0') {
+          strncpy(st.first_error_stage, "audio_in_timeout", sizeof(st.first_error_stage) - 1);
+          st.first_error_stage[sizeof(st.first_error_stage) - 1] = '\0';
+        }
+        break;
+      }
+      s_session_no_audio_recoveries++;
       struct audio_dma_stats stalled = {0};
       audio_in_get_dma_stats(&stalled);
       LOG_ERR("ADC/DMA status: callbacks=%u errors=%u overruns=%u missed=%u",
@@ -2118,7 +2458,7 @@ int recorder_record_session(uint32_t seconds, uint32_t cycle,
         st.adc_dma_recovery_attempts++;
         (void)audio_in_stop();
         int restart_rc = audio_in_start();
-        if (restart_rc == 0 && k_msgq_get(&filled_q, &blk, K_SECONDS(2)) == 0) {
+        if (restart_rc == 0 && k_msgq_get(&filled_q, &buf_id, K_SECONDS(2)) == 0) {
           recovered = true;
           LOG_WRN("ADC/DMA acquisition resumed after attempt %u", attempt + 1U);
         } else {
@@ -2129,11 +2469,14 @@ int recorder_record_session(uint32_t seconds, uint32_t cycle,
       if (!recovered) {
         err = -ETIMEDOUT;
         if (st.first_error_stage[0] == '\0') {
-          strncpy(st.first_error_stage, "audio_in_timeout", sizeof(st.first_error_stage));
+          strncpy(st.first_error_stage, "audio_in_timeout", sizeof(st.first_error_stage) - 1);
+          st.first_error_stage[sizeof(st.first_error_stage) - 1] = '\0';
         }
         break;
       }
     }
+    recorder_buf_set_state(buf_id, BUF_OWNER_DSP);
+    blk = recorder_buf_id_to_ptr(buf_id);
     st.blocks_processed++;
     uint64_t t_block_arrival = k_cycle_get_64();
     if (st.blocks_processed == 1) {
@@ -2147,6 +2490,30 @@ int recorder_record_session(uint32_t seconds, uint32_t cycle,
                                     : (uint32_t)samples_remaining;
     if (samples_in_block < BLOCK_SAMPLES) {
       st.boundary_discarded_samples += (BLOCK_SAMPLES - samples_in_block);
+    }
+
+    if (use_psram) {
+      uint32_t occupied = psram_staging_occupied();
+      uint32_t cap = psram_staging_capacity();
+      if (!s_backpressure_slowdown && (occupied >= (cap * 3U / 4U))) {
+        s_backpressure_slowdown = true;
+        st.slowdown_events++;
+        LOG_WRN("[BACK-PRESSURE] PSRAM staging fill > 75%% (%u KB / %u KB), slowdown engaged",
+                occupied >> 10, cap >> 10);
+        printk("[BACK-PRESSURE] SLOWDOWN_ENGAGED: occupied=%u KB\n", occupied >> 10);
+      } else if (s_backpressure_slowdown && (occupied <= (cap / 2U))) {
+        s_backpressure_slowdown = false;
+        LOG_INF("[BACK-PRESSURE] PSRAM staging fill < 50%% (%u KB / %u KB), slowdown cleared",
+                occupied >> 10, cap >> 10);
+        printk("[BACK-PRESSURE] SLOWDOWN_CLEARED: occupied=%u KB\n", occupied >> 10);
+      }
+      st.slowdown_active = s_backpressure_slowdown;
+      if (s_backpressure_slowdown) {
+        k_sem_give(&sd_writer_sem);
+        if (k_mem_slab_num_free_get(&pool) > 2) {
+          k_yield();
+        }
+      }
     }
 
     if (apply_dsp) {
@@ -2171,13 +2538,20 @@ int recorder_record_session(uint32_t seconds, uint32_t cycle,
             }
           }
         }
+        recorder_buf_set_state(buf_id, BUF_OWNER_FREE);
         k_mem_slab_free(&pool, blk);
 
         if (p_ret == -ENOBUFS) {
-          /* PSRAM staging buffer is full */
+          /* PSRAM staging buffer is full - Drop and continue policy */
           st.psram_full_events++;
           st.psram_dropped_samples += samples_in_block;
           st.samples_dropped += samples_in_block;
+          st.blocks_dropped++;
+          consecutive_drops++;
+          uint64_t gap_idx = st.expected_samples - samples_remaining;
+          recorder_record_gap(gap_idx, samples_in_block);
+          samples_remaining -= samples_in_block;
+
           if (st.first_error_stage[0] == '\0') {
             strncpy(st.first_error_stage, "PSRAM_STAGING_FULL", sizeof(st.first_error_stage) - 1);
           }
@@ -2186,13 +2560,19 @@ int recorder_record_session(uint32_t seconds, uint32_t cycle,
           if (now_ms - last_full_warn_ms > 1000) {
             last_full_warn_ms = now_ms;
             LOG_WRN("PSRAM staging buffer full! Occupancy: %u KB / %u KB. "
-                    "Dropping audio block (%u samples)",
+                    "Dropping audio block (%u samples, consecutive: %u)",
                     psram_staging_occupied() >> 10,
-                    psram_staging_capacity() >> 10, samples_in_block);
+                    psram_staging_capacity() >> 10, samples_in_block, consecutive_drops);
           }
-          /* Abort capture cleanly to preserve stream integrity */
-          err = -ENOBUFS;
-          break;
+          /* Abort capture only after consecutive drop threshold */
+          if (consecutive_drops >= RECORDER_MAX_CONSECUTIVE_DROPS) {
+            LOG_ERR("PSRAM staging full: %u consecutive drops exceeded limit %u; aborting capture",
+                    consecutive_drops, RECORDER_MAX_CONSECUTIVE_DROPS);
+            st.consecutive_drop_abort_count++;
+            err = -ENOBUFS;
+            break;
+          }
+          continue;
         } else if (p_ret != 0) {
           LOG_ERR("PSRAM push fatal error: %d", p_ret);
           err = p_ret;
@@ -2201,6 +2581,8 @@ int recorder_record_session(uint32_t seconds, uint32_t cycle,
           }
           break;
         }
+
+        consecutive_drops = 0;
 
         if (sd_writer_err != 0) {
           LOG_ERR("SD writer error detected in recording loop: %d",
@@ -2243,7 +2625,9 @@ int recorder_record_session(uint32_t seconds, uint32_t cycle,
       } else {
         /* Decoupled non-PSRAM storage path: Enqueue processed block to
          * sd_writer_thread */
+        recorder_buf_set_state(buf_id, BUF_OWNER_WRITING);
         struct sd_block_msg s_msg = {
+            .buf_id = buf_id,
             .blk = blk,
             .bytes = bytes_to_write,
             .samples = samples_in_block,
@@ -2252,22 +2636,37 @@ int recorder_record_session(uint32_t seconds, uint32_t cycle,
         int q_ret = k_msgq_put(&sd_block_q, &s_msg, K_NO_WAIT);
         if (q_ret == 0) {
           uint32_t sd_queued = k_msgq_num_used_get(&sd_block_q);
-          if (sd_queued > sd_queue_high_water) sd_queue_high_water = sd_queued;
-        }
-        if (q_ret != 0) {
-          /* Bounded RAM queue capacity exhausted */
-          sram_writer_drops++;
+          recorder_update_high_water(&s_sd_queue_high_water, sd_queued, &sd_queue_high_water);
+          consecutive_drops = 0;
+        } else {
+          /* Bounded RAM queue capacity exhausted - Drop and continue policy */
+          atomic_inc(&s_sram_writer_drops);
+          atomic_inc(&s_drops);
+          sram_writer_drops = (uint32_t)atomic_get(&s_sram_writer_drops);
+          drops = (uint32_t)atomic_get(&s_drops);
+          st.sram_queue_dropped_blocks++;
+          st.blocks_dropped++;
           st.samples_dropped += samples_in_block;
+          consecutive_drops++;
+          uint64_t gap_idx = st.expected_samples - samples_remaining;
+          recorder_record_gap(gap_idx, samples_in_block);
+          samples_remaining -= samples_in_block;
           if (st.first_error_stage[0] == '\0') {
             strncpy(st.first_error_stage, "DSP_QUEUE_OVERFLOW", sizeof(st.first_error_stage) - 1);
           }
+          recorder_buf_set_state(buf_id, BUF_OWNER_FREE);
           k_mem_slab_free(&pool, blk);
-          LOG_ERR("Non-PSRAM RAM queue exhausted (%u/%u blocks)! Dropping block "
-                  "(%u samples). Aborting capture.",
+          LOG_WRN("Non-PSRAM RAM queue exhausted (%u/%u blocks)! Dropping block "
+                  "(%u samples, consecutive: %u).",
                   (unsigned)k_msgq_num_used_get(&sd_block_q), NUM_BLOCKS,
-                  samples_in_block);
-          err = -ENOBUFS;
-          break;
+                  samples_in_block, consecutive_drops);
+          if (consecutive_drops >= RECORDER_MAX_CONSECUTIVE_DROPS) {
+            LOG_ERR("Non-PSRAM RAM queue drops exceeded threshold (%u)! Aborting capture.", consecutive_drops);
+            st.consecutive_drop_abort_count++;
+            err = -ENOBUFS;
+            break;
+          }
+          continue;
         }
 
         /* Signal SD writer thread to consume queued block */
@@ -2302,8 +2701,8 @@ int recorder_record_session(uint32_t seconds, uint32_t cycle,
       }
     } else {
       /* Experimental format conversion (32-bit PCM, stereo duplication, synthetic tone) */
-      static uint8_t format_chunk_buf[8192] __aligned(4);
-      uint32_t chunk_frames = 1024;
+      static uint8_t format_chunk_buf[2048] __aligned(4);
+      uint32_t chunk_frames = 256;
       bool chunk_failed = false;
       const int16_t *src_s16 = (const int16_t *)blk;
 
@@ -2368,8 +2767,20 @@ int recorder_record_session(uint32_t seconds, uint32_t cycle,
           if (p_ret == -ENOBUFS) {
             st.psram_full_events++;
             st.psram_dropped_samples += (samples_in_block - off);
-            err = -ENOBUFS;
-            chunk_failed = true;
+            st.samples_dropped += (samples_in_block - off);
+            st.blocks_dropped++;
+            consecutive_drops++;
+            uint64_t gap_idx = st.expected_samples - samples_remaining;
+            recorder_record_gap(gap_idx, samples_in_block - off);
+            samples_remaining -= samples_in_block;
+            if (consecutive_drops >= RECORDER_MAX_CONSECUTIVE_DROPS) {
+              LOG_ERR("Format conversion PSRAM staging full: %u drops exceeded limit; aborting", consecutive_drops);
+              st.consecutive_drop_abort_count++;
+              err = -ENOBUFS;
+              chunk_failed = true;
+              break;
+            }
+            chunk_failed = false;
             break;
           } else if (p_ret != 0) {
             LOG_ERR("PSRAM push fatal error: %d", p_ret);
@@ -2432,7 +2843,8 @@ int recorder_record_session(uint32_t seconds, uint32_t cycle,
   if (stop_rc != 0 && err == 0) {
     err = stop_rc;
     if (st.first_error_stage[0] == '\0') {
-      strncpy(st.first_error_stage, "audio_in_stop", sizeof(st.first_error_stage));
+      strncpy(st.first_error_stage, "audio_in_stop", sizeof(st.first_error_stage) - 1);
+      st.first_error_stage[sizeof(st.first_error_stage) - 1] = '\0';
     }
   }
 
@@ -2470,13 +2882,15 @@ int recorder_record_session(uint32_t seconds, uint32_t cycle,
        dma_stats.callback_errors != 0 || dma_stats.adc_overruns != 0) && err == 0) {
     err = -EIO;
     if (st.first_error_stage[0] == '\0') {
-      strncpy(st.first_error_stage, "DMA_ACQUISITION", sizeof(st.first_error_stage));
+      strncpy(st.first_error_stage, "DMA_ACQUISITION", sizeof(st.first_error_stage) - 1);
+      st.first_error_stage[sizeof(st.first_error_stage) - 1] = '\0';
     }
   }
   if (dma_stats.samples_lost != 0 && err == 0) {
     err = -EIO;
     if (st.first_error_stage[0] == '\0') {
-      strncpy(st.first_error_stage, "DMA_ACQUISITION", sizeof(st.first_error_stage));
+      strncpy(st.first_error_stage, "DMA_ACQUISITION", sizeof(st.first_error_stage) - 1);
+      st.first_error_stage[sizeof(st.first_error_stage) - 1] = '\0';
     }
   }
 
@@ -2491,18 +2905,14 @@ int recorder_record_session(uint32_t seconds, uint32_t cycle,
       : (uint32_t)k_msgq_num_used_get(&sd_block_q) * BLOCK_BYTES;
   uint32_t completion_timeout_ms = writer_completion_timeout_ms(pending_writer_bytes);
   if (k_sem_take(&sd_writer_done_sem, K_MSEC(completion_timeout_ms)) != 0) {
-    LOG_ERR("SD writer completion timeout after %u ms; retaining writer resources",
+    LOG_ERR("SD writer completion timeout after %u ms; closing file and reporting fault",
             completion_timeout_ms);
     st.err = -ETIMEDOUT;
     st.writer_completion_timeouts++;
     s_recorder_last_error = -ETIMEDOUT;
     s_recorder_last_sd_error = -ETIMEDOUT;
-    s_active_stats_ptr = NULL;
-    s_power_state = REC_PWR_ACTIVE;
-    if (out) *out = st;
-    /* The writer may still own the file and bounce buffer. Keep the recorder
-     * fault latched active so sleep, remount, new sessions, and reboot are blocked. */
-    return -ETIMEDOUT;
+    err = -ETIMEDOUT;
+    goto cleanup;
   }
   sd_writer_flush_req = false;
 #if defined(CONFIG_WILDSONIC_VERBOSE_LOGS)
@@ -2510,11 +2920,8 @@ int recorder_record_session(uint32_t seconds, uint32_t cycle,
   printk("[TEST] SD_WRITER_COMPLETE\n");
 #endif
 
-  /* Release borrowed bounce buffer back to pool if allocated */
-  if (sd_bounce_buf) {
-    k_mem_slab_free(&pool, sd_bounce_buf);
-    sd_bounce_buf = NULL;
-  }
+  /* Reset dedicated bounce & ping-pong buffer pointers */
+  sd_bounce_buf = NULL;
   s_pingpong[0].buf = NULL;
   s_pingpong[0].state = PINGPONG_BUF_FREE;
   s_pingpong[0].bytes = 0;
@@ -2658,6 +3065,7 @@ int recorder_record_session(uint32_t seconds, uint32_t cycle,
      * Attempt one best-effort close only after the writer has relinquished ownership.
      */
     int close_ret = fs_close(&f);
+    file_opened = false;
     if (close_ret != 0) {
       LOG_WRN("Best-effort fs_close on failed storage handle returned: %d", close_ret);
     }
@@ -2679,7 +3087,7 @@ int recorder_record_session(uint32_t seconds, uint32_t cycle,
 #endif
     } else {
       ssize_t header_written = fs_write(&f, hdr, WAV_HEADER_BYTES);
-      if (header_written != WAV_HEADER_BYTES) {
+      if (header_written < 0 || header_written != WAV_HEADER_BYTES) {
         finalize_ret = (header_written < 0) ? (int)header_written : -EIO;
 #if defined(CONFIG_WILDSONIC_VERBOSE_LOGS)
         log_sdmmc_stage_diagnostics("WAV_HEADER_FINAL_WRITE", finalize_ret, 0, WAV_HEADER_BYTES);
@@ -2706,9 +3114,13 @@ int recorder_record_session(uint32_t seconds, uint32_t cycle,
       }
     }
     int close_ret = fs_close(&f);
+    file_opened = false;
 #if defined(CONFIG_WILDSONIC_VERBOSE_LOGS)
     printk("[TEST] WAV_FILE_CLOSED\n");
 #endif
+    recorder_write_gap_sidecar(st.file);
+    st.gap_count = s_session_gap_count;
+    st.slowdown_active = s_backpressure_slowdown;
     if (close_ret != 0) {
 #if defined(CONFIG_WILDSONIC_VERBOSE_LOGS)
       log_sdmmc_stage_diagnostics("FILE_CLOSE", close_ret, WAV_HEADER_BYTES + data_bytes, 0);
@@ -2733,17 +3145,14 @@ int recorder_record_session(uint32_t seconds, uint32_t cycle,
     }
   }
 
-  /* Verify exact frame count and byte count match configured recording target
-   */
+  /* Verify total accounted frame count (written + dropped) matches configured recording target */
   if (!recorder_abort_requested && err == 0) {
-    if (st.samples_written != st.expected_samples) {
-      LOG_ERR("Sample count mismatch: requested %llu, wrote %llu",
-              st.expected_samples, st.samples_written);
-      err = -EINVAL;
-    }
-    if (st.bytes_written != exact_bytes) {
-      LOG_ERR("PCM byte count mismatch: expected %llu, wrote %llu", exact_bytes,
-              st.bytes_written);
+    uint64_t total_accounted = st.samples_written + st.samples_dropped;
+    if (total_accounted != st.expected_samples) {
+      LOG_ERR("Sample count mismatch: requested %llu, wrote %llu, dropped %llu",
+              (unsigned long long)st.expected_samples,
+              (unsigned long long)st.samples_written,
+              (unsigned long long)st.samples_dropped);
       err = -EINVAL;
     }
   }
@@ -2781,12 +3190,20 @@ int recorder_record_session(uint32_t seconds, uint32_t cycle,
   if (st.avg_write_us > 0) {
     sd_avg_kb_s = (uint32_t)(((uint64_t)BLOCK_BYTES * 1000000ULL) / ((uint64_t)st.avg_write_us * 1024ULL));
   }
+  uint64_t total_active_samples_lost = (uint64_t)dma_stats.samples_lost + st.samples_dropped;
   printk("\n[TEST] RECORDING ACCOUNTING SUMMARY:\n");
   printk("  Expected source samples            : %llu\n", (unsigned long long)st.expected_samples);
   printk("  Acquired source samples            : %llu\n", (unsigned long long)st.hardware_source_samples);
   printk("  Successfully processed samples     : %llu\n", (unsigned long long)st.processed_samples);
   printk("  Samples written                    : %llu\n", (unsigned long long)st.samples_written);
-  printk("  Samples lost during active capture : %u\n", dma_stats.samples_lost);
+  printk("  Samples lost during active capture : %llu\n", (unsigned long long)total_active_samples_lost);
+  printk("  Gaps recorded in session           : %u\n", s_session_gap_count);
+  printk("  Backpressure slowdown events       : %u\n", st.slowdown_events);
+  printk("  Drop breakdown: DMA=%u, Pool=%u, PSRAM Staging=%llu, SD Write=%llu\n",
+         dma_stats.samples_lost,
+         st.dma_dropped_blocks * BLOCK_SAMPLES,
+         (unsigned long long)st.psram_dropped_samples,
+         (unsigned long long)st.sd_failed_samples);
   printk("  Boundary samples discarded         : %llu\n", (unsigned long long)st.boundary_discarded_samples);
   printk("  DSP average / worst time           : %u / %u us\n", st.dsp_avg_us, st.dsp_worst_us);
   printk("  DSP block deadline                 : %u us\n", ds_log.block_deadline_us);
@@ -2816,7 +3233,27 @@ int recorder_record_session(uint32_t seconds, uint32_t cycle,
          (unsigned long long)(st.sd_writer_commit_us / 1000ULL),
          (unsigned long long)(st.sd_writer_starve_us / 1000ULL));
   printk("  SD error                           : %d\n", st.sd_write_error);
-  printk("  First error origin                 : %s\n\n", st.first_error_stage[0] ? st.first_error_stage : "NONE");
+  printk("  First error origin                 : %s\n", st.first_error_stage[0] ? st.first_error_stage : "NONE");
+  bool zero_loss = (total_active_samples_lost == 0) &&
+                   (st.blocks_dropped == 0) &&
+                   (dma_stats.events_missed == 0) &&
+                   (st.psram_full_events == 0) &&
+                   (st.sd_write_error == 0) &&
+                   (s_session_gap_count == 0);
+
+  if (zero_loss && err == 0) {
+    printk("  Capture Loss Integrity             : ZERO LOSS\n\n");
+    printk("[TEST] ZERO_LOSS_VERIFIED\n");
+  } else {
+    printk("  Capture Loss Integrity             : DATA LOSS OCCURRED (%llu samples lost, %u gaps)\n\n",
+           (unsigned long long)total_active_samples_lost, s_session_gap_count);
+    printk("[TEST] DATA_LOSS_REPORTED: lost_samples=%llu, dropped_blocks=%u, gaps=%u, psram_full=%u, sd_err=%d\n",
+           (unsigned long long)total_active_samples_lost,
+           st.blocks_dropped,
+           s_session_gap_count,
+           st.psram_full_events,
+           st.sd_write_error);
+  }
 #endif
 
   s_power_state = REC_PWR_ACTIVE;
@@ -2869,7 +3306,30 @@ int recorder_record_session(uint32_t seconds, uint32_t cycle,
   } else {
     led_indicator_set(LED_IND_OFF);
   }
+cleanup:
+  if (file_opened) {
+    fs_close(&f);
+    file_opened = false;
+    if (st.samples_written == 0 && st.file[0] != '\0') {
+      fs_unlink(st.file);
+      st.file[0] = '\0';
+    }
+  }
+  sd_file_ptr = NULL;
+  if (sd_bounce_buf) {
+    /* k_mem_slab_free(&pool, sd_bounce_buf); */
+    sd_bounce_buf = NULL;
+  }
+  s_pingpong[0].buf = NULL;
+  s_pingpong[0].state = PINGPONG_BUF_FREE;
+  s_pingpong[0].bytes = 0;
+  s_pingpong[1].buf = NULL;
+  s_pingpong[1].state = PINGPONG_BUF_FREE;
+  s_pingpong[1].bytes = 0;
   s_active_stats_ptr = NULL;
+  if (out) {
+    *out = st;
+  }
   return err;
 }
 

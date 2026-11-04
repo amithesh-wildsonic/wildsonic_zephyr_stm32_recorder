@@ -26,8 +26,14 @@ __attribute__((weak)) bool recorder_is_active(void) { return false; }
 #endif
 
 #define BENCH_CHUNK_SIZE 4096U
+#if defined(__ZEPHYR__)
+extern uint8_t s_sd_writer_buf[];
+#define bench_tx_buf (&s_sd_writer_buf[0])
+#define bench_rx_buf (&s_sd_writer_buf[BENCH_CHUNK_SIZE])
+#else
 static uint8_t bench_tx_buf[BENCH_CHUNK_SIZE] __aligned(4);
 static uint8_t bench_rx_buf[BENCH_CHUNK_SIZE] __aligned(4);
+#endif
 
 static inline uint64_t bench_get_us(void)
 {

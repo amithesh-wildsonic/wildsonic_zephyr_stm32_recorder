@@ -11,15 +11,28 @@ from measurement_tool.workbook import ComparisonWorkbookManager, backup_workbook
 REQUIRED_SHEET_NAMES = [
     "Start Here",
     "Test Setup",
+    "Executive Summary",
+    "Hardware Config",
     "Comparison Summary",
+    "Power Consumption",
     "Power & Sleep",
+    "Sleep Current & RTC",
     "Wake & RTC",
+    "Recording Perf & Integrity",
     "Recording Integrity",
+    "SD Card Performance",
     "SD Card I-O",
+    "Audio ADC Performance",
     "Audio & ADC",
+    "PSRAM Performance",
+    "RTOS & Memory",
     "RTOS & Resources",
     "Interfaces & Reliability",
+    "Config Verification",
+    "Stability Test",
+    "Execution Log",
     "Test Log",
+    "Evidence & References",
 ]
 
 
@@ -41,25 +54,40 @@ def test_workbook_preserves_max78000_reference_data(tmp_path):
     # Check Comparison Summary
     ws_sum = wb["Comparison Summary"]
     found_rec_power = False
+
     for row in ws_sum.iter_rows(values_only=True):
-        if row and "Active Recording Current" in str(row[1]):
+        if row and "Recording average / peak current" in str(row[1]):
             found_rec_power = True
-            assert "28.50 mA" in str(row[2])  # MAX78000 baseline
-    assert found_rec_power, "Active Recording Current comparison row missing"
+            assert row[2] is None  # No unverified MAX78000 measurement
+
+    assert found_rec_power, "Recording power comparison row missing"
 
     # Check Power & Sleep
     ws_pwr = wb["Power & Sleep"]
     headers = [cell.value for cell in ws_pwr[1]]
+
     assert "MAX78000 Current (mA)" in headers
     assert "STM32 Avg (mA)" in headers
 
-    # Verify that sleep current is populated
+    # Verify sleep row exists, but baseline remains unpopulated
     found_sleep = False
+
     for row in ws_pwr.iter_rows(values_only=True):
-        if row and "Stop 2 Deep Sleep" in str(row[0]):
+        if row and "Stop2 sleep" in str(row[0]):
             found_sleep = True
-            assert row[1] == pytest.approx(0.0021)  # MAX78000 deep sleep ~2.1 uA
-    assert found_sleep, "Stop 2 Deep Sleep row missing"
+            assert row[1] is None
+
+    assert found_sleep, "Stop2 sleep row missing"
+
+
+def test_workbook_keeps_unverified_stop2_current_blank(tmp_path):
+    wb_path = tmp_path / "comparison.xlsx"
+    mgr = ComparisonWorkbookManager(wb_path)
+    ws_sleep = mgr.workbook["Sleep Current & RTC"]
+    sleep_row = next((row for row in ws_sleep.iter_rows(values_only=True) if row and "Verified STOP2 current" in str(row[0])), None)
+    assert sleep_row is not None
+    assert sleep_row[3] is None
+    assert sleep_row[4] == "UNVERIFIED"
 
 
 def test_workbook_backup_mechanism(tmp_path):

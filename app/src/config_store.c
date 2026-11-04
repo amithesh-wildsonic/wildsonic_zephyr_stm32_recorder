@@ -55,6 +55,28 @@ static bool s_has_last_valid_applied = false;
 static void unpack_record_to_system(const struct wildsonic_persisted_config *rec);
 static void pack_system_to_record(struct wildsonic_persisted_config *rec);
 
+static uint32_t crc32_for_byte(uint32_t byte_val)
+{
+	uint32_t crc = byte_val;
+	for (int j = 0; j < 8; j++) {
+		crc = (crc >> 1) ^ ((crc & 1) ? 0xEDB88320U : 0);
+	}
+	return crc;
+}
+
+uint32_t config_store_calc_crc32(const struct wildsonic_persisted_config *cfg)
+{
+	if (!cfg) return 0;
+	const uint8_t *p = (const uint8_t *)cfg;
+	size_t check_len = offsetof(struct wildsonic_persisted_config, crc32);
+	uint32_t crc = 0xFFFFFFFFU;
+
+	for (size_t i = 0; i < check_len; i++) {
+		crc = (crc >> 8) ^ crc32_for_byte((crc ^ p[i]) & 0xFFU);
+	}
+	return crc ^ 0xFFFFFFFFU;
+}
+
 uint32_t config_store_calc_checksum(const struct wildsonic_persisted_config *cfg)
 {
 	if (!cfg) return 0;
@@ -342,6 +364,8 @@ static void pack_system_to_record(struct wildsonic_persisted_config *rec)
 	rec->pending_generation = s_pending_gen;
 	rec->applied_generation = s_applied_gen;
 
+	rec->version = CONFIG_STORE_VERSION_2;
+	rec->crc32 = config_store_calc_crc32(rec);
 	rec->checksum = config_store_calc_checksum(rec);
 }
 
@@ -350,6 +374,11 @@ static bool config_record_is_valid(const struct wildsonic_persisted_config *rec)
 	if (!rec) return false;
 	if (rec->magic != CONFIG_STORE_MAGIC) return false;
 	if (config_store_calc_checksum(rec) != rec->checksum) return false;
+	if (rec->version >= CONFIG_STORE_VERSION_2) {
+		if (config_store_calc_crc32(rec) != rec->crc32) {
+			return false;
+		}
+	}
 
 	uint32_t act = 0, div = 0;
 	int err = 0;
@@ -432,6 +461,9 @@ int config_store_init(void)
 			        primary_slot, primary->sequence_number, primary->pending_generation);
 
 			if (config_record_is_valid(primary)) {
+				if (primary->version == CONFIG_STORE_VERSION_1) {
+					LOG_INF("Migrating config store record from Version 1 to Version 2");
+				}
 				unpack_record_to_system(primary);
 				s_applied_gen = primary->pending_generation;
 				s_pending_gen = primary->pending_generation;

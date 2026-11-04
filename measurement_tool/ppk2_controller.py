@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import csv
 import logging
+import re
 import threading
 import time
 from dataclasses import dataclass, field
@@ -201,12 +202,67 @@ class PPK2Controller:
         self.progress(f"[PPK2] Connecting to Nordic PPK2 on '{self.port}'...")
 
         try:
-            self._device = PPK2_MP(self.port)
+            # This controller owns the sampling thread, so the direct API is the
+            # appropriate transport. PPK2_MP adds a second fetch thread and has
+            # an unsafe destructor when its serial port is closed explicitly.
+            self._device = PPK2_API(self.port)
+            # A previous process may have left the PPK2 streaming binary samples.
+            # The 0.9.2 API's metadata reader decodes every byte as UTF-8, so stop
+            # any stale stream and discard buffered samples before requesting text.
+            serial_port = getattr(self._device, "ser", None)
+            if serial_port is not None:
+                try:
+                    serial_port.reset_input_buffer()
+                except Exception:
+                    pass
+            self._device.stop_measuring()
+            time.sleep(0.1)
+            if serial_port is not None:
+                try:
+                    serial_port.reset_input_buffer()
+                except Exception:
+                    pass
+
+            def read_metadata_safely() -> Optional[str]:
+                from ppk2_api.ppk2_api import PPK2_Command
+
+                self._device._write_serial((PPK2_Command.GET_META_DATA,))
+                received = bytearray()
+                deadline = time.monotonic() + 2.0
+                while time.monotonic() < deadline:
+                    available = serial_port.in_waiting if serial_port is not None else 0
+                    if available:
+                        received.extend(serial_port.read(available))
+                        if b"END\n" in received or received.endswith(b"END"):
+                            break
+                    else:
+                        time.sleep(0.01)
+                lines = []
+                for raw_line in bytes(received).splitlines():
+                    line = raw_line.decode("ascii", errors="ignore").strip()
+                    if line == "END" or re.fullmatch(r"[A-Za-z0-9]+:\s*[-+]?[0-9]+(?:\.[0-9]+)?", line):
+                        lines.append(line)
+                return "\n".join(lines) if "END" in lines else None
+
+            if serial_port is None:
+                raise RuntimeError("PPK2 serial transport is unavailable")
+            self._device._read_metadata = read_metadata_safely
             modifiers = self._device.get_modifiers()
-            if not modifiers:
+            if not modifiers or any(self._device.modifiers.get(name, {}).get("0") is None
+                                    for name in ("R", "GS", "GI", "O", "S", "I", "UG")):
                 raise RuntimeError("Failed to retrieve PPK2 calibration modifiers.")
             self.progress(f"[PPK2] Hardware connected successfully on '{self.port}'. Modifiers verified.")
         except Exception as ex:
+            # PPK2_API has no public close method; release pySerial explicitly so
+            # retries and subsequent runs do not inherit a stale COM handle.
+            device = self._device
+            serial_port = getattr(device, "ser", None)
+            if serial_port is not None:
+                try:
+                    serial_port.close()
+                except Exception:
+                    pass
+            self._device = None
             raise RuntimeError(
                 f"Failed to connect to PPK2 on port '{self.port}': {ex}. "
                 "Ensure no other software (e.g. nRF Connect Power Profiler) has opened this port."
@@ -359,7 +415,7 @@ class PPK2Controller:
 
             if expected_duration_s is not None and expected_duration_s > 0:
                 if abs(phase.duration_s - expected_duration_s) > 0.5:
-                    timing_issues.append(f"duration {phase.duration_s:.2f}s vs expected {expected_duration_s:.1f}s")
+                    timing_issues.append(f"duration {phase.duration_s:.2f}s deviates from expected {expected_duration_s:.1f}s")
 
             if timing_issues:
                 phase.timing_verified = False
@@ -462,6 +518,13 @@ class PPK2Controller:
         if not keep_power_on:
             try:
                 self.power_off(force=True)
+            except Exception:
+                pass
+        device = self._device
+        serial_port = getattr(device, "ser", None)
+        if serial_port is not None:
+            try:
+                serial_port.close()
             except Exception:
                 pass
         self._device = None

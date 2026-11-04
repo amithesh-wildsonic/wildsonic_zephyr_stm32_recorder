@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import collections
+import logging
 import re
 import threading
 import time
@@ -12,6 +13,8 @@ try:
     import serial  # type: ignore
 except ImportError:
     serial = None
+
+logger = logging.getLogger("measurement_tool.controller")
 
 
 # Authoritative set of valid command verbs supported by the WildSonic STM32 firmware
@@ -100,12 +103,16 @@ class SerialController:
         output_dir: str | Path = "data/stm32/raw_logs",
         progress_callback: Optional[Callable[[str], None]] = None,
         mock_port: Optional[Any] = None,
+        live_console: bool = True,
+        line_callback: Optional[Callable[[str, str, int], None]] = None,
     ) -> None:
         self.port = port
         self.baudrate = baudrate
         self.output_dir = Path(output_dir)
         self.output_dir.mkdir(parents=True, exist_ok=True)
         self.progress_callback = progress_callback or (lambda msg: None)
+        self.live_console = live_console
+        self.line_callback = line_callback
 
         self._serial: Optional[Any] = mock_port
         self._is_mock = mock_port is not None
@@ -119,6 +126,7 @@ class SerialController:
         self._lock = threading.Lock()
         self._last_error: Optional[str] = None
         self._start_time: Optional[float] = None
+        self._start_monotonic_ns: Optional[int] = None
 
     @property
     def raw_path(self) -> Optional[Path]:
@@ -149,14 +157,21 @@ class SerialController:
             return False, f"Command verb '{verb}' is not supported by STM32 firmware"
         return True, ""
 
-    def connect(self, test_name: str = "benchmark", board: str = "STM32L476RG") -> None:
+    def connect(
+        self,
+        test_name: str = "benchmark",
+        board: str = "STM32L476RG",
+        raw_filename: Optional[str] = None,
+        timestamped_filename: Optional[str] = None,
+    ) -> None:
         stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         safe_name = "".join(ch if ch.isalnum() or ch in "-_" else "_" for ch in test_name).strip("_") or "capture"
-        self._raw_path = self.output_dir / f"{safe_name}_{board}_{stamp}.raw.log"
-        self._timestamped_path = self.output_dir / f"{safe_name}_{board}_{stamp}.timestamped.log"
+        self._raw_path = self.output_dir / (raw_filename or f"{safe_name}_{board}_{stamp}.raw.log")
+        self._timestamped_path = self.output_dir / (timestamped_filename or f"{safe_name}_{board}_{stamp}.timestamped.log")
 
         self._stop_event.clear()
         self._start_time = time.time()
+        self._start_monotonic_ns = time.monotonic_ns()
 
         if self._is_mock and self._serial is not None:
             self._serial.is_open = True
@@ -198,13 +213,21 @@ class SerialController:
                     del pending_line[: idx + 1]
                     line_str = line_bytes.decode("utf-8", errors="replace")
 
-                    now_str = datetime.now().strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3]
-                    ts_line = f"[{now_str}] {line_str}"
+                    now_str = datetime.now().astimezone().isoformat(timespec="milliseconds")
+                    elapsed_ns = max(0, time.monotonic_ns() - (self._start_monotonic_ns or time.monotonic_ns()))
+                    ts_line = f"[{now_str}] [mono_ns={elapsed_ns}] {line_str}"
                     with self._timestamped_path.open("a", encoding="utf-8", errors="replace") as ts_f:
                         ts_f.write(ts_line)
 
                     with self._lock:
                         self._line_history.append(line_str)
+                    if self.line_callback:
+                        try:
+                            self.line_callback(line_str, now_str, elapsed_ns)
+                        except Exception:
+                            logger.exception("UART line callback failed")
+                    if self.live_console:
+                        print(line_str, end="", flush=True)
 
             except Exception as exc:
                 self._last_error = str(exc)

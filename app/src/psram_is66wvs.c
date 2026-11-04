@@ -48,6 +48,9 @@ static struct k_mutex psram_mutex;
 #define CMD_RESET          0x99
 #define CMD_READ_ID        0x9F
 #define CMD_ENTER_DPD      0xB9
+/* Target clock: 18 MHz maximum safe limit for ISSI IS66WVS4M8 without DDR.
+ * On 80 MHz HCLK, prescaler is set to 4 (divider = 5), yielding actual QSPI clock of 16.0 MHz.
+ * On 72 MHz HCLK, prescaler is set to 3 (divider = 4), yielding actual QSPI clock of 18.0 MHz. */
 #define PSRAM_QSPI_TARGET_HZ 18000000U
 
 bool psram_is_quad_mode(void) { return quad_mode_enabled; }

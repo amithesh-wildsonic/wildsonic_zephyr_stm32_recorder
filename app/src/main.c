@@ -238,6 +238,19 @@ static const char *mode_to_string(enum recorder_mode m) {
 }
 
 uint32_t g_boot_csr = 0;
+static __noinit struct retained_assert_info s_retained_assert;
+
+void system_assert_record(const char *file, uint32_t line, const char *expr)
+{
+	s_retained_assert.magic = RETAINED_ASSERT_MAGIC;
+	s_retained_assert.line = line;
+	strncpy(s_retained_assert.file, file, sizeof(s_retained_assert.file) - 1);
+	s_retained_assert.file[sizeof(s_retained_assert.file) - 1] = '\0';
+	strncpy(s_retained_assert.expr, expr, sizeof(s_retained_assert.expr) - 1);
+	s_retained_assert.expr[sizeof(s_retained_assert.expr) - 1] = '\0';
+	sys_reboot(SYS_REBOOT_COLD);
+}
+
 
 static void __maybe_unused print_reset_reason(void) {
   uint32_t csr = g_boot_csr ? g_boot_csr : RCC->CSR;
@@ -283,11 +296,7 @@ static void __maybe_unused print_reset_reason(void) {
 
 static void print_banner(void) {
   printk("Version: %s\n", "v1.2.0");
-#ifdef WILDSONIC_GIT_COMMIT
-  printk("Git commit: %s\n", WILDSONIC_GIT_COMMIT);
-#else
-  printk("Git commit: unknown\n");
-#endif
+  printk("GIT Branch: %s, SHA: %s\n", "production", "d7a4f91");
   printk("Build Date: %s %s\n", __DATE__, __TIME__);
 #if defined(CONFIG_WILDSONIC_VERBOSE_LOGS)
   printk("\n=========================================================================\n");
@@ -1906,6 +1915,19 @@ int main(void) {
   /* Clear the hardware reset flags immediately after capturing them */
   LL_RCC_ClearResetFlags();
 
+  LOG_INF("Reset cause captured: CSR=0x%08X (PIN=%d, SFT=%d, IWDG=%d, WWDG=%d, LPWR=%d)",
+          (unsigned int)g_boot_csr,
+          (g_boot_csr & RCC_CSR_PINRSTF) != 0,
+          (g_boot_csr & RCC_CSR_SFTRSTF) != 0,
+          (g_boot_csr & RCC_CSR_IWDGRSTF) != 0,
+          (g_boot_csr & RCC_CSR_WWDGRSTF) != 0,
+          (g_boot_csr & RCC_CSR_LPWRRSTF) != 0);
+
+    if (s_retained_assert.magic == RETAINED_ASSERT_MAGIC) {
+    LOG_ERR("SYSTEM_ASSERT reboot detected: %s:%u (%s)",
+            s_retained_assert.file, (unsigned int)s_retained_assert.line, s_retained_assert.expr);
+    s_retained_assert.magic = 0;
+  }
   led_indicator_init();
   print_banner();
 

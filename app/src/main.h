@@ -77,5 +77,25 @@ const char *main_get_shutdown_stage_name(enum system_shutdown_stage stage);
 }
 #endif
 
+
+#include <zephyr/sys/reboot.h>
+
+struct retained_assert_info {
+	uint32_t magic;
+	uint32_t line;
+	char file[64];
+	char expr[64];
+};
+
+#define RETAINED_ASSERT_MAGIC 0x53595341U
+
+void system_assert_record(const char *file, uint32_t line, const char *expr);
+
+#define SYSTEM_ASSERT(cond) do { \
+	if (!(cond)) { \
+		system_assert_record(__FILE__, __LINE__, #cond); \
+	} \
+} while (0)
+
 #endif /* MAIN_H_ */
 

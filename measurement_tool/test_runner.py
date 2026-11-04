@@ -641,7 +641,7 @@ class BenchmarkRunner:
 
         # Update comparison workbook
         wb_mgr = ComparisonWorkbookManager("data/reports/stm32_vs_max78000.xlsx")
-        wb_mgr.update_ppk2_phase_measurements(self.ppk2.phases)
+        wb_mgr.update_ppk2_phase_measurements(self.ppk2.phases, stop2_verified=False)
 
         extra_metrics = {
             "boot_verified": True,

@@ -1,0 +1,28 @@
+# Example test-plan definition. Host-side phase-plan executor is not yet wired;
+# use this as the version-controlled run specification, not as an executable command.
+test:
+  name: stm32_audio_full_comparison
+  board: NUCLEO-L476RG
+  build_type: test
+  repeat_cycles: 1
+  reset_before_test: true
+  reset_between_cycles: false
+capture:
+  uart_port: COM30
+  uart_baudrate: 115200
+  ppk2_port: COM28
+  ppk2_voltage_mv: 5000
+  power_rail: E5V
+phases:
+  - {name: record_192k, operation: record, duration_seconds: 60, sample_rate: 192000, bit_depth: 16, channels: 1}
+  - {name: sleep_1, operation: sleep, duration_seconds: 60, wake_source: rtc}
+  - {name: record_96k, operation: record, duration_seconds: 60, sample_rate: 96000, bit_depth: 16, channels: 1}
+  - {name: sleep_2, operation: sleep, duration_seconds: 60, wake_source: rtc}
+  - {name: record_48k, operation: record, duration_seconds: 60, sample_rate: 48000, bit_depth: 16, channels: 1}
+  - {name: sleep_3, operation: sleep, duration_seconds: 60, wake_source: rtc}
+report:
+  update_excel: true
+  save_uart_log: true
+  save_raw_ppk2: true
+  require_verified_phase_boundaries: true
+  max_dropped_blocks: 0

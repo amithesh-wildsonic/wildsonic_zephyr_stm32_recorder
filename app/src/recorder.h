@@ -6,6 +6,38 @@
 #include <stdint.h>
 #include <stddef.h>
 
+/*
+ * ============================================================================
+ * WILDSONIC THREAD PRIORITY & EXECUTION TOPOLOGY TABLE
+ * ============================================================================
+ *
+ * System Priorities (Preemptive, Lower Number = Higher Priority):
+ * | Priority         | Thread Name    | Stack Size | Execution Role                         |
+ * |------------------|----------------|------------|----------------------------------------|
+ * | ISR (Hardware)   | ADC1/TIM6 DMA  | N/A        | Fills DMA half-buffers, signals event  |
+ * | K_PRIO_PREEMPT(0)| audio_acquire  | 2048 B     | Drains DMA events, copies to pool blk  |
+ * | K_PRIO_PREEMPT(1)| main / console | 4096 B     | Interactive UART console REPL          |
+ * | K_PRIO_PREEMPT(1)| recorder       | 6144 B     | DSP filter pipeline & PSRAM staging    |
+ * | K_PRIO_PREEMPT(3)| sd_writer      | 4096 B     | Dedicated FatFs SDMMC writer task      |
+ * | K_PRIO_PREEMPT(3)| psram_reader   | 2048 B     | Asynchronous PSRAM ping-pong reader    |
+ * | K_PRIO_PREEMPT(4)| scheduler      | 4096 B     | Low-power RTC sleep/wake coordination  |
+ *
+ * Invariants:
+ * 1. Real-time acquisition (Priority 0) preempts DSP processing (Priority 1).
+ * 2. DSP processing (Priority 1) preempts SD writing and PSRAM reading (Priority 3).
+ * 3. SD writing and PSRAM reading (Priority 3) preempt low-power scheduling (Priority 4).
+ * ============================================================================
+ */
+
+/* WildSonic Buffer Ownership State Machine */
+enum buf_owner_state {
+  BUF_OWNER_FREE = 0,    /* In pool, available for allocation */
+  BUF_OWNER_DMA,         /* Allocated by sink_alloc, being filled by DMA worker */
+  BUF_OWNER_DSP,         /* Dequeued from filled_q, undergoing DSP & conversion */
+  BUF_OWNER_STAGED,      /* Data pushed to PSRAM staging / SD queue */
+  BUF_OWNER_WRITING,     /* Currently being written to SD card (Mode A) */
+};
+
 struct rec_stats {
   uint32_t sample_rate;
   uint16_t sample_bits;            /* 16 or 32 */
@@ -111,6 +143,12 @@ struct rec_stats {
   uint32_t psram_read_throughput_kb_s;
   uint32_t psram_write_throughput_kb_s;
   uint8_t pipeline_mode;
+
+  /* Data Loss Policy & Back-pressure Metrics */
+  uint32_t gap_count;
+  uint32_t consecutive_drop_abort_count;
+  bool slowdown_active;
+  uint32_t slowdown_events;
 };
 
 enum storage_pipeline_mode {
@@ -198,5 +236,19 @@ int recorder_scan_last_file(char *out_folder, size_t folder_len, char *out_file,
 
 /* Low-power sleep transition between sessions, with measured wakeup recovery */
 int recorder_sleep(uint32_t seconds, uint32_t *wake_recovery_us);
+
+typedef enum {
+  SHUTDOWN_STAGE_NONE = 0,
+  SHUTDOWN_STAGE_AUDIO_STOP,
+  SHUTDOWN_STAGE_WRITER_DRAIN,
+  SHUTDOWN_STAGE_FS_SYNC,
+  SHUTDOWN_STAGE_PSRAM_SLEEP,
+  SHUTDOWN_STAGE_SD_SLEEP,
+  SHUTDOWN_STAGE_STOP2,
+  SHUTDOWN_STAGE_COMPLETE
+} shutdown_stage_t;
+
+const char *recorder_shutdown_stage_name(shutdown_stage_t stage);
+shutdown_stage_t recorder_get_shutdown_stage(void);
 
 #endif

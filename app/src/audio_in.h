@@ -106,6 +106,7 @@ int audio_in_set_block_size(uint32_t samples);
 
 int audio_in_start(void);
 int audio_in_stop(void);
+int audio_in_verify_ready(void);
 
 /* Check whether audio DMA is actively running */
 bool audio_in_is_dma_active(void);

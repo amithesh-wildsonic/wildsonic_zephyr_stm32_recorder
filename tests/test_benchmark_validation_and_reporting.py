@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import json
+import shutil
 from pathlib import Path
+
 import pytest
 
 from measurement_tool.config import AcceptanceCriteria
@@ -216,21 +218,49 @@ class TestPhaseDurationAndTimingConsistency:
 class TestArtifactHandlingAndWorkbookUpdate:
     """Regression tests for JSON artifact consistency and workbook updates."""
 
-    def test_reprocessed_hw_001_values_in_workbook(self):
-        wb_mgr = ComparisonWorkbookManager("data/reports/stm32_vs_max78000.xlsx")
-        ws_pwr = wb_mgr.workbook["Power & Sleep"]
+    def test_reprocessed_hw_001_values_in_workbook(self, tmp_path):
+        source_workbook = Path("data/reports/stm32_vs_max78000.xlsx")
+        workbook_copy = tmp_path / "stm32_vs_max78000_hw001.xlsx"
+        shutil.copy2(source_workbook, workbook_copy)
 
-        # Check Idle energy is ~1568.42 mJ (not 1.5M mJ!)
-        idle_row = None
+        evidence_path = Path("data/parsed/STM32-PPK2-HW-001_20261104_045112.json")
+        with evidence_path.open("r", encoding="utf-8") as fh:
+            evidence = json.load(fh)
+
+        stop2_verified = bool(evidence.get("stop2_verified", False))
+        assert stop2_verified is False
+        assert evidence.get("stop2_verification") == "UNVERIFIED"
+        assert evidence["ppk2_phases"]["Phase C: Recording"]["timing_verified"] is False
+
+        wb_mgr = ComparisonWorkbookManager(workbook_copy)
+        wb_mgr.update_ppk2_phase_measurements(evidence["ppk2_phases"], stop2_verified=stop2_verified)
+
+        session = TestSession(
+            test_id="STM32-PPK2-HW-001",
+            board="STM32L476RG",
+            firmware_commit=evidence.get("firmware_commit", "b1c299f43d0f"),
+            build_type="test",
+            category="ppk2-full-benchmark",
+            configuration="PPK2-Controlled 9-Phase Benchmark (5000 mV)",
+            date_time="2026-11-04T00:00:00Z",
+            raw_log_path="data/stm32/raw_logs/STM32-PPK2-HW-001_STM32L476RG_20261104_044951.raw.log",
+            ppk2_csv_path="data/ppk2/STM32-PPK2-HW-001_20261104_044951_ppk2_full.csv",
+            parsed_result=evidence,
+            evidence_type="HARDWARE",
+            status="FAIL",
+        )
+        wb_mgr.add_or_update_session(session)
+
+        ws_pwr = wb_mgr.workbook["Power & Sleep"]
+        phase_b_row = None
         for row in ws_pwr.iter_rows(min_row=2, values_only=True):
             if "Idle / Baseline" in str(row[0]):
-                idle_row = row
+                phase_b_row = row
                 break
-        assert idle_row is not None
-        assert idle_row[8] == 1568.42  # Energy mJ
-        assert idle_row[7] == 307.896  # Power mW
+        assert phase_b_row is not None
+        assert phase_b_row[7] == pytest.approx(307.896)
+        assert phase_b_row[8] == pytest.approx(1568.42)
 
-        # Check Stop 2 row has UNVERIFIED note
         stop2_row = None
         for row in ws_pwr.iter_rows(min_row=2, values_only=True):
             if "Stop 2 Deep Sleep" in str(row[0]):
@@ -239,7 +269,6 @@ class TestArtifactHandlingAndWorkbookUpdate:
         assert stop2_row is not None
         assert "UNVERIFIED" in str(stop2_row[10])
 
-        # Check Test Log has failure reasons
         ws_log = wb_mgr.workbook["Test Log"]
         hw_log_row = None
         for row in ws_log.iter_rows(min_row=2, values_only=True):

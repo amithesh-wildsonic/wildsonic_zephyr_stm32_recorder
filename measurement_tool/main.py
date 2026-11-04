@@ -123,7 +123,7 @@ def run_test_cmd(args):
 
     ppk2_ctrl = None
     category = args.category.lower()
-    if ppk2_port or category in {"ppk2-boot", "ppk2-benchmark", "full-benchmark", "stability-test", "stability"}:
+    if ppk2_port or category in {"ppk2-boot", "ppk2-benchmark", "full-benchmark", "stability-test", "stability", "one-hour-stability"}:
         ppk2_mock = is_mock or (ppk2_port and ppk2_port.upper() in {"MOCK", "SIM", "MOCK_PPK2"})
         ppk2_ctrl = PPK2Controller(
             port=ppk2_port if not ppk2_mock else "MOCK_PPK2",
@@ -165,6 +165,19 @@ def run_test_cmd(args):
             evidence_type=evidence_type,
         )
         sessions.append(sess)
+    elif category == "one-hour-stability":
+        stab_runner = StabilityRunner(
+            controller=controller,
+            ppk2=ppk2_ctrl,
+            sample_rate=args.rate or 96000,
+            bit_depth=getattr(args, "bit_depth", 16),
+            voltage_mv=voltage_mv,
+            duration_seconds=3600,
+            progress_callback=lambda msg: print(f"  {msg}"),
+        )
+        summary = stab_runner.run_one_hour(test_id=args.test_id, duration_s=3600)
+        print(json.dumps(summary, indent=2))
+        return
     elif category in {"ppk2-benchmark", "full-benchmark"}:
         sess = runner.run_ppk2_full_benchmark(
             base_id=args.test_id or "STM32-PPK2-BENCH",
@@ -269,6 +282,7 @@ def build_parser() -> argparse.ArgumentParser:
             "ppk2-boot",
             "stability-test",
             "stability",
+            "one-hour-stability",
             "boot",
             "cold-boot",
             "idle-power",

@@ -448,8 +448,14 @@ int rtc_sleep_enter_stop2(uint32_t seconds)
 #endif
 	while (log_process()) {}
 #if defined(CONFIG_SOC_SERIES_STM32L4X)
-	/* Ensure all UART console bits are completely transmitted before clocks freeze in Stop 2 */
-	while (!LL_USART_IsActiveFlag_TC(USART2)) {}
+	/* Ensure all UART console bits are completely transmitted before clocks freeze in Stop 2
+	 * Uses DWT cycle counter timeout to prevent infinite hang if UART TX is faulted. */
+	uint32_t tc_start_cyc = k_cycle_get_32();
+	while (!LL_USART_IsActiveFlag_TC(USART2)) {
+		if ((uint32_t)(k_cycle_get_32() - tc_start_cyc) > (SystemCoreClock / 10U)) { /* 100 ms timeout */
+			break;
+		}
+	}
 #endif
 
 	/*
@@ -486,10 +492,10 @@ int rtc_sleep_enter_stop2(uint32_t seconds)
 	/* Clear SLEEPDEEP bit in Cortex-M4 SCR */
 	LL_LPM_EnableSleep();
 
-	/* Enable interrupts: vectors immediately to rtc_wkup_isr() if pending */
-	__enable_irq();
+	/* Re-enable PWR clock and Backup domain access after Stop 2 */
+	rtc_access_enable();
 
-	/* Determine wake status */
+	/* Determine wake status from snapshotted flags BEFORE enabling interrupts */
 	int wake_rc = 0;
 	if (rtc_wut_flag || exti20_flag || nvic_rtc_flag || pre_wake_event || (last_wake_source == RTC_WAKE_TIMER)) {
 		last_wake_source = RTC_WAKE_TIMER;
@@ -501,10 +507,8 @@ int rtc_sleep_enter_stop2(uint32_t seconds)
 		wake_rc = -EIO;
 	}
 
-	/* Re-enable PWR clock and Backup domain access after Stop 2 */
-	rtc_access_enable();
-
-	/* Re-initialize 72 MHz PLL clock tree via Zephyr clock control */
+	/* Re-initialize 72 MHz PLL clock tree via Zephyr clock control BEFORE enabling IRQs
+	 * so that all pending ISRs execute at 72 MHz rather than 4 MHz MSI. */
 	int clk_ret = stm32_clock_control_init(NULL);
 	if (clk_ret != 0 || LL_RCC_GetSysClkSource() != LL_RCC_SYS_CLKSOURCE_STATUS_PLL) {
 		LOG_ERR("Clock restoration failed after Stop 2 (ret=%d, src=0x%02X)",
@@ -512,9 +516,12 @@ int rtc_sleep_enter_stop2(uint32_t seconds)
 		wake_rc = -EIO;
 	}
 
-	/* Restore SysTick and compensate kernel uptime ticks */
+	/* Enable interrupts with system clock fully restored to PLL */
+	__enable_irq();
+
+	/* Restore SysTick and compensate kernel uptime ticks (even on unexpected wake to prevent scheduler stall) */
 	SysTick->CTRL = saved_systick_ctrl;
-	if (seconds > 0 && wake_rc == 0) {
+	if (seconds > 0) {
 		uint64_t elapsed_ticks = (uint64_t)seconds * CONFIG_SYS_CLOCK_TICKS_PER_SEC;
 		while (elapsed_ticks > 0) {
 			uint32_t chunk_ticks = (elapsed_ticks > (UINT32_MAX / 4))
@@ -539,11 +546,23 @@ int rtc_sleep_enter_stop2(uint32_t seconds)
 	/* Restore console UART RX interrupts after Stop 2 wakeup */
 	console_async_resume();
 	ble_comm_resume();
+#if defined(CONFIG_WILDSONIC_VERBOSE_LOGS)
+	/* Emit wake milestones cleanly only after system clocks and UART are 100% operational */
+	printk("[TEST] STOP2_EXITED\n");
+	if (last_wake_source == RTC_WAKE_TIMER) {
+		printk("[TEST] RTC_WAKE_ISR\n");
+	}
+	if (clk_ret == 0 && LL_RCC_GetSysClkSource() == LL_RCC_SYS_CLKSOURCE_STATUS_PLL) {
+		printk("[TEST] CLOCKS_RESTORED\n");
+	}
+	printk("[TEST] UART_RESTORED\n");
+#else
 	/* Keep one useful operational message after clocks and console are restored. */
 	if (wake_rc == 0 && last_wake_source == RTC_WAKE_TIMER) {
 		printk("\nRTC wake received. System clock restored; console and BLE communications resumed.\n");
 		printk("Wake initialization complete; scheduler continuing.\n");
 	}
+#endif
 
 	/* Disarm RTC Wakeup Timer and clear pending flags */
 	rtc_sleep_disarm();

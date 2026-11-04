@@ -81,9 +81,18 @@ struct __attribute__((packed)) wildsonic_persisted_config {
 	uint8_t sunset_interval_before;    /* Minutes before sunset */
 	uint8_t sunset_interval_after;     /* Minutes after sunset */
 
-	uint8_t reserved[249];             /* Pad out to exactly 508 bytes before checksum */
+	uint8_t reserved[245];             /* Pad out to exactly 504 bytes before crc32 and checksum */
+	uint32_t crc32;                    /* IEEE 802.3 CRC32 of bytes 0..503 */
 	uint32_t checksum;                 /* Additive byte sum of bytes 0..507 */
 };
+
+#define CONFIG_STORE_VERSION_1 1U
+#define CONFIG_STORE_VERSION_2 2U
+
+/**
+ * @brief Calculate IEEE 802.3 CRC32 of persisted configuration record.
+ */
+uint32_t config_store_calc_crc32(const struct wildsonic_persisted_config *cfg);
 
 /**
  * @brief Calculate additive byte checksum matching Maxim reference.

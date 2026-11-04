@@ -96,7 +96,14 @@ class AcceptanceCriteria:
             warnings.append(f"WAV verification {metrics['wav_verification']} does not meet required {self.wav_verification_required}.")
         if metrics.get("storage_recovery") is not None and str(metrics["storage_recovery"]).upper() != self.storage_recovery_required.upper():
             warnings.append(f"Storage recovery {metrics['storage_recovery']} does not meet required {self.storage_recovery_required}.")
-        if self.stop2_verified_required:
+        category = str(metrics.get("category") or "").lower()
+        has_sleep_workload = (
+            metrics.get("requested_sleep_s") is not None or
+            metrics.get("sleep_seconds") is not None or
+            category in {"sleep", "sleep-wake", "ppk2-benchmark", "full-benchmark", "stability"} or
+            "sleep" in category
+        )
+        if self.stop2_verified_required and has_sleep_workload:
             if metrics.get("stop2_verified") is False:
                 missing = metrics.get("stop2_missing_evidence", [])
                 missing_str = f" ({'; '.join(missing)})" if missing else ""

@@ -198,9 +198,9 @@ class TestStabilityRunnerExecution:
 
         # Verify generated artifacts
         parsed_path = Path(f"data/stm32/parsed/{test_id}_{runner.recoveries[0].timestamp_iso[:10].replace('-', '')}")
-        json_matches = list(Path("data/stm32/parsed").glob(f"{test_id}_*.json"))
+        json_matches = sorted(list(Path("data/stm32/parsed").glob(f"{test_id}_*.json")), key=lambda p: p.stat().st_mtime)
         assert len(json_matches) >= 1
-        saved_data = json.loads(json_matches[0].read_text(encoding="utf-8"))
+        saved_data = json.loads(json_matches[-1].read_text(encoding="utf-8"))
         assert saved_data["test_id"] == test_id
         assert saved_data["sample_rate"] == 96000
         assert saved_data["power_cycles_count"] >= 1

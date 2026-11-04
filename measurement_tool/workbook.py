@@ -65,21 +65,33 @@ def _auto_fit_columns(ws, max_cols: int = 15):
 
 
 class ComparisonWorkbookManager:
-    """Manages the full 11-sheet STM32 vs MAX78000 benchmarking workbook."""
+    """Manages the comparison workbook. Result cells start blank and are populated only from measured evidence."""
 
     REQUIRED_SHEETS = [
         "Start Here",
         "Test Setup",
+        "Executive Summary",
+        "Hardware Config",
         "Comparison Summary",
+        "Power Consumption",
         "Power & Sleep",
+        "Sleep Current & RTC",
         "Wake & RTC",
+        "Recording Perf & Integrity",
         "Recording Integrity",
+        "SD Card Performance",
         "SD Card I-O",
+        "Audio ADC Performance",
         "Audio & ADC",
+        "PSRAM Performance",
+        "RTOS & Memory",
         "RTOS & Resources",
         "Interfaces & Reliability",
+        "Config Verification",
         "Stability Test",
+        "Execution Log",
         "Test Log",
+        "Evidence & References",
         "STM32 Measurements",  # Legacy / individual capture sheet
     ]
 
@@ -128,16 +140,28 @@ class ComparisonWorkbookManager:
         init_dispatch = {
             "Start Here": self._populate_start_here,
             "Test Setup": self._populate_test_setup,
+            "Executive Summary": self._populate_executive_summary,
+            "Hardware Config": self._populate_hardware_configuration,
             "Comparison Summary": self._populate_comparison_summary,
+            "Power Consumption": self._populate_power_consumption,
             "Power & Sleep": self._populate_power_sleep,
+            "Sleep Current & RTC": self._populate_sleep_current_rtc,
             "Wake & RTC": self._populate_wake_rtc,
+            "Recording Perf & Integrity": self._populate_recording_performance_integrity,
             "Recording Integrity": self._populate_recording_integrity,
+            "SD Card Performance": self._populate_sd_card_performance_comparison,
             "SD Card I-O": self._populate_sd_card_io,
+            "Audio ADC Performance": self._populate_audio_adc_performance,
             "Audio & ADC": self._populate_audio_adc,
+            "PSRAM Performance": self._populate_psram_performance,
+            "RTOS & Memory": self._populate_rtos_memory_resources,
             "RTOS & Resources": self._populate_rtos_resources,
             "Interfaces & Reliability": self._populate_interfaces_reliability,
+            "Config Verification": self._populate_configuration_verification,
             "Stability Test": self._populate_stability_test_headers,
+            "Execution Log": self._populate_hardware_test_execution_log,
             "Test Log": self._populate_test_log_headers,
+            "Evidence & References": self._populate_evidence_references,
             "STM32 Measurements": self._populate_stm32_measurements_headers,
         }
         if name in init_dispatch:
@@ -146,17 +170,164 @@ class ComparisonWorkbookManager:
     def _init_all_sheets(self, wb: openpyxl.Workbook) -> None:
         self._populate_start_here(wb["Start Here"])
         self._populate_test_setup(wb["Test Setup"])
+        self._populate_executive_summary(wb["Executive Summary"])
+        self._populate_hardware_configuration(wb["Hardware Config"])
         self._populate_comparison_summary(wb["Comparison Summary"])
+        self._populate_power_consumption(wb["Power Consumption"])
         self._populate_power_sleep(wb["Power & Sleep"])
+        self._populate_sleep_current_rtc(wb["Sleep Current & RTC"])
         self._populate_wake_rtc(wb["Wake & RTC"])
+        self._populate_recording_performance_integrity(wb["Recording Perf & Integrity"])
         self._populate_recording_integrity(wb["Recording Integrity"])
+        self._populate_sd_card_performance_comparison(wb["SD Card Performance"])
         self._populate_sd_card_io(wb["SD Card I-O"])
+        self._populate_audio_adc_performance(wb["Audio ADC Performance"])
         self._populate_audio_adc(wb["Audio & ADC"])
+        self._populate_psram_performance(wb["PSRAM Performance"])
+        self._populate_rtos_memory_resources(wb["RTOS & Memory"])
         self._populate_rtos_resources(wb["RTOS & Resources"])
         self._populate_interfaces_reliability(wb["Interfaces & Reliability"])
+        self._populate_configuration_verification(wb["Config Verification"])
         self._populate_stability_test_headers(wb["Stability Test"])
+        self._populate_hardware_test_execution_log(wb["Execution Log"])
         self._populate_test_log_headers(wb["Test Log"])
+        self._populate_evidence_references(wb["Evidence & References"])
         self._populate_stm32_measurements_headers(wb["STM32 Measurements"])
+
+    def _populate_blank_reference_sheet(self, ws, headers: List[str], row_templates: Optional[List[List[Any]]] = None) -> None:
+        ws.views.sheetView[0].showGridLines = True
+        ws.append(headers)
+        _apply_row_style(ws, 1, font=HEADER_FONT, fill=HEADER_FILL)
+        rows = row_templates or []
+        for row in rows:
+            ws.append(row)
+            _apply_row_style(ws, ws.max_row)
+        _auto_fit_columns(ws)
+
+    def _populate_executive_summary(self, ws) -> None:
+        self._populate_blank_reference_sheet(
+            ws,
+            ["Section", "Metric", "MAX78000 Reference", "STM32 Measured", "Status", "Evidence / Note"],
+            [
+                ["Executive Summary", "Overall platform readiness", None, None, "REFERENCE", "Populate from verified evidence only"],
+                ["Power", "Recording current and energy", None, None, "REFERENCE", "Use verified PPK2 phase measurements only"],
+                ["Sleep", "STOP2 verification status", None, None, "UNVERIFIED", "Do not promote unverified sleep current to PASS"],
+            ],
+        )
+
+    def _populate_hardware_configuration(self, ws) -> None:
+        self._populate_blank_reference_sheet(
+            ws,
+            ["Parameter", "MAX78000 Value", "STM32 Value", "Measurement Method", "Status", "Evidence"],
+            [
+                ["Board / MCU", None, None, "Hardware banner / datasheet", "REFERENCE", "Documented platform setup"],
+                ["Firmware commit", None, None, "UART banner / build metadata", "REFERENCE", "SHA recorded from hardware evidence"],
+                ["Supply / instrumentation", "3.3 V rail / PMIC", "3.3 V rail / PPK2", "Bench instrumentation", "REFERENCE", "Measured at test fixture"],
+            ],
+        )
+
+    def _populate_power_consumption(self, ws) -> None:
+        self._populate_blank_reference_sheet(
+            ws,
+            ["Measurement", "MAX78000 Reference", "STM32 Measured", "Units", "Status", "Evidence"],
+            [
+                ["Active recording current", None, None, "mA", "NOT RUN", "Awaiting verified phase capture"],
+                ["Active recording power", None, None, "mW", "NOT RUN", "Awaiting verified phase capture"],
+                ["Average energy", None, None, "mJ", "NOT RUN", "Awaiting verified energy calculation"],
+            ],
+        )
+
+    def _populate_sleep_current_rtc(self, ws) -> None:
+        self._populate_blank_reference_sheet(
+            ws,
+            ["Sleep Metric", "Expected Value", "MAX78000", "STM32 Measured", "Status", "Verification / Note"],
+            [
+                ["Expected STOP2 current", "~6 mA", None, None, "EXPECTED", "Expected value, not measured"],
+                ["HW-002 sleep current", "Invalid", None, "52.74 mA", "INVALID", "Recorder remained active; not a valid sleep measurement"],
+                ["Verified STOP2 current", None, None, None, "UNVERIFIED", "Blank until actual STOP2 evidence exists"],
+                ["RTC wake verification", None, None, None, "UNVERIFIED", "Must include wake event and restoration checks"],
+            ],
+        )
+
+    def _populate_recording_performance_integrity(self, ws) -> None:
+        self._populate_blank_reference_sheet(
+            ws,
+            ["Test Condition", "Expected Samples", "Acquired", "Written", "Lost", "WAV Verified", "Status", "Evidence"],
+            [
+                ["192 kHz / 10 s / 16-bit", None, None, None, None, None, "NOT RUN", "Awaiting raw log + JSON evidence"],
+                ["96 kHz / 10 s / 16-bit", None, None, None, None, None, "NOT RUN", "Awaiting raw log + JSON evidence"],
+            ],
+        )
+
+    def _populate_sd_card_performance_comparison(self, ws) -> None:
+        self._populate_blank_reference_sheet(
+            ws,
+            ["Operation", "Chunk Size", "MAX78000 Throughput", "STM32 Throughput", "Min", "Avg", "Max", "P95", "Worst Latency", "Errors", "Data Integrity", "Status", "Evidence"],
+            [
+                ["Raw sequential read", "16 KB", None, None, None, None, None, None, None, None, None, "NOT RUN", "No matched evidence"],
+                ["Raw sequential write", "128 KB", None, None, None, None, None, None, None, None, None, "NOT RUN", "No matched evidence"],
+                ["FatFs write", "256 KB", None, None, None, None, None, None, None, None, None, "NOT RUN", "No matched evidence"],
+            ],
+        )
+
+    def _populate_audio_adc_performance(self, ws) -> None:
+        self._populate_blank_reference_sheet(
+            ws,
+            ["Audio / ADC Metric", "MAX78000 Reference", "STM32 Measured", "Delta / Comparison", "Status", "Measurement Method"],
+            [
+                ["Sample rate error", None, None, None, "NOT RUN", "Measured from raw capture and log"],
+                ["ADC ENOB / jitter", None, None, None, "NOT RUN", "Measured from sample timing and waveform"],
+            ],
+        )
+
+    def _populate_psram_performance(self, ws) -> None:
+        self._populate_blank_reference_sheet(
+            ws,
+            ["PSRAM Metric", "MAX78000 Reference", "STM32 Measured", "Units", "Status", "Evidence"],
+            [
+                ["Write bandwidth", None, None, "MB/s", "NOT RUN", "No verified PSRAM evidence"],
+                ["Read bandwidth", None, None, "MB/s", "NOT RUN", "No verified PSRAM evidence"],
+            ],
+        )
+
+    def _populate_rtos_memory_resources(self, ws) -> None:
+        self._populate_blank_reference_sheet(
+            ws,
+            ["Resource", "MAX78000", "STM32", "Utilization / Capacity", "Status", "Evidence"],
+            [
+                ["CPU avg / max utilization", None, None, None, "NOT RUN", "Awaiting system traces"],
+                ["Thread runtime and stack headroom", None, None, None, "NOT RUN", "Awaiting runtime log"],
+            ],
+        )
+
+    def _populate_configuration_verification(self, ws) -> None:
+        self._populate_blank_reference_sheet(
+            ws,
+            ["Setting", "Request", "Command Accepted", "Persisted", "Staged", "Applied", "Active", "Status", "Evidence"],
+            [
+                ["SAMF", None, None, None, None, None, None, "UNVERIFIED", "Configuration verification required"],
+                ["BTPS", None, None, None, None, None, None, "UNVERIFIED", "Configuration verification required"],
+                ["RECT", None, None, None, None, None, None, "UNVERIFIED", "Configuration verification required"],
+            ],
+        )
+
+    def _populate_hardware_test_execution_log(self, ws) -> None:
+        self._populate_blank_reference_sheet(
+            ws,
+            ["Timestamp", "Test ID", "Command / Phase", "Result", "Status", "Evidence / Note"],
+            [
+                [None, None, "Benchmark sequence start", "NOT RUN", "NOT RUN", "No hardware test executed in this workbook snapshot"],
+            ],
+        )
+
+    def _populate_evidence_references(self, ws) -> None:
+        self._populate_blank_reference_sheet(
+            ws,
+            ["Test ID", "Firmware SHA", "Build Config", "Raw UART Log", "PPK2 CSV", "Parsed JSON", "Timestamp", "Hardware Setup", "Status"],
+            [
+                [None, None, None, None, None, None, None, None, "REFERENCE"],
+            ],
+        )
 
     def _populate_start_here(self, ws) -> None:
         ws.views.sheetView[0].showGridLines = True
@@ -210,7 +381,7 @@ class ComparisonWorkbookManager:
         ]
 
         for row in data:
-            ws.append(list(row))
+            ws.append([row[0], None, row[2], row[3]])
             _apply_row_style(ws, ws.max_row)
         _auto_fit_columns(ws)
 
@@ -219,25 +390,10 @@ class ComparisonWorkbookManager:
         ws.append(["Metric Category", "Specific Metric", "MAX78000 Baseline", "STM32 Min", "STM32 Avg", "STM32 Max", "Delta / Comparison", "Status", "Notes"])
         _apply_row_style(ws, 1, font=HEADER_FONT, fill=HEADER_FILL)
 
-        rows = [
-            ("Power", "Active Recording Current (192 kHz)", "28.50 mA", "24.80 mA", "26.80 mA", "31.20 mA", "-6.0% (Lower)", "PASS", "Nordic PPK2 @ 3.3V"),
-            ("Power", "Stop 2 / Deep Sleep Current", "2.10 uA", "2.60 uA", "2.85 uA", "3.10 uA", "+0.75 uA", "PASS", "STM32 retains 96KB SRAM1"),
-            ("Power", "Idle Current (Console Active)", "12.20 mA", "8.40 mA", "9.10 mA", "9.80 mA", "-25.4% (Lower)", "PASS", "CPU waiting for UART"),
-            ("Performance", "SD Active Write Throughput", "750 KB/s", "1850 KB/s", "2150 KB/s", "2400 KB/s", "+186.7% (Faster)", "PASS", "4-bit SDMMC vs SPI/SDHC"),
-            ("Performance", "SD Worst Batch Latency", "35.0 ms", "4.2 ms", "7.8 ms", "12.5 ms", "-64.3% (Better)", "PASS", "256 KB batch writes"),
-            ("Reliability", "Sample Loss Rate (192 kHz)", "0.00 %", "0.00 %", "0.00 %", "0.00 %", "0.00 % (Parity)", "PASS", "Zero lost samples required"),
-            ("Reliability", "ADC Overruns / DMA Errors", "0", "0", "0", "0", "0 (Parity)", "PASS", "Zero-tolerance criteria"),
-            ("Responsiveness", "Boot to Recording Readiness", "440 ms", "1180 ms", "1200 ms", "1240 ms", "+760 ms", "PASS", "Zephyr RTOS init + SD mount"),
-            ("Responsiveness", "RTC Wake Latency", "20.0 ms", "28.0 us", "32.0 us", "35.0 us", "-99.8% (Faster)", "PASS", "On-chip Stop 2 exit vs Power Latch"),
-            ("Capacity", "Audio Staging Headroom", "330 ms", "8000 ms", "8000 ms", "8000 ms", "+2324% (Higher)", "PASS", "3 MB PSRAM vs 128 KB OCM"),
-        ]
-
-        for r in rows:
-            ws.append(list(r))
-            row_idx = ws.max_row
-            _apply_row_style(ws, row_idx)
-            # Apply PASS fill to status cell
-            ws.cell(row_idx, 8).fill = PASS_FILL
+        # Intentionally blank: populate only from verified hardware evidence.
+        for category, metric in [("CPU", "Average CPU utilization"), ("CPU", "Maximum CPU utilization"), ("RTOS", "Thread runtime / stack headroom"), ("RTOS", "Queue and memory-slab high-water"), ("Power", "Recording average / peak current"), ("Power", "Verified Stop2 sleep current"), ("RTC", "RTC timing error / drift"), ("Wake", "Wake-to-firmware-ready"), ("Recording", "Dropped audio blocks"), ("Storage", "SD throughput / worst batch latency"), ("Reliability", "Unexpected resets / faults"), ("Reliability", "Overall test result")]:
+            ws.append([category, metric, None, None, None, None, None, None, "Populate from verified test evidence"])
+            _apply_row_style(ws, ws.max_row)
         _auto_fit_columns(ws)
 
     def _populate_power_sleep(self, ws) -> None:
@@ -249,18 +405,9 @@ class ComparisonWorkbookManager:
         ])
         _apply_row_style(ws, 1, font=HEADER_FONT, fill=HEADER_FILL)
 
-        data = [
-            ("Idle / Baseline", 12.20, 40.26, 8.40, 9.10, 9.80, 11.20, 30.03, 300.3, 10.0, "Console ready, scheduler idle"),
-            ("Active Recording (192 kHz)", 28.50, 94.05, 24.80, 26.80, 31.20, 38.50, 88.44, 884.4, 10.0, "ADC1 + TIM6 DMA + PSRAM write"),
-            ("Active SD Write (Batch)", 48.00, 158.40, 38.50, 42.00, 46.50, 52.00, 138.60, 55.4, 0.4, "SDMMC1 4-bit 256 KB drain"),
-            ("Active SD Read (Verify)", 42.00, 138.60, 32.00, 35.00, 38.00, 41.00, 115.50, 23.1, 0.2, "WAV header & footer readback"),
-            ("Stop 2 Deep Sleep", 0.0021, 0.0069, 0.0026, 0.0028, 0.0031, 0.0035, 0.0092, 0.046, 5.0, "RTC timer active, SRAM1 retained"),
-            ("RTC Wake-up Transition", 18.50, 61.05, 14.20, 16.50, 18.00, 22.00, 54.45, 0.54, 0.01, "HSI PLL relock & peripheral init"),
-            ("Peak Combined Workload", 58.00, 191.40, 44.00, 48.50, 54.00, 58.20, 160.05, 160.0, 1.0, "Concurrent audio DMA + SD write"),
-        ]
-
-        for r in data:
-            ws.append(list(r))
+        # Intentionally blank: populate only from verified hardware evidence.
+        for phase in ["Idle", "Recording", "SD write", "Stop2 sleep", "RTC wake", "Peripheral recovery"]:
+            ws.append([phase] + [None] * 9 + ["PPK2 phase capture required"])
             _apply_row_style(ws, ws.max_row)
         _auto_fit_columns(ws)
 
@@ -269,17 +416,9 @@ class ComparisonWorkbookManager:
         ws.append(["Parameter", "MAX78000 Baseline", "STM32 Min", "STM32 Avg", "STM32 Max", "Delta", "Notes / Verification"])
         _apply_row_style(ws, 1, font=HEADER_FONT, fill=HEADER_FILL)
 
-        data = [
-            ("Wakeup Latency (Stop 2 to ISR)", "20.0 ms", "28.0 us", "31.5 us", "35.0 us", "-99.8% (Faster)", "Measured from RTC event to CPU execution"),
-            ("System Clock Recovery Time", "5.0 ms", "12.0 us", "14.5 us", "18.0 us", "-99.7% (Faster)", "HSI 16 MHz to PLL 72 MHz lock time"),
-            ("Wake to Recording Readiness", "45.0 ms", "4.2 ms", "5.0 ms", "6.1 ms", "-88.9% (Faster)", "Audio ADC & DMA pipeline armed"),
-            ("RTC Calendar Accuracy / Drift", "< 2.0 ppm", "< 1.5 ppm", "< 1.5 ppm", "< 2.0 ppm", "Parity", "External 32.768 kHz quartz crystal"),
-            ("Wake Source Detection Reliability", "100.0 %", "100.0 %", "100.0 %", "100.0 %", "Parity", "RTC Wakeup Timer flag (WUTF) verified"),
-            ("Stop 2 Sleep Entry Rejection Rate", "0.0 %", "0.0 %", "0.0 %", "0.0 %", "Parity", "Guarded against active SD or file operations"),
-        ]
-
-        for r in data:
-            ws.append(list(r))
+        # Intentionally blank: populate only from verified hardware evidence.
+        for metric in ["Requested sleep duration", "Actual sleep duration", "RTC timing error", "RTC drift", "Wake source", "Wake-to-firmware-ready", "Wake-to-recording-ready", "Successful wake cycles", "Missed wake cycles", "Verified Stop2 entries"]:
+            ws.append([metric, None, None, None, None, None, "Awaiting verified RTC/UART evidence"])
             _apply_row_style(ws, ws.max_row)
         _auto_fit_columns(ws)
 
@@ -288,20 +427,10 @@ class ComparisonWorkbookManager:
         ws.append(["Sample Rate", "Bit Depth", "Duration", "Expected Samples", "Acquired Samples", "Written Samples", "Lost Samples", "ADC Overruns", "DMA Errors", "WAV Verified", "Status"])
         _apply_row_style(ws, 1, font=HEADER_FONT, fill=HEADER_FILL)
 
-        test_cases = [
-            ("48000 Hz", "16-bit", "10 s", 480000, 480000, 480000, 0, 0, 0, "PASS", "PASS"),
-            ("48000 Hz", "16-bit", "20 s", 960000, 960000, 960000, 0, 0, 0, "PASS", "PASS"),
-            ("96000 Hz", "16-bit", "10 s", 960000, 960000, 960000, 0, 0, 0, "PASS", "PASS"),
-            ("192000 Hz", "16-bit", "10 s", 1920000, 1920000, 1920000, 0, 0, 0, "PASS", "PASS"),
-            ("192000 Hz", "16-bit", "20 s", 3840000, 3840000, 3840000, 0, 0, 0, "PASS", "PASS"),
-        ]
-
-        for r in test_cases:
-            ws.append(list(r))
-            row_idx = ws.max_row
-            _apply_row_style(ws, row_idx)
-            ws.cell(row_idx, 10).fill = PASS_FILL
-            ws.cell(row_idx, 11).fill = PASS_FILL
+        # Intentionally blank: populate only from verified hardware evidence.
+        for rate in (192000, 96000, 48000):
+            ws.append([f"{rate} Hz", "16-bit", None, None, None, None, None, None, None, None, None])
+            _apply_row_style(ws, ws.max_row)
         _auto_fit_columns(ws)
 
     def _populate_sd_card_io(self, ws) -> None:
@@ -309,19 +438,10 @@ class ComparisonWorkbookManager:
         ws.append(["Test Condition / Chunk Size", "MAX78000 Throughput", "STM32 Min (KB/s)", "STM32 Avg (KB/s)", "STM32 Max (KB/s)", "Worst Latency (us)", "Error Count", "Recovery Status"])
         _apply_row_style(ws, 1, font=HEADER_FONT, fill=HEADER_FILL)
 
-        data = [
-            ("Raw Sequential 16 KB", "850 KB/s", 2200, 2450, 2600, 2400, 0, "PASS"),
-            ("FatFs Block Write 16 KB", "750 KB/s", 1850, 2150, 2350, 3100, 0, "PASS"),
-            ("FatFs Block Write 64 KB", "820 KB/s", 2100, 2380, 2550, 4800, 0, "PASS"),
-            ("FatFs Block Write 256 KB (Batch)", "880 KB/s", 2250, 2480, 2650, 7800, 0, "PASS"),
-            ("Storage Recovery Under Timeout", "Manual Reset", "120 ms", "145 ms", "180 ms", "N/A", 0, "PASS"),
-        ]
-
-        for r in data:
-            ws.append(list(r))
-            row_idx = ws.max_row
-            _apply_row_style(ws, row_idx)
-            ws.cell(row_idx, 8).fill = PASS_FILL
+        # Intentionally blank: populate only from verified hardware evidence.
+        for item in ["8 KB write", "16 KB write", "32 KB write", "64 KB write", "128 KB write", "Continuous recording"]:
+            ws.append([item] + [None] * 7)
+            _apply_row_style(ws, ws.max_row)
         _auto_fit_columns(ws)
 
     def _populate_audio_adc(self, ws) -> None:
@@ -329,17 +449,9 @@ class ComparisonWorkbookManager:
         ws.append(["Acoustic Parameter", "MAX78000 (MAX9867 Codec)", "STM32L476RG (ADC1 8x/16x OVS)", "Delta / Comparison", "Notes / Measurement Method"])
         _apply_row_style(ws, 1, font=HEADER_FONT, fill=HEADER_FILL)
 
-        data = [
-            ("Native Resolution", "16-bit (Delta-Sigma)", "12-bit SAR", "-4 bits (Hardware)", "Hardware converter baseline"),
-            ("Effective Resolution (ENOB)", "14.2 bits", "14.8 bits", "+0.6 bits (Superior)", "Hardware oversampling & decimation"),
-            ("Signal-to-Noise Ratio (SNR)", "84.5 dB", "86.2 dB", "+1.7 dB (Better)", "1 kHz sine wave @ 48 kHz / 192 kHz"),
-            ("Total Harmonic Distortion (THD)", "-82.0 dB", "-83.5 dB", "-1.5 dB (Cleaner)", "Measured at -3 dBFS input"),
-            ("Dynamic Range", "88.0 dB", "89.5 dB", "+1.5 dB (Higher)", "A-weighted @ 192 kHz"),
-            ("Sampling Clock Jitter", "< 45 ps RMS", "< 25 ps RMS", "Lower jitter", "TIM6 TRGO hardware trigger"),
-        ]
-
-        for r in data:
-            ws.append(list(r))
+        # Intentionally blank: populate only from verified hardware evidence.
+        for metric in ["Sample rate", "Sample-rate error", "ADC overruns", "DMA errors"]:
+            ws.append([metric, None, None, None, "Measured values only; no analog/noise tests added"])
             _apply_row_style(ws, ws.max_row)
         _auto_fit_columns(ws)
 
@@ -348,20 +460,10 @@ class ComparisonWorkbookManager:
         ws.append(["Resource / Metric", "MAX78000 Baseline", "STM32L476RG (Zephyr)", "Utilization / Capacity", "Status"])
         _apply_row_style(ws, 1, font=HEADER_FONT, fill=HEADER_FILL)
 
-        data = [
-            ("Active Thread Count", "3 Tasks (Bare-metal)", "4 Threads (Main, Recorder, Scheduler, SD)", "4 concurrent", "PASS"),
-            ("SRAM Consumption", "78 KB / 128 KB (60.9%)", "91.8 KB / 128 KB (71.7%)", "36.2 KB margin", "PASS"),
-            ("Flash Footprint", "320 KB / 512 KB (62.5%)", "227.4 KB / 1024 KB (22.2%)", "796.6 KB margin", "PASS"),
-            ("PSRAM Staging Buffer", "256 KB OCM", "3072 KB (12 slots x 256 KB)", "78% high-water", "PASS"),
-            ("DSP Execution Time per Block", "180 us", "120 us (worst 240 us)", "48% of 500 us deadline", "PASS"),
-            ("Interrupt Latency", "< 35 cycles", "< 18 cycles (Cortex-M4F NVIC)", "Low jitter", "PASS"),
-        ]
-
-        for r in data:
-            ws.append(list(r))
-            row_idx = ws.max_row
-            _apply_row_style(ws, row_idx)
-            ws.cell(row_idx, 5).fill = PASS_FILL
+        # Intentionally blank: populate only from verified hardware evidence.
+        for metric in ["CPU average / maximum", "Thread runtime", "Scheduler response latency", "Minimum stack headroom", "Queue high-water", "Memory-slab high-water", "Thread faults"]:
+            ws.append([metric, None, None, None, None])
+            _apply_row_style(ws, ws.max_row)
         _auto_fit_columns(ws)
 
     def _populate_interfaces_reliability(self, ws) -> None:
@@ -369,19 +471,10 @@ class ComparisonWorkbookManager:
         ws.append(["Interface / Subsystem", "Clock Rate / Bus Width", "Error Rate", "Continuous Duration", "Recovery Rate", "Status"])
         _apply_row_style(ws, 1, font=HEADER_FONT, fill=HEADER_FILL)
 
-        data = [
-            ("SDMMC1 Storage", "6 MHz, 4-bit bus (3 MB/s capacity)", "0.0 % (0 errors)", "> 24 hours verified", "100.0 % (Auto-recovery)", "PASS"),
-            ("QUADSPI PSRAM", "18 MHz, 4-bit Quad-SPI (9 MB/s)", "0.0 % (0 errors)", "Continuous streaming", "100.0 % verified", "PASS"),
-            ("ADC1 / TIM6 Audio", "192 kHz, 1-channel 16-bit PCM", "0.0 % (0 lost)", "Continuous streaming", "100.0 % verified", "PASS"),
-            ("UART / ST-LINK VCP", "115200 baud, 8N1", "0.0 % framing errors", "Full session telemetry", "N/A", "PASS"),
-            ("RTC Calendar & WUT", "32.768 kHz LSE quartz", "< 2 ppm drift", "Indefinite battery backup", "100.0 % verified", "PASS"),
-        ]
-
-        for r in data:
-            ws.append(list(r))
-            row_idx = ws.max_row
-            _apply_row_style(ws, row_idx)
-            ws.cell(row_idx, 6).fill = PASS_FILL
+        # Intentionally blank: populate only from verified hardware evidence.
+        for metric in ["SDMMC errors", "PSRAM errors", "ADC/DMA errors", "Unexpected resets", "Watchdog resets", "Recording success rate", "Wake success rate", "Overall reliability result"]:
+            ws.append([metric, None, None, None, None, None])
+            _apply_row_style(ws, ws.max_row)
         _auto_fit_columns(ws)
 
     def _populate_stability_test_headers(self, ws) -> None:
@@ -523,10 +616,12 @@ class ComparisonWorkbookManager:
     def update_ppk2_phase_measurements(
         self,
         phases: Dict[str, Any],
-        stop2_verified: bool = True,
+        stop2_verified: Optional[bool] = None,
         notes_overrides: Optional[Dict[str, str]] = None,
     ) -> None:
         """Updates Power & Sleep comparison sheet with measured STM32 PPK2 phase telemetry."""
+        if stop2_verified is None:
+            stop2_verified = False
         ws_pwr = self.workbook["Power & Sleep"]
         phase_map = {
             "Idle / Baseline": ["Phase B: Active Idle", "idle", "idle-power"],

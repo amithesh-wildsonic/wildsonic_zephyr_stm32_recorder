@@ -114,6 +114,26 @@ The benchmark executes 9 sequential hardware phases, with continuous PPK2 power 
 
 ## 5. Command-Line Usage
 
+### One-Hour Autonomous Functional Stability Test
+
+The config-preserving mode continuously captures UART output, performs read-only
+preflight checks, and starts its 3600-second monotonic timer only after preflight
+passes. It does not power-cycle the target or change recording settings. Run it
+with the recorder UART and, optionally, a PPK2 connected:
+
+```powershell
+python -m measurement_tool.main run-test `
+  --category one-hour-stability `
+  --port COM30 `
+  --ppk2-port COM28 `
+  --test-id ONE_HOUR_AUTONOMOUS_STABILITY_001
+```
+
+Evidence is written to a unique `data/stability/ONE_HOUR_<timestamp>/` directory.
+The mode blocks before the timer when the firmware cannot verify required state;
+the current console does not expose pending configuration or host-side WAV
+readback, so these are explicitly reported as unavailable.
+
 ### 1. First PPK2-Controlled Hardware Benchmark
 Run the complete 9-phase hardware benchmark on connected hardware:
 

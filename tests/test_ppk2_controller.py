@@ -6,6 +6,42 @@ import pytest
 from measurement_tool.ppk2_controller import MockPPK2Device, PPK2Controller, PPK2PhaseWindow
 
 
+def test_hardware_connect_clears_stale_binary_stream_and_closes_serial(monkeypatch):
+    class FakeSerial:
+        def __init__(self):
+            self.reset_count = 0
+            self.closed = False
+
+        def reset_input_buffer(self):
+            self.reset_count += 1
+
+        def close(self):
+            self.closed = True
+
+    class FakeDevice:
+        def __init__(self, _port):
+            self.ser = FakeSerial()
+            self.stopped = False
+            self.modifiers = {key: {"0": 1.0} for key in ("R", "GS", "GI", "O", "S", "I", "UG")}
+
+        def stop_measuring(self):
+            self.stopped = True
+
+        def get_modifiers(self):
+            return {"Calibrated": "YES"}
+
+    monkeypatch.setattr("measurement_tool.ppk2_controller.PPK2_API_AVAILABLE", True)
+    monkeypatch.setattr("measurement_tool.ppk2_controller.PPK2_API", FakeDevice)
+    monkeypatch.setattr("measurement_tool.ppk2_controller.time.sleep", lambda _seconds: None)
+    ctrl = PPK2Controller(port="COM28")
+    ctrl.connect()
+    assert ctrl._device.stopped is True
+    assert ctrl._device.ser.reset_count == 2
+    serial_port = ctrl._device.ser
+    ctrl.close(keep_power_on=True)
+    assert serial_port.closed is True
+
+
 def test_ppk2_connection_and_device_identification():
     ctrl = PPK2Controller(port="MOCK_PPK2", mock=True)
     assert ctrl.port == "MOCK_PPK2"

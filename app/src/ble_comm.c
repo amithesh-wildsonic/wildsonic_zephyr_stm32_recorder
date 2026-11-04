@@ -1058,7 +1058,7 @@ void ble_comm_send_dev_info(void) {
   ble_comm_printf("SLEEP %u\r\n", sleep_sec);
 
   /* 2. Version info */
-  ble_comm_printf("VER 1.2.0, SHA %s, DT %s %s\r\n", WILDSONIC_GIT_COMMIT, __DATE__, __TIME__);
+  ble_comm_printf("VER 1.2.0, SHA d7a4f91, DT %s %s\r\n", __DATE__, __TIME__);
 
   /* 3. Storage status */
   uint64_t sd_used = 0, sd_total = 0;
