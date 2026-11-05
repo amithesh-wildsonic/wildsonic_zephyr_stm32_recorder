@@ -88,8 +88,18 @@ def test_get_dev_info_schema_parity():
         '"VER 1.2.0, SHA d7a4f91, DT %s %s\\r\\n"',
         '"SDUSED %llu, SDCAP %llu\\r\\n"',
         '"FLDR %s\\r\\n"',
-        '"VBATT N/A, CBATT N/A, REMBATT N/A\\r\\n"',
-        '"FULLBATT N/A, REMTIME N/A, AVGPWR N/A\\r\\n"',
+        '"VBATT %u"',
+        '"CBATT %d"',
+        '"REMBATT %u\\r\\n"',
+        '"FULLBATT %u"',
+        '"REMTIME %u"',
+        '"AVGPWR %d\\r\\n"',
+        '"VBATT N/A"',
+        '"CBATT N/A"',
+        '"REMBATT N/A\\r\\n"',
+        '"FULLBATT N/A"',
+        '"REMTIME N/A"',
+        '"AVGPWR N/A\\r\\n"',
         '"NBAT 1\\r\\n"',
         '"DATETIME',
         '"TIMEZONE',
@@ -112,12 +122,22 @@ def test_get_status_info_schema_parity():
     src = BLE_COMM_C.read_text(encoding="utf-8")
     assert "void ble_comm_send_status_info(void)" in src
     status_pos = src.find("void ble_comm_send_status_info(void)")
-    status_body = src[status_pos:status_pos + 1500]
+    status_body = src[status_pos:src.find("int ble_comm_feed_rx_bytes", status_pos)]
 
     expected_status_lines = [
         '"SDUSED %llu, SDCAP %llu\\r\\n"',
-        '"VBATT N/A, CBATT N/A, REMBATT N/A\\r\\n"',
-        '"FULLBATT N/A, REMTIME N/A, AVGPWR N/A\\r\\n"',
+        '"VBATT %u"',
+        '"CBATT %d"',
+        '"REMBATT %u\\r\\n"',
+        '"FULLBATT %u"',
+        '"REMTIME %u"',
+        '"AVGPWR %d\\r\\n"',
+        '"VBATT N/A"',
+        '"CBATT N/A"',
+        '"REMBATT N/A\\r\\n"',
+        '"FULLBATT N/A"',
+        '"REMTIME N/A"',
+        '"AVGPWR N/A\\r\\n"',
         '"TEMP 0.00, HUMID 0.00\\r\\n"',
     ]
     for line_fmt in expected_status_lines:

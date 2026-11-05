@@ -38,6 +38,7 @@
 #include <zephyr/storage/disk_access.h>
 #include <zephyr/sys/time_units.h>
 #include "led_indicator.h"
+#include "battery_monitor.h"
 
 #if defined(CONFIG_SOC_SERIES_STM32L4X)
 #include <stm32_ll_dma.h>
@@ -1964,6 +1965,7 @@ int recorder_sleep(uint32_t seconds, uint32_t *wake_recovery_us) {
 #endif
 
   /* 11. Enter STM32L476 Stop 2 low-power mode */
+  battery_monitor_suspend();
   s_power_state = REC_PWR_RTC_ARMED;
   LOG_INF("Entering STM32L476 Stop 2 low-power mode for %u seconds (RTC Wakeup Timer)...", seconds);
   const uint64_t t_pre = k_uptime_get();
@@ -1987,11 +1989,13 @@ int recorder_sleep(uint32_t seconds, uint32_t *wake_recovery_us) {
    * 12. Wake external PSRAM and verify SPI/QPI interface ID */
   int psram_wake_rc = psram_wake();
   if (psram_wake_rc != 0) {
+    battery_monitor_resume();
     LOG_ERR("recorder_sleep: PSRAM wake failed or ID mismatch (%d)", psram_wake_rc);
     s_power_state = REC_PWR_ACTIVE;
     return psram_wake_rc;
   }
   int post_wake_rc = post_wake_check();
+  battery_monitor_resume();
   if (post_wake_rc != 0) {
     LOG_ERR("recorder_sleep: post_wake_check failed (%d)", post_wake_rc);
   }

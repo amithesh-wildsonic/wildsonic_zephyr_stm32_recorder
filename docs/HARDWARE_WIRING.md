@@ -2,6 +2,35 @@
 
 This document provides detailed electrical wiring specifications, pin assignments, signal characteristics, and physical interface considerations for the WildSonic STM32L476RG Audio Recorder.
 
+## BQ34110 Battery Gauge (External Wiring Required)
+
+The firmware configures the NUCLEO-L476RG I2C1 controller for standard-mode
+100 kHz on PB8/PB9 (AF4), with the BQ34110 at 7-bit address `0x55`.
+
+| BQ34110 signal | NUCLEO-L476RG connection | Notes |
+|---|---|---|
+| SDA | D14 / CN5-9 / PB9 | I2C1 SDA, AF4 |
+| SCL | D15 / CN5-10 / PB8 | I2C1 SCL, AF4 |
+| GND | GND | Common ground required |
+| VCC | A compatible regulated supply | Check the actual gauge module and BQ34110 reference design before wiring. Do not infer this from the board's 3V3 header. |
+| BAT / battery sense | Battery pack per the BQ34110 reference design | This is a gauge connection; do not connect the pack directly to an STM32 GPIO or ADC. |
+
+PB8/PB9 are not used by the audio, USART1 BLE, SDMMC, or documented optional
+PSRAM pin maps. Zephyr's NUCLEO-L476RG DTS already defines the I2C1 PB8/PB9
+AF4 pinctrl. The ST board documentation maps PB8/PB9 to the D15/D14 headers.
+This firmware uses those digital header pins; the A4/A5 solder-bridge option is
+not needed.
+
+The NUCLEO alone does not include the external BQ34110 gauge. The project's
+available wiring documents do not establish the gauge module's supply, BAT
+input circuit, pull-up resistors, or whether its supply remains on during Stop 2.
+Before connecting hardware, inspect the actual gauge module schematic and
+measure/confirm existing SDA/SCL pull-ups. If absent, fit pull-ups to the
+compatible logic rail according to the BQ34110 electrical requirements and bus
+capacitance; do not add parallel pull-ups without checking their combined
+resistance. Gauge presence, pack configuration, and Stop 2 power retention have
+not been hardware-validated.
+
 ---
 
 ## 1. Development Platform Overview

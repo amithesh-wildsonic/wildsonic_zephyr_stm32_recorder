@@ -10,6 +10,7 @@
 #include "rtc_calendar.h"
 #include "scheduler.h"
 #include "scheduler_retention.h"
+#include "battery_monitor.h"
 
 #include <zephyr/drivers/uart.h>
 #include <zephyr/fs/fs.h>
@@ -1043,6 +1044,8 @@ void ble_comm_send_dev_info(void) {
 
   struct wildsonic_config *cfg = console_get_config();
   struct app_settings *settings = main_get_settings();
+  struct battery_status battery;
+  battery_monitor_get_status(&battery);
   uint32_t sleep_sec = cfg->sleep_pause_interval
                            ? cfg->sleep_pause_interval
                            : (settings ? settings->sleep_seconds : 60);
@@ -1077,8 +1080,40 @@ void ble_comm_send_dev_info(void) {
   ble_comm_printf("FLDR %s\r\n", fldr_str);
 
   /* 5. Power management status */
-  ble_comm_printf("VBATT N/A, CBATT N/A, REMBATT N/A\r\n");
-  ble_comm_printf("FULLBATT N/A, REMTIME N/A, AVGPWR N/A\r\n");
+  if (battery.valid_measurement && (battery.valid_fields & BATTERY_VALID_VOLTAGE)) {
+    ble_comm_printf("VBATT %u", battery.voltage_mv);
+  } else {
+    ble_comm_printf("VBATT N/A");
+  }
+  ble_comm_printf(", ");
+  if (battery.valid_measurement && (battery.valid_fields & BATTERY_VALID_CURRENT)) {
+    ble_comm_printf("CBATT %d", battery.current_ma);
+  } else {
+    ble_comm_printf("CBATT N/A");
+  }
+  ble_comm_printf(", ");
+  if (battery.valid_measurement && (battery.valid_fields & BATTERY_VALID_REMAINING_CAPACITY)) {
+    ble_comm_printf("REMBATT %u\r\n", battery.remaining_capacity_mah);
+  } else {
+    ble_comm_printf("REMBATT N/A\r\n");
+  }
+  if (battery.valid_measurement && (battery.valid_fields & BATTERY_VALID_FULL_CAPACITY)) {
+    ble_comm_printf("FULLBATT %u", battery.full_charge_capacity_mah);
+  } else {
+    ble_comm_printf("FULLBATT N/A");
+  }
+  ble_comm_printf(", ");
+  if (battery.valid_measurement && (battery.valid_fields & BATTERY_VALID_TIME_TO_EMPTY)) {
+    ble_comm_printf("REMTIME %u", battery.time_to_empty_seconds);
+  } else {
+    ble_comm_printf("REMTIME N/A");
+  }
+  ble_comm_printf(", ");
+  if (battery.valid_measurement && (battery.valid_fields & BATTERY_VALID_AVERAGE_POWER)) {
+    ble_comm_printf("AVGPWR %d\r\n", battery.average_power_mw);
+  } else {
+    ble_comm_printf("AVGPWR N/A\r\n");
+  }
   ble_comm_printf("NBAT 1\r\n");
 
   /* 6. Time and schedule status with local timezone offset */
@@ -1189,6 +1224,8 @@ void ble_comm_send_status_info(void) {
   }
 
   uint64_t sd_used = 0, sd_total = 0;
+  struct battery_status battery;
+  battery_monitor_get_status(&battery);
   struct fs_statvfs stat;
   if (fs_statvfs("/SD:", &stat) == 0) {
     sd_total = (uint64_t)stat.f_blocks * (uint64_t)stat.f_frsize;
@@ -1199,9 +1236,40 @@ void ble_comm_send_status_info(void) {
                   (unsigned long long)sd_total);
 
 
-  ble_comm_printf("VBATT N/A, CBATT N/A, REMBATT N/A\r\n");
-
-  ble_comm_printf("FULLBATT N/A, REMTIME N/A, AVGPWR N/A\r\n");
+  if (battery.valid_measurement && (battery.valid_fields & BATTERY_VALID_VOLTAGE)) {
+    ble_comm_printf("VBATT %u", battery.voltage_mv);
+  } else {
+    ble_comm_printf("VBATT N/A");
+  }
+  ble_comm_printf(", ");
+  if (battery.valid_measurement && (battery.valid_fields & BATTERY_VALID_CURRENT)) {
+    ble_comm_printf("CBATT %d", battery.current_ma);
+  } else {
+    ble_comm_printf("CBATT N/A");
+  }
+  ble_comm_printf(", ");
+  if (battery.valid_measurement && (battery.valid_fields & BATTERY_VALID_REMAINING_CAPACITY)) {
+    ble_comm_printf("REMBATT %u\r\n", battery.remaining_capacity_mah);
+  } else {
+    ble_comm_printf("REMBATT N/A\r\n");
+  }
+  if (battery.valid_measurement && (battery.valid_fields & BATTERY_VALID_FULL_CAPACITY)) {
+    ble_comm_printf("FULLBATT %u", battery.full_charge_capacity_mah);
+  } else {
+    ble_comm_printf("FULLBATT N/A");
+  }
+  ble_comm_printf(", ");
+  if (battery.valid_measurement && (battery.valid_fields & BATTERY_VALID_TIME_TO_EMPTY)) {
+    ble_comm_printf("REMTIME %u", battery.time_to_empty_seconds);
+  } else {
+    ble_comm_printf("REMTIME N/A");
+  }
+  ble_comm_printf(", ");
+  if (battery.valid_measurement && (battery.valid_fields & BATTERY_VALID_AVERAGE_POWER)) {
+    ble_comm_printf("AVGPWR %d\r\n", battery.average_power_mw);
+  } else {
+    ble_comm_printf("AVGPWR N/A\r\n");
+  }
 
 
   /* Terminating line */

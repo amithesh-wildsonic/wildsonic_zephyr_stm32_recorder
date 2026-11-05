@@ -1,0 +1,9 @@
+description: Texas Instruments BQ34110 battery fuel gauge
+
+compatible: "ti,bq34110"
+
+include: i2c-device.yaml
+
+properties:
+  reg:
+    required: true

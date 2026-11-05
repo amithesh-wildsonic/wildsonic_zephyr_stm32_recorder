@@ -19,6 +19,9 @@ else()
   message(WARNING "No SD overlay ${SD_OVERLAY}; add one or define the 'SD' disk yourself")
 endif()
 
+# Add application-local devicetree bindings (including the BQ34110 node).
+list(APPEND DTS_ROOT ${CMAKE_CURRENT_SOURCE_DIR})
+
 find_package(Zephyr REQUIRED HINTS $ENV{ZEPHYR_BASE})
 project(wildsonic_stm32_recorder)
 
@@ -50,6 +53,7 @@ else()
     src/scheduler.c
     src/console.c
     src/config_store.c
+    src/battery_monitor.c
     src/led_indicator.c
     src/ble_comm.c
     src/scheduler_retention.c

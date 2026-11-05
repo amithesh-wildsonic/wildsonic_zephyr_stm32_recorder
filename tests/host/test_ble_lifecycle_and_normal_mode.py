@@ -368,9 +368,14 @@ def test_get_dev_info_protocol_compatibility():
     assert 'ble_comm_printf("MIC ANALOG\\r\\n");' in dev_info_fn
     assert "SPH0645" not in dev_info_fn
 
-    # Explicit N/A telemetry requirement
-    assert 'VBATT N/A, CBATT N/A, REMBATT N/A' in dev_info_fn
-    assert 'FULLBATT N/A, REMTIME N/A, AVGPWR N/A' in dev_info_fn
+    # Battery fields use the latest valid snapshot and preserve N/A per field.
+    assert 'battery_monitor_get_status(&battery);' in dev_info_fn
+    assert '"VBATT %u"' in dev_info_fn and '"VBATT N/A"' in dev_info_fn
+    assert '"CBATT %d"' in dev_info_fn and '"CBATT N/A"' in dev_info_fn
+    assert '"REMBATT %u\\r\\n"' in dev_info_fn and '"REMBATT N/A\\r\\n"' in dev_info_fn
+    assert '"FULLBATT %u"' in dev_info_fn and '"FULLBATT N/A"' in dev_info_fn
+    assert '"REMTIME %u"' in dev_info_fn and '"REMTIME N/A"' in dev_info_fn
+    assert '"AVGPWR %d\\r\\n"' in dev_info_fn and '"AVGPWR N/A\\r\\n"' in dev_info_fn
     assert 'BATTCAP 0' in dev_info_fn
 
     # RTC fallback to N/A if invalid
@@ -394,8 +399,13 @@ def test_get_status_info_protocol_compatibility():
     status_fn = c_src[status_pos:c_src.find("int ble_comm_feed_rx_bytes", status_pos)]
 
     assert 'SDUSED %llu, SDCAP %llu' in status_fn
-    assert 'VBATT N/A, CBATT N/A, REMBATT N/A' in status_fn
-    assert 'FULLBATT N/A, REMTIME N/A, AVGPWR N/A' in status_fn
+    assert 'battery_monitor_get_status(&battery);' in status_fn
+    assert '"VBATT %u"' in status_fn and '"VBATT N/A"' in status_fn
+    assert '"CBATT %d"' in status_fn and '"CBATT N/A"' in status_fn
+    assert '"REMBATT %u\\r\\n"' in status_fn and '"REMBATT N/A\\r\\n"' in status_fn
+    assert '"FULLBATT %u"' in status_fn and '"FULLBATT N/A"' in status_fn
+    assert '"REMTIME %u"' in status_fn and '"REMTIME N/A"' in status_fn
+    assert '"AVGPWR %d\\r\\n"' in status_fn and '"AVGPWR N/A\\r\\n"' in status_fn
     assert 'TEMP 0.00, HUMID 0.00' in status_fn
 
     # Mutex protection

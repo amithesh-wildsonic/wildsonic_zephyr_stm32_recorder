@@ -33,6 +33,7 @@
 #include "psram_staging.h"
 #include "recorder.h"
 #include "rtc_calendar.h"
+#include "battery_monitor.h"
 #include "rtc_sleep.h"
 #include "scheduler.h"
 #include "main.h"
@@ -1953,6 +1954,11 @@ int main(void) {
   } else {
     LOG_ERR("RTC calendar initialization failed: %d", rtc_cal_rc);
   }
+
+  /* Battery polling is asynchronous and starts independently of the audio
+   * acquisition and SDMMC writer paths. A missing gauge does not block boot.
+   */
+  (void)battery_monitor_init();
 
 #ifdef CONFIG_PSRAM_TEST_ENABLE
   /* 1. Independent External PSRAM Bring-up & Multi-Pass Memory Test */

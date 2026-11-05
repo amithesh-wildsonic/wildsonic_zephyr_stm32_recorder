@@ -6,6 +6,26 @@ This document details the software architecture, real-time concurrency model, me
 
 ## 1. System Architecture Overview
 
+### Battery monitoring
+
+The battery monitor is an asynchronous Zephyr delayed-work client of I2C1. The
+NUCLEO-L476RG board pinctrl supplies AF4 on PB8/PB9; the application overlay
+sets standard-mode 100 kHz and describes the external BQ34110 at 7-bit address
+`0x55`. It reads the eight standard-command words at `0x08`, `0x0C`, `0x10`,
+`0x12`, `0x14`, `0x16`, `0x24`, and `0x28` every 10 seconds. SMBus word data
+is decoded little-endian with a bounded 100 ms I2C transfer timeout; current
+values are signed, time-to-empty minutes are converted to seconds, and
+temperature in 0.1 K is converted to integer °C.
+
+The work item publishes a mutex-protected snapshot with independent per-field
+validity. Failed reads retain last-known numeric storage but clear freshness
+validity for that field, so BLE reports `N/A` instead of stale data. The work
+item is synchronously canceled before Stop 2 and restarted after wake. A missing
+gauge does not block boot. Pack cell multiplication and low-battery actions are
+not enabled because the target pack, gauge configuration, and thresholds have
+not been validated. The BQ34110 external module, supply, BAT-sense circuit,
+pull-ups, and sleep power retention remain hardware hookup dependencies.
+
 The firmware is designed around a multi-threaded, zero-copy producer-consumer model running on **Zephyr RTOS v4.5.0-rc2**.
 
 ```
