@@ -2428,6 +2428,17 @@ static int console_process_line_internal(char *cmd_line, bool from_ble, char *ou
 		out_resp[0] = '\0';
 	}
 
+#if defined(CONFIG_WILDSONIC_TEST_BUILD)
+	if (strncasecmp(p, "TEST CONTINUE", 13) == 0 &&
+	    (p[13] == '\0' || isspace((unsigned char)p[13]))) {
+		main_test_gate_continue();
+		if (out_resp && out_resp_size > 0) {
+			snprintf(out_resp, out_resp_size, "OK");
+		}
+		return 0;
+	}
+#endif
+
 	if (strncasecmp(p, "BITS", 4) == 0 && (p[4] == ' ' || p[4] == '\0' || p[4] == '=')) {
 		const char *arg = p + 4;
 		while (*arg == ' ' || *arg == '=') arg++;

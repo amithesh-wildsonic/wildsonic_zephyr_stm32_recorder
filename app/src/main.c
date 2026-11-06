@@ -1359,6 +1359,11 @@ struct recorder_request {
 static struct recorder_request s_rec_req;
 static struct k_sem s_rec_trigger_sem;
 static struct k_sem s_rec_done_sem;
+#if defined(CONFIG_WILDSONIC_TEST_BUILD)
+/* Host-controlled gate for deterministic automated multi-profile tests. */
+static struct k_sem s_test_host_gate_sem;
+static bool s_test_host_gate_initialized;
+#endif
 static atomic_t s_rec_busy = ATOMIC_INIT(0);
 static int s_rec_last_result = 0;
 static struct rec_stats s_rec_last_stats;
@@ -1464,6 +1469,11 @@ void main_set_reboot_pending(bool pending) {
   atomic_set(&s_reboot_pending, pending ? 1 : 0);
   if (pending) {
     atomic_set(&s_schedule_paused, 1);
+#if defined(CONFIG_WILDSONIC_TEST_BUILD)
+    if (s_test_host_gate_initialized) {
+      k_sem_give(&s_test_host_gate_sem);
+    }
+#endif
   }
 }
 
@@ -1542,6 +1552,16 @@ static void dispatch_recording_session(const struct schedule_interval *interval,
   printk("  Storage Destination   : SDMMC (/SD:)\n");
   printk("  Control               : Asynchronous console active; type commands or 'stop'\n");
   printk("=========================================================================\n");
+#endif
+
+#if defined(CONFIG_WILDSONIC_TEST_BUILD)
+  /* Hold the scheduler here so the PC test bench can configure/read back the next profile. */
+  printk("[TEST] HOST_GATE_WAIT: cycle=%u\n", s_schedule_cycle);
+  k_sem_take(&s_test_host_gate_sem, K_FOREVER);
+  printk("[TEST] HOST_GATE_RELEASED: cycle=%u\n", s_schedule_cycle);
+  if (main_is_reboot_pending() || recorder_is_abort_requested()) {
+    return;
+  }
 #endif
 
   /* Dispatch autonomous recording to recorder_thread without blocking console REPL */
@@ -1717,6 +1737,12 @@ static void scheduler_thread_fn(void *p1, void *p2, void *p3) {
 /* ==============================================================================
  * Bridge and Dispatch Functions for Console & Test Subsystems
  * ============================================================================== */
+
+#if defined(CONFIG_WILDSONIC_TEST_BUILD)
+void main_test_gate_continue(void) {
+  k_sem_give(&s_test_host_gate_sem);
+}
+#endif
 
 struct app_settings *main_get_settings(void) {
   return &settings;
@@ -2136,6 +2162,10 @@ int main(void) {
 
   k_sem_init(&s_rec_trigger_sem, 0, 1);
   k_sem_init(&s_rec_done_sem, 0, 1);
+#if defined(CONFIG_WILDSONIC_TEST_BUILD)
+  k_sem_init(&s_test_host_gate_sem, 0, 1);
+  s_test_host_gate_initialized = true;
+#endif
 
   recorder_tid = k_thread_create(
       &recorder_thread_data,

@@ -31,6 +31,8 @@
 #include <stdlib.h>
 #include <string.h>
 #include <strings.h>
+#include <zephyr/devicetree.h>
+#include <zephyr/drivers/gpio.h>
 #include <zephyr/fs/fs.h>
 #include <zephyr/kernel.h>
 #include <zephyr/logging/log.h>
@@ -100,6 +102,87 @@ static void recorder_apply_sdmmc_clock(void) {
   LOG_INF("SDMMC hardware clock: %u Hz (CLKDIV=%u, CLKCR=0x%08X, bus=%s)",
           clk_hz, clkdiv, clkcr, (clkcr & (1U << 11)) ? "4-bit" : "1-bit");
 #endif
+}
+
+static K_MUTEX_DEFINE(s_failure_diag_mutex);
+
+static void recorder_serialized_failure_dump(const char *stage_name,
+                                            int err_code,
+                                            uint64_t file_offset,
+                                            uint32_t byte_count) {
+  k_mutex_lock(&s_failure_diag_mutex, K_FOREVER);
+  printk("\n[STAGE_DIAG] Stage: %s | Error: %d | Offset: %llu B | Count: %u B\n",
+         stage_name, err_code, (unsigned long long)file_offset, byte_count);
+#if defined(CONFIG_SOC_SERIES_STM32L4X)
+  uint32_t sta = SDMMC1->STA;
+  uint32_t dcount = SDMMC1->DCOUNT;
+  uint32_t dctrl = SDMMC1->DCTRL;
+  uint32_t clkcr = SDMMC1->CLKCR;
+  uint32_t clk_div = clkcr & SDMMC_CLKCR_CLKDIV_Msk;
+  printk("  [SDMMC_HW] STA=0x%08X | DCOUNT=%u | DCTRL=0x%08X | CLKCR=0x%08X (clk_div=%u)\n",
+         (unsigned int)sta, (unsigned int)dcount, (unsigned int)dctrl,
+         (unsigned int)clkcr, (unsigned int)clk_div);
+#endif
+  k_mutex_unlock(&s_failure_diag_mutex);
+}
+
+static bool recorder_sdmmc_retryable_error(int err_code) {
+  if (err_code == -EIO || err_code == -ETIMEDOUT || err_code == -EBUSY) {
+    return true;
+  }
+  return false;
+}
+
+static void recorder_sdmmc_cmd12_cmd13_status(void) {
+#if defined(CONFIG_SOC_SERIES_STM32L4X)
+  SDMMC1->ARG = 0U;
+  SDMMC1->CMD = (12U | (1U << 10));
+  while ((SDMMC1->STA & SDMMC_STA_CMDACT) != 0U) {
+    k_busy_wait(10);
+  }
+
+  SDMMC1->ARG = 0U;
+  SDMMC1->CMD = (13U | (1U << 10) | (1U << 6));
+  while ((SDMMC1->STA & SDMMC_STA_CMDACT) != 0U) {
+    k_busy_wait(10);
+  }
+
+  if (SDMMC1->STA & (SDMMC_STA_CCRCFAIL | SDMMC_STA_DCRCFAIL | SDMMC_STA_CTIMEOUT | SDMMC_STA_DTIMEOUT)) {
+    LOG_WRN("SDMMC CMD12/CMD13 status check saw CRC/timeout flags: STA=0x%08X",
+            (unsigned int)SDMMC1->STA);
+  }
+#endif
+}
+
+static int recorder_sd_write_with_retry(struct fs_file_t *fp,
+                                       const void *data,
+                                       size_t length) {
+  uint32_t attempts = 0;
+  size_t pending = length;
+  const uint8_t *ptr = (const uint8_t *)data;
+
+  while (pending > 0) {
+    ssize_t w = fs_write(fp, ptr, pending);
+    if (w >= 0) {
+      ptr += (size_t)w;
+      pending -= (size_t)w;
+      if (pending == 0) {
+        return 0;
+      }
+      continue;
+    }
+
+    if (!recorder_sdmmc_retryable_error((int)w) || attempts >= 3U) {
+      return (int)w;
+    }
+
+    recorder_sdmmc_cmd12_cmd13_status();
+    recorder_serialized_failure_dump("FS_WRITE_RETRY", (int)w, 0, (uint32_t)length);
+    attempts++;
+    k_busy_wait(2000U);
+  }
+
+  return 0;
 }
 
 #define SAMPLE_BYTES (CONFIG_AUDIO_SAMPLE_BITS / 8)
@@ -197,10 +280,9 @@ static inline enum buf_owner_state recorder_buf_get_state(uint8_t id) {
 }
 
 #define SD_WRITER_STACK_SIZE 4096
-/* SD writer runs at preemptive priority 3 (below real-time capture priority 0 and
- * recorder/DSP/PSRAM consumer priority 1, ahead of background tasks) */
+/* Keep PSRAM reader ahead of the SD writer so ping-pong overlap remains active. */
+#define PSRAM_READER_PRIORITY 2
 #define SD_WRITER_PRIORITY 3
-#define PSRAM_READER_PRIORITY 3
 
 K_THREAD_STACK_DEFINE(sd_writer_stack, SD_WRITER_STACK_SIZE);
 static struct k_thread sd_writer_thread_data;
@@ -243,20 +325,8 @@ static int sd_write_all(struct fs_file_t *fp, const void *data, size_t length) {
   if (!fp || !data) {
     return -EINVAL;
   }
-  const uint8_t *ptr = (const uint8_t *)data;
-  size_t remaining = length;
-  while (remaining > 0) {
-    ssize_t w = fs_write(fp, ptr, remaining);
-    if (w < 0) {
-      return (int)w;
-    }
-    if (w == 0) {
-      return -ENOSPC;
-    }
-    ptr += (size_t)w;
-    remaining -= (size_t)w;
-  }
-  return 0;
+
+  return recorder_sd_write_with_retry(fp, data, length);
 }
 
 static struct k_sem s_reader_start_sem;
@@ -1272,25 +1342,66 @@ int recorder_storage_recover(void) {
   if (recorder_is_active()) {
     return -EBUSY;
   }
+
   s_storage_recovering = true;
+
+  int ret = 0;
+  int status = DISK_STATUS_OK;
+  for (int i = 0; i < 4; i++) {
+    ret = disk_access_ioctl("SD", DISK_IOCTL_CTRL_DEINIT, NULL);
+    if (ret == 0) {
+      ret = disk_access_ioctl("SD", DISK_IOCTL_GET_STATUS, &status);
+      if (ret == 0 && status != DISK_STATUS_OK) {
+        break;
+      }
+    }
+    k_sleep(K_MSEC(10));
+  }
+
   if (mounted) {
-    int ret = fs_unmount(&mp);
+    ret = fs_unmount(&mp);
     if (ret != 0) {
       LOG_WRN("Storage recovery: filesystem unmount returned %d; proceeding with re-init", ret);
     }
     mounted = false;
   }
 
-  /* FatFs unmount powers the disk off through CTRL_DEINIT. Reinitialize the
-   * disk before mounting the volume again; do not retry file operations on
-   * the stale mounted filesystem after an SDMMC timeout. */
-  int ret = disk_access_init("SD");
+#if defined(CONFIG_WILDSONIC_SD_CARD_POWER_GPIO)
+  const struct gpio_dt_spec sd_pwr = GPIO_DT_SPEC_GET_OR(DT_ALIAS(sdcard_pwr), gpios, {0});
+  if (sd_pwr.port != NULL) {
+    gpio_pin_configure(sd_pwr.port, sd_pwr.pin, GPIO_OUTPUT_ACTIVE | GPIO_OUTPUT_LOW);
+    gpio_pin_set(sd_pwr.port, sd_pwr.pin,
+                 IS_ENABLED(CONFIG_WILDSONIC_SD_CARD_POWER_ACTIVE_LOW) ? 0 : 1);
+    k_sleep(K_MSEC(20));
+    gpio_pin_set(sd_pwr.port, sd_pwr.pin,
+                 IS_ENABLED(CONFIG_WILDSONIC_SD_CARD_POWER_ACTIVE_LOW) ? 1 : 0);
+    k_sleep(K_MSEC(20));
+  }
+#endif
+
+#if defined(CONFIG_SOC_SERIES_STM32L4X)
+  LL_AHB1_GRP1_ForceReset(LL_AHB1_GRP1_PERIPH_SDMMC1);
+  LL_AHB1_GRP1_ReleaseReset(LL_AHB1_GRP1_PERIPH_SDMMC1);
+  k_busy_wait(1500U);
+#endif
+
+  ret = disk_access_init("SD");
   if (ret != 0) {
     LOG_ERR("Storage recovery: SDMMC reinitialization failed: %d", ret);
     s_storage_state = STORAGE_STATE_FAULT;
     s_storage_recovery_result = ret;
     s_storage_recovering = false;
     return ret;
+  }
+
+  status = DISK_STATUS_OK;
+  ret = disk_access_ioctl("SD", DISK_IOCTL_GET_STATUS, &status);
+  if (ret != 0 || status != DISK_STATUS_OK) {
+    LOG_ERR("Storage recovery: SD status check failed: ioctl=%d status=%d", ret, status);
+    s_storage_state = STORAGE_STATE_FAULT;
+    s_storage_recovery_result = ret != 0 ? ret : -EIO;
+    s_storage_recovering = false;
+    return s_storage_recovery_result;
   }
 
   ret = fs_mount(&mp);
@@ -1302,6 +1413,7 @@ int recorder_storage_recover(void) {
     return ret;
   }
   mounted = true;
+
   recorder_apply_sdmmc_clock();
   ret = disk_access_ioctl("SD", DISK_IOCTL_CTRL_DEINIT, NULL);
   if (ret != 0) {
@@ -1316,6 +1428,32 @@ int recorder_storage_recover(void) {
 
   LOG_INF("Storage recovery: SDMMC reinitialized and filesystem remounted");
   return 0;
+}
+
+static int recorder_storage_recover_with_backoff(void) {
+  for (int attempt = 0; attempt < 5; attempt++) {
+    int ret = recorder_storage_recover();
+    if (ret == 0) {
+      return 0;
+    }
+    uint32_t delay_s = (attempt < 3) ? (1U << attempt) : 4U;
+    LOG_WRN("Storage recovery attempt %d/%d failed (%d); retrying in %u s",
+            attempt + 1, 5, ret, delay_s);
+    if (attempt < 4) {
+      k_sleep(K_SECONDS(delay_s));
+    }
+  }
+
+  if (psram_staging_is_active()) {
+    psram_staging_flush_publish();
+    sd_writer_flush_req = true;
+    k_sem_give(&sd_writer_sem);
+    k_sleep(K_MSEC(200));
+  }
+
+  LOG_ERR("storage unrecoverable: watchdog reset imminent");
+  sys_reboot(SYS_REBOOT_WARM);
+  return -EIO;
 }
 
 static int next_filename(char *name, size_t len) {
@@ -3274,6 +3412,47 @@ int recorder_record_session(uint32_t seconds, uint32_t cycle,
     st.wav_verified = false;
   }
 
+#if defined(CONFIG_WILDSONIC_TEST_BUILD)
+  /* Machine-readable per-session counters for the independent host test bench. */
+  printk("[METRIC] {\"event\":\"record_complete\","
+         "\"sample_rate_hz\":%u,\"bits\":%u,\"channels\":%u,"
+         "\"duration_s\":%u,\"session_elapsed_ms\":%u,"
+         "\"expected_samples\":%llu,\"acquired_samples\":%llu,"
+         "\"processed_samples\":%llu,\"written_samples\":%llu,"
+         "\"lost_samples\":%llu,\"gaps\":%u,"
+         "\"adc_overruns\":%u,\"dma_errors\":%u,\"missed_events\":%u,"
+         "\"dsp_overruns\":%u,\"dsp_avg_us\":%u,\"dsp_worst_us\":%u,"
+         "\"sd_error\":%d,\"sd_write_errors\":%u,"
+         "\"sd_avg_kbps\":%u,\"sd_aggregate_kbps\":%u,\"sd_worst_write_us\":%u,"
+         "\"psram_full_events\":%u,\"queue_high_water\":%u,"
+         "\"pool_high_water\":%u,\"sd_queue_high_water\":%u,"
+         "\"dma_interval_max_us\":%u,\"blocks_dropped\":%u,"
+         "\"dma_dropped_blocks\":%u,\"sd_failed_samples\":%llu,"
+         "\"file_size_bytes\":%llu,\"wav_verified\":%s,"
+         "\"adc_dma_recovery_attempts\":%u,\"adc_dma_recovery_failures\":%u,"
+         "\"rtc_time_valid\":%s,\"psram_used\":%s,\"pipeline_mode\":%u}\n",
+         st.measured_sample_rate ? st.measured_sample_rate : st.sample_rate,
+         st.sample_bits, st.channels, st.elapsed_ms / 1000U, st.elapsed_ms,
+         (unsigned long long)st.expected_samples,
+         (unsigned long long)st.samples_acquired,
+         (unsigned long long)st.processed_samples,
+         (unsigned long long)st.samples_written,
+         (unsigned long long)total_active_samples_lost, s_session_gap_count,
+         st.adc_overruns, st.dma_errors, st.acquisition_events_missed,
+         st.dsp_overruns, st.dsp_avg_us, st.dsp_worst_us,
+         st.sd_write_error, st.sd_write_error == 0 ? 0U : 1U,
+         st.sd_active_throughput_kb_s, st.sd_aggregate_throughput_kb_s,
+         st.worst_write_us, st.psram_full_events, st.queue_high_water,
+         st.pool_high_water, st.sd_queue_high_water, st.dma_interval_max_us,
+         st.blocks_dropped, st.dma_dropped_blocks,
+         (unsigned long long)st.sd_failed_samples,
+         (unsigned long long)st.file_size_bytes,
+         st.wav_verified ? "true" : "false",
+         st.adc_dma_recovery_attempts, st.adc_dma_recovery_failures,
+         st.rtc_time_valid ? "true" : "false",
+         st.psram_used ? "true" : "false", st.pipeline_mode);
+#endif
+
   if (out) {
     *out = st;
   }
@@ -3300,7 +3479,7 @@ int recorder_record_session(uint32_t seconds, uint32_t cycle,
     if (storage_error == -EIO || storage_error == -ETIMEDOUT ||
         storage_error == -EBUSY) {
       st.sd_recovery_attempts++;
-      s_storage_recovery_result = recorder_storage_recover();
+      s_storage_recovery_result = recorder_storage_recover_with_backoff();
       st.sd_recovery_result = s_storage_recovery_result;
       if (s_storage_recovery_result != 0) {
         LOG_ERR("Storage recovery failed: %d", s_storage_recovery_result);

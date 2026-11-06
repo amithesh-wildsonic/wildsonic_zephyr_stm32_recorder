@@ -205,6 +205,22 @@ config WILDSONIC_SDMMC_CLK_DIV
 	  clk_div = 2: 12 MHz (6 MB/s bus bandwidth, high-speed)
 	  clk_div = 6: 6 MHz (3 MB/s bus bandwidth, safe jumper-wire default)
 
+config WILDSONIC_SD_CARD_POWER_GPIO
+	bool "Optional SD card power-cycle GPIO"
+	default n
+	help
+	  Enables a GPIO-controlled card power cycle during SD storage recovery.
+	  If a matching board alias or devicetree GPIO is present, the controller
+	  will drive it low for a brief reset interval before reinitializing SD.
+
+config WILDSONIC_SD_CARD_POWER_ACTIVE_LOW
+	bool "SD card power is active-low"
+	default n
+	depends on WILDSONIC_SD_CARD_POWER_GPIO
+	help
+	  Invert the generated power-control polarity for cards that assert reset
+	  when GPIO is low.
+
 config PSRAM_TEST_ENABLE
     bool "Run external ISSI IS66WVS4M8 PSRAM detection and memory test on boot"
     default y
