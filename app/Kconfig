@@ -324,6 +324,63 @@ config FORMAT_EXPECTED_SECTOR_SIZE
 
 endmenu
 
+menu "WildSonic Build Profiles"
+
+choice WILDSONIC_BUILD_PROFILE
+	prompt "WildSonic Build Profile"
+	default WILDSONIC_PROFILE_PRODUCTION
+
+config WILDSONIC_PROFILE_PRODUCTION
+	bool "PRODUCTION build profile"
+	help
+	  Production profile for wildlife audio recorder: minimal logging, no test
+	  markers, no benchmarks, watchdog enabled, LED quiet during capture.
+
+config WILDSONIC_PROFILE_TEST
+	bool "TEST build profile"
+	select WILDSONIC_TEST_MARKERS
+	select WILDSONIC_TEST_BUILD
+	help
+	  Test build profile: test markers enabled for automated host test suites
+	  and per-batch SD timing reports enabled, matching production code paths.
+
+config WILDSONIC_PROFILE_DEV
+	bool "DEV build profile"
+	select WILDSONIC_TEST_MARKERS
+	select WILDSONIC_VERBOSE_LOGS
+	select WILDSONIC_BENCHMARKS
+	help
+	  Development profile: verbose logs, thread analyzer, and benchmarks enabled.
+
+endchoice
+
+config WILDSONIC_TEST_MARKERS
+	bool "Emit [TEST] and test harness markers"
+	default n
+	help
+	  Enables [TEST], [PHASE], and automated test bench marker output. Must be
+	  disabled in production builds.
+
+config WILDSONIC_BENCHMARKS
+	bool "Enable hardware benchmarks (psram bench, sdbench)"
+	default n
+	help
+	  Enables console benchmark commands and diagnostic testing routines.
+
+config WILDSONIC_WATCHDOG
+	bool "Enable hardware watchdog (IWDG) with Stop mode safety"
+	default y
+	help
+	  Enables hardware IWDG watchdog monitoring with Stop 2 freeze support.
+
+config WILDSONIC_SESSION_LOG
+	bool "Enable SD session.log sidecar recording"
+	default y
+	help
+	  When enabled, writes session summary and telemetry to session.log on SD.
+
+endmenu
+
 config WILDSONIC_VERBOSE_LOGS
 	bool "Enable verbose development and diagnostic console logs"
 	default n
@@ -351,6 +408,20 @@ config WILDSONIC_SD_FAULT_INJECT
 	  F3: Return -9 for every FatFs call until a full re-init happens.
 	  F4: Fail all writes permanently (card dead).
 	  F5: Fail mount for M attempts after wake.
+
+config WAKE_FOR_SERVICE_GPIO
+	bool "Optional technician wake on user button (B1 on PC13)"
+	default n
+	help
+	  When enabled, allows a technician to interrupt long Stop 2 standby
+	  by pressing user button B1 (PC13) via EXTI 13.
+
+config SD_POWER_GPIO
+	bool "Optional SD card VDD load-switch power control"
+	default n
+	help
+	  When enabled, cycles card power via the 'sd-power' devicetree alias
+	  during hardware reset recovery (100 ms off, 10 ms wait after power on).
 
 config LOG_DEFAULT_LEVEL_WRN
 	bool "Default log level WARNING"

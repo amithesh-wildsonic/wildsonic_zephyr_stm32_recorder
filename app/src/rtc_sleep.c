@@ -1,5 +1,7 @@
 /* SPDX-License-Identifier: Apache-2.0 */
 #include "rtc_sleep.h"
+#include "rtc_calendar.h"
+#include "scheduler.h"
 #include "recorder.h"
 #include "psram_is66wvs.h"
 #include "console.h"
@@ -380,6 +382,42 @@ int rtc_sleep_enter_stop2(uint32_t seconds)
 	uint32_t saved_exti_imr2 = EXTI->IMR2;
 	uint32_t saved_exti_emr2 = EXTI->EMR2;
 
+#if defined(CONFIG_WAKE_FOR_SERVICE_GPIO)
+	/* Configure PC13 (B1 button) for technician service interrupt */
+	LL_APB2_GRP1_EnableClock(LL_APB2_GRP1_PERIPH_SYSCFG);
+	LL_AHB2_GRP1_EnableClock(LL_AHB2_GRP1_PERIPH_GPIOC);
+	LL_GPIO_SetPinMode(GPIOC, LL_GPIO_PIN_13, LL_GPIO_MODE_INPUT);
+	LL_GPIO_SetPinPull(GPIOC, LL_GPIO_PIN_13, LL_GPIO_PULL_NO);
+	LL_SYSCFG_SetEXTISource(LL_SYSCFG_EXTI_PORTC, LL_SYSCFG_EXTI_LINE13);
+
+	/* Enable EXTI Line 20 (RTC Wakeup) and EXTI Line 13 (PC13 User Button / Technician Wake) */
+	EXTI->IMR1 = LL_EXTI_LINE_20 | LL_EXTI_LINE_13;
+	EXTI->EMR1 = 0;
+	EXTI->IMR2 = 0;
+	EXTI->EMR2 = 0;
+	LL_EXTI_EnableRisingTrig_0_31(LL_EXTI_LINE_20);
+	LL_EXTI_ClearFlag_0_31(LL_EXTI_LINE_20);
+	LL_EXTI_EnableFallingTrig_0_31(LL_EXTI_LINE_13);
+	LL_EXTI_ClearFlag_0_31(LL_EXTI_LINE_13);
+
+	/* Save active NVIC interrupt enable configuration */
+	uint32_t saved_nvic_iser[3];
+	saved_nvic_iser[0] = NVIC->ISER[0];
+	saved_nvic_iser[1] = NVIC->ISER[1];
+	saved_nvic_iser[2] = NVIC->ISER[2];
+
+	/* Disable other NVIC interrupts during WFI except RTC_WKUP_IRQn (IRQ 3) and EXTI15_10_IRQn (IRQ 40) */
+	NVIC->ICER[0] = 0xFFFFFFFF & ~(1UL << (RTC_WKUP_IRQn & 0x1F));
+	NVIC->ICER[1] = 0xFFFFFFFF & ~(1UL << ((EXTI15_10_IRQn - 32) & 0x1F));
+	NVIC->ICER[2] = 0xFFFFFFFF;
+
+	NVIC->ISER[0] = (1UL << (RTC_WKUP_IRQn & 0x1F));
+	NVIC->ISER[1] = (1UL << ((EXTI15_10_IRQn - 32) & 0x1F));
+
+	/* Target only RTC_WKUP_IRQn and EXTI15_10_IRQn pending state; do not wipe unrelated peripheral events! */
+	NVIC_ClearPendingIRQ(RTC_WKUP_IRQn);
+	NVIC_ClearPendingIRQ(EXTI15_10_IRQn);
+#else
 	/* Strictly mask all EXTI lines except Line 20 (RTC Wakeup) */
 	EXTI->IMR1 = LL_EXTI_LINE_20;
 	EXTI->EMR1 = 0;
@@ -387,6 +425,10 @@ int rtc_sleep_enter_stop2(uint32_t seconds)
 	EXTI->EMR2 = 0;
 	LL_EXTI_EnableRisingTrig_0_31(LL_EXTI_LINE_20);
 	LL_EXTI_ClearFlag_0_31(LL_EXTI_LINE_20);
+
+	/* User Button EXTI 13 explicitly disabled */
+	LL_EXTI_DisableEvent_0_31(LL_EXTI_LINE_13);
+	LL_EXTI_DisableIT_0_31(LL_EXTI_LINE_13);
 
 	/* Save active NVIC interrupt enable configuration */
 	uint32_t saved_nvic_iser[3];
@@ -403,6 +445,14 @@ int rtc_sleep_enter_stop2(uint32_t seconds)
 
 	/* Target only RTC_WKUP_IRQn pending state; do not wipe unrelated peripheral events! */
 	NVIC_ClearPendingIRQ(RTC_WKUP_IRQn);
+#endif
+
+#if defined(FLASH_OPTR_IWDG_STOP)
+	/* Check if IWDG is configured to freeze in Stop mode */
+	if ((FLASH->OPTR & FLASH_OPTR_IWDG_STOP) == 0) {
+		LOG_WRN("IWDG_STOP option byte is clear: IWDG would continue running in Stop mode");
+	}
+#endif
 
 	/* Suspend SysTick to prevent kernel tick interrupts during Stop 2 */
 	uint32_t saved_systick_ctrl = SysTick->CTRL;
@@ -463,9 +513,16 @@ int rtc_sleep_enter_stop2(uint32_t seconds)
 	 * ENTER STM32L476 STOP 2 LOW-POWER MODE
 	 * =========================================================================
 	 */
+	struct rtc_calendar_time pre_sleep_cal = {0};
+	time_t pre_sleep_epoch = 0;
+	if (rtc_calendar_get(&pre_sleep_cal) == 0 && rtc_calendar_is_valid()) {
+		pre_sleep_epoch = scheduler_calendar_to_epoch(&pre_sleep_cal);
+	}
+
 	__disable_irq();
 	bool pre_wake_event = (LL_RTC_IsActiveFlag_WUT(RTC) != 0) ||
-	                      (NVIC_GetPendingIRQ(RTC_WKUP_IRQn) != 0);
+	                      (NVIC_GetPendingIRQ(RTC_WKUP_IRQn) != 0) ||
+	                      (LL_EXTI_IsActiveFlag_0_31(LL_EXTI_LINE_13) != 0);
 	if (!pre_wake_event) {
 		__DSB();
 		__WFI();
@@ -478,6 +535,7 @@ int rtc_sleep_enter_stop2(uint32_t seconds)
 	 * Inspect hardware status BEFORE enabling interrupts or taking any ISR!
 	 * =========================================================================
 	 */
+	bool exti13_flag = (LL_EXTI_IsActiveFlag_0_31(LL_EXTI_LINE_13) != 0);
 	bool rtc_wut_flag = (LL_RTC_IsActiveFlag_WUT(RTC) != 0);
 	bool exti20_flag = (LL_EXTI_IsActiveFlag_0_31(LL_EXTI_LINE_20) != 0);
 	bool nvic_rtc_flag = (NVIC_GetPendingIRQ(RTC_WKUP_IRQn) != 0);
@@ -497,7 +555,12 @@ int rtc_sleep_enter_stop2(uint32_t seconds)
 
 	/* Determine wake status from snapshotted flags BEFORE enabling interrupts */
 	int wake_rc = 0;
-	if (rtc_wut_flag || exti20_flag || nvic_rtc_flag || pre_wake_event || (last_wake_source == RTC_WAKE_TIMER)) {
+	if (exti13_flag) {
+		LL_EXTI_ClearFlag_0_31(LL_EXTI_LINE_13);
+		last_wake_source = RTC_WAKE_USER_BUTTON;
+		wake_rc = -EINTR;
+		printk("\n[SERVICE WAKE] Stop 2 interrupted by technician button B1 (PC13).\n");
+	} else if (rtc_wut_flag || exti20_flag || nvic_rtc_flag || pre_wake_event || (last_wake_source == RTC_WAKE_TIMER)) {
 		last_wake_source = RTC_WAKE_TIMER;
 		wake_rc = 0;
 	} else {
@@ -519,8 +582,17 @@ int rtc_sleep_enter_stop2(uint32_t seconds)
 	/* Enable interrupts with system clock fully restored to PLL */
 	__enable_irq();
 
-	/* Restore SysTick and compensate kernel uptime ticks (even on unexpected wake to prevent scheduler stall) */
+	/* Restore SysTick and compensate kernel uptime ticks from RTC calendar delta */
 	SysTick->CTRL = saved_systick_ctrl;
+	uint32_t actual_sleep_sec = seconds;
+	struct rtc_calendar_time post_sleep_cal = {0};
+	if (pre_sleep_epoch > 0 && rtc_calendar_get(&post_sleep_cal) == 0 && rtc_calendar_is_valid()) {
+		time_t post_sleep_epoch = scheduler_calendar_to_epoch(&post_sleep_cal);
+		if (post_sleep_epoch >= pre_sleep_epoch) {
+			actual_sleep_sec = (uint32_t)(post_sleep_epoch - pre_sleep_epoch);
+		}
+	}
+	seconds = actual_sleep_sec;
 	if (seconds > 0) {
 		uint64_t elapsed_ticks = (uint64_t)seconds * CONFIG_SYS_CLOCK_TICKS_PER_SEC;
 		while (elapsed_ticks > 0) {

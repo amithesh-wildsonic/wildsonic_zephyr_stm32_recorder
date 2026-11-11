@@ -21,7 +21,7 @@ def generate_test_wav(filepath, sample_rate=192000, bits=32, duration_sec=1.0, f
     byte_rate = sample_rate * block_align
     total_samples = int(sample_rate * duration_sec)
     data_bytes = total_samples * block_align
-    header_bytes = 512
+    header_bytes = 32768
     junk_bytes = header_bytes - 12 - 24 - 8 - 8
 
     # Generate signal
@@ -57,10 +57,10 @@ def generate_test_wav(filepath, sample_rate=192000, bits=32, duration_sec=1.0, f
     else:
         raise ValueError("Unsupported bit depth")
 
-    # Construct 512-byte padded header
-    hdr = bytearray(512)
+    # Construct cluster-aligned padded header
+    hdr = bytearray(header_bytes)
     hdr[0:4] = b"RIFF"
-    struct.pack_into("<I", hdr, 4, (512 - 8) + data_bytes)
+    struct.pack_into("<I", hdr, 4, (header_bytes - 8) + data_bytes)
     hdr[8:12] = b"WAVE"
 
     hdr[12:16] = b"fmt "
@@ -93,7 +93,7 @@ def parse_wav_native(filepath):
 
     filesize = os.path.getsize(filepath)
     with open(filepath, "rb") as f:
-        header = f.read(512)
+        header = f.read(min(32768, filesize))
         assert header[0:4] == b"RIFF", "Invalid RIFF identifier"
         riff_size = struct.unpack_from("<I", header, 4)[0]
         assert header[8:12] == b"WAVE", "Invalid WAVE identifier"
@@ -235,7 +235,7 @@ def run_tests():
         assert meta["fmt"]["bits_per_sample"] == 32
         assert meta["total_frames"] == 960000, f"Expected 960,000 frames, got {meta['total_frames']}"
         assert meta["data_size_bytes"] == 3840000, f"Expected 3,840,000 bytes, got {meta['data_size_bytes']}"
-        assert meta["filesize_bytes"] == 512 + 3840000
+        assert meta["filesize_bytes"] == 32768 + 3840000
         full_blocks = meta["total_frames"] // 2048
         partial_samples = meta["total_frames"] % 2048
         assert full_blocks == 468, f"Expected 468 full blocks, got {full_blocks}"

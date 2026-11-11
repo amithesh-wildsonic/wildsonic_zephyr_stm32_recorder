@@ -28,7 +28,7 @@ BASE_DIR = Path(__file__).resolve().parent.parent.parent
 APP_DIR = BASE_DIR / "app"
 APP_SRC = APP_DIR / "src"
 
-WAV_HEADER_BYTES = 512
+WAV_HEADER_BYTES = 32768
 PSRAM_CAPACITY_BYTES = 1024 * 1024       # 1 MiB
 SD_BATCH_BYTES = 256 * 1024              # 256 KiB
 BLOCK_SAMPLES = 4096
@@ -208,7 +208,7 @@ def test_wav_header_conformance_all_production_formats():
 
     for rate, ch, bits, data_bytes, exp_align, exp_byte_rate in test_cases:
         hdr = build_test_wav_header(rate, ch, bits, data_bytes)
-        assert len(hdr) == 512
+        assert len(hdr) == WAV_HEADER_BYTES
         assert verify_wav_header(hdr, rate, ch, bits, data_bytes)
 
         # Direct unpack verification
@@ -218,7 +218,7 @@ def test_wav_header_conformance_all_production_formats():
 
         assert block_align == exp_align
         assert byte_rate == exp_byte_rate
-        assert riff_size == (512 - 8) + data_bytes
+        assert riff_size == (WAV_HEADER_BYTES - 8) + data_bytes
 
 
 # ==============================================================================
@@ -345,3 +345,31 @@ def test_production_build_hygiene_and_quiet_console():
     # SRAM2 retention section dedicated to audio buffer pool
     assert 'section("SRAM1")' in src_rec
     assert "_k_mem_slab_buf_pool[(NUM_BLOCKS) * ROUND_UP(BLOCK_BYTES, 4)];" in src_rec
+
+
+def test_write_alignment_cluster_boundary_and_junk_chunk():
+    """Verify WAV header is 32768 bytes, audio data starts at 0 mod 64 sectors, writes are count=64."""
+    assert WAV_HEADER_BYTES == 32768
+    hdr = build_test_wav_header(192000, 1, 16, 3840000)
+    assert len(hdr) == 32768
+
+    # data chunk header begins at 32760, data payload begins at 32768
+    assert hdr[32760:32764] == b"data"
+    data_bytes = struct.unpack_from("<I", hdr, 32764)[0]
+    assert data_bytes == 3840000
+
+    # Sector arithmetic: 32768 / 512 = 64 sectors. First data write starts at 64 sectors = 0 mod 64.
+    header_sectors = WAV_HEADER_BYTES // 512
+    assert header_sectors == 64
+    assert header_sectors % 64 == 0
+
+    # 32 KB chunk is exactly 64 sectors
+    chunk_sectors = 32768 // 512
+    assert chunk_sectors == 64
+
+    # JUNK chunk padding
+    junk_len = WAV_HEADER_BYTES - 12 - 24 - 8 - 8
+    assert junk_len == 32716
+    assert hdr[36:40] == b"JUNK"
+    assert struct.unpack_from("<I", hdr, 40)[0] == junk_len
+

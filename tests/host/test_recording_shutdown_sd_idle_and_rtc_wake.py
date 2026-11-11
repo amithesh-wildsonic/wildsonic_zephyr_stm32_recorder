@@ -131,7 +131,7 @@ def test_writer_timeout():
     """Verify bounded writer completion timeout and safe error return on timeout without hanging."""
     code = RECORDER_C.read_text(encoding="utf-8")
     assert "uint32_t completion_timeout_ms = writer_completion_timeout_ms(" in code
-    assert "if (k_sem_take(&sd_writer_done_sem, K_MSEC(completion_timeout_ms)) != 0) {" in code
+    assert "k_sem_take(&sd_writer_done_sem, K_MSEC(wait_slice))" in code
     assert "st.writer_completion_timeouts++;" in code
     assert "return -ETIMEDOUT;" in code
 
@@ -323,4 +323,23 @@ def test_exactly_one_recording_start_per_opportunity():
     assert "s_schedule_cycle++;" in code
     assert "atomic_set(&s_rec_busy, 0);" in code
     assert "k_sem_give(&s_rec_done_sem);" in code
+
+
+def test_one_wake_produces_exactly_one_recording_no_double_trigger():
+    """Verify one wake trigger dispatches exactly one recording and no extra semaphore gives."""
+    code = MAIN_C.read_text(encoding="utf-8")
+
+    # Verify dispatch_recording_session has s_rec_busy guard
+    dispatch_fn = code.split("static void dispatch_recording_session(")[1].split("void main_scheduler_service_step")[0]
+    assert "atomic_get(&s_rec_busy)" in dispatch_fn or "s_rec_busy" in dispatch_fn
+    assert "recorder_is_active()" in dispatch_fn
+
+    # Verify main_scheduler_service_step does not contain redundant k_sem_give(&s_rec_trigger_sem)
+    sched_fn = code.split("void main_scheduler_service_step(void)")[1].split("static void scheduler_thread_fn")[0]
+    assert "k_sem_give(&s_rec_trigger_sem)" not in sched_fn
+
+    # Verify s_schedule_cycle is advanced once per real session
+    rec_fn = code.split("static void recorder_thread_fn(")[1].split("static uint32_t s_sleep_attempt_counter")[0]
+    assert "s_schedule_cycle++;" in rec_fn
+
 

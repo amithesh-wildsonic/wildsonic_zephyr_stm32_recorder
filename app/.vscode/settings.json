@@ -1,6 +1,15 @@
 {
   "zephyr-workbench.build.configurations": [
     {
+      "name": "PRODUCTION",
+      "board": "nucleo_l476rg",
+      "active": "true",
+      "west-flags": [
+        "SD_BUS=sdmmc"
+      ],
+      "default-runner": "stm32cubeprogrammer"
+    },
+    {
       "name": "TEST",
       "board": "nucleo_l476rg",
       "west-flags": [
@@ -13,7 +22,7 @@
       "default-runner": "stm32cubeprogrammer"
     },
     {
-      "name": "PRODUCTION",
+      "name": "primary",
       "board": "nucleo_l476rg",
       "west-flags": [
         "SD_BUS=sdmmc"
@@ -21,7 +30,7 @@
       "default-runner": "stm32cubeprogrammer"
     }
   ],
-  "zephyr-workbench.westWorkspace": "${workspaceFolder}/../../../zephyrproject",
+  "zephyr-workbench.westWorkspace": "${workspaceFolder}/../../../zephyrproject-4.5.0-rc2",
   "zephyr-workbench.toolchain": "zephyr",
   "zephyr-workbench.sdk": "global",
   "zephyr-workbench.intellisense.provider": "cpptools",

@@ -326,8 +326,8 @@ def test_scenario_6_sleep_under_fault_discards_dirty_and_proceeds():
     assert "if (s_storage_state == STORAGE_STATE_FAULT) {" in sleep_fn
     assert "sd_resilient_record_sleep_discard(dirty);" in sleep_fn
     assert "psram_staging_reset();" in sleep_fn
-    # Verify timeout flush deadline is strictly bounded to 3000 ms
-    assert "uint32_t timeout_ms = 3000U;" in sleep_fn
+    # Verify timeout flush deadline is strictly bounded via writer_completion_timeout_ms
+    assert "uint32_t timeout_ms = writer_completion_timeout_ms(" in sleep_fn
 
 # ==============================================================================
 # 7. SCENARIO 7: POST-WAKE MOUNT RETRY (F5)
@@ -398,3 +398,18 @@ def test_fault_injection_isolated_from_production_console():
 
     fault_block = console_c.split("CMD_FAULT")[1].split("};")[0]
     assert "CONFIG_WILDSONIC_SD_FAULT_INJECT" in console_c
+
+
+def test_sd_resilient_hardware_reset_diagnostics_and_power_cycle_gpio():
+    """Verify sd_resilient_hardware_reset prints all 5 reset steps, prefers driver deinit, and supports sd-power."""
+    res_c = (APP_SRC / "sd_resilient.c").read_text(encoding="utf-8")
+    kconfig = (REPO_ROOT / "app" / "Kconfig").read_text(encoding="utf-8")
+
+    assert "config SD_POWER_GPIO" in kconfig
+    assert "Step 1 (CTRL_DEINIT)" in res_c
+    assert "Step 2 (VDD power cycle)" in res_c
+    assert "Step 3 (disk_access_init)" in res_c
+    assert "Step 4 (disk_access_status)" in res_c
+    assert "Step 5 (CLKCR" in res_c
+    assert "DT_ALIAS(sd_power)" in res_c
+

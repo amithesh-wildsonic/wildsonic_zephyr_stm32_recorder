@@ -8,6 +8,8 @@
 #include <zephyr/logging/log.h>
 #include <zephyr/drivers/disk.h>
 #include <zephyr/storage/disk_access.h>
+#include <zephyr/drivers/gpio.h>
+#include <zephyr/devicetree.h>
 
 #if defined(CONFIG_SOC_SERIES_STM32L4X)
 #include <stm32l4xx_ll_bus.h>
@@ -116,44 +118,90 @@ int sd_resilient_init(void) {
   return 0;
 }
 
+#if DT_NODE_EXISTS(DT_ALIAS(sd_power))
+static const struct gpio_dt_spec s_sd_power_gpio =
+    GPIO_DT_SPEC_GET(DT_ALIAS(sd_power), gpios);
+#define HAS_SD_POWER_GPIO 1
+#else
+#define HAS_SD_POWER_GPIO 0
+#endif
+
 /*
  * Hardware Card Reset:
  * Bounded reset sequence:
- * 1. disk_access_ioctl(CTRL_DEINIT) repeatedly until status != OK (max 8)
- * 2. Force reset and release SDMMC1 peripheral in RCC
- * 3. k_msleep(2)
- * 4. disk_access_init("SD_HW")
- * 5. Verify status == OK
+ * 1. disk_access_ioctl(CTRL_DEINIT) to invoke driver's HAL_SD_DeInit and DMA cleanup.
+ * 2. Optional VDD power cycle via sd-power GPIO (100 ms off, 10 ms settle on).
+ * 3. Fallback RCC peripheral reset only if driver deinit failed.
+ * 4. disk_access_init("SD_HW").
+ * 5. Verify disk_access_status == OK and log CLKCR.
+ * Prints the result of every step in the sequence.
  */
 int sd_resilient_hardware_reset(void) {
   int ret = 0;
+  int deinit_rc = -1;
 
+  printk("\n[SD_RESET] Initiating hardware card reset sequence...\n");
+
+  /* Step 1: Prefer driver's own deinit path (HAL_SD_DeInit) */
   for (int i = 0; i < 8; i++) {
-    (void)disk_access_ioctl("SD_HW", DISK_IOCTL_CTRL_DEINIT, NULL);
+    deinit_rc = disk_access_ioctl("SD_HW", DISK_IOCTL_CTRL_DEINIT, NULL);
     if (disk_access_status("SD_HW") != DISK_STATUS_OK) {
       break;
     }
   }
+  int post_deinit_status = disk_access_status("SD_HW");
+  printk("  [SD_RESET] Step 1 (CTRL_DEINIT): rc=%d, status=%d\n", deinit_rc, post_deinit_status);
 
-#if defined(CONFIG_SOC_SERIES_STM32L4X)
-  __HAL_RCC_SDMMC1_FORCE_RESET();
-  __HAL_RCC_SDMMC1_RELEASE_RESET();
-  k_msleep(2);
+  /* Step 2: Optional VDD power cycle via GPIO */
+#if HAS_SD_POWER_GPIO
+  if (device_is_ready(s_sd_power_gpio.port)) {
+    printk("  [SD_RESET] Step 2 (VDD power cycle): OFF for 100 ms...\n");
+    gpio_pin_configure_dt(&s_sd_power_gpio, GPIO_OUTPUT_INACTIVE);
+    k_msleep(100);
+    gpio_pin_set_dt(&s_sd_power_gpio, 1);
+    k_msleep(10);
+    printk("  [SD_RESET] Step 2 (VDD power cycle): ON, settled 10 ms\n");
+  } else {
+    printk("  [SD_RESET] Step 2 (VDD power cycle): GPIO not ready\n");
+  }
 #else
-  k_msleep(2);
+  printk("  [SD_RESET] Step 2 (VDD power cycle): None (alias 'sd-power' not configured)\n");
 #endif
 
+  /* Step 2b: Fallback RCC reset only if driver deinit failed */
+  if (deinit_rc != 0) {
+#if defined(CONFIG_SOC_SERIES_STM32L4X)
+    printk("  [SD_RESET] Step 2b (RCC force-reset): deinit failed (%d), resetting peripheral\n", deinit_rc);
+    __HAL_RCC_SDMMC1_FORCE_RESET();
+    __HAL_RCC_SDMMC1_RELEASE_RESET();
+    k_msleep(2);
+#else
+    k_msleep(2);
+#endif
+  }
+
+  /* Step 3: Driver init */
   ret = disk_access_init("SD_HW");
+  printk("  [SD_RESET] Step 3 (disk_access_init): ret=%d\n", ret);
   if (ret != 0) {
     LOG_WRN("sd_resilient: card re-init failed: %d", ret);
     return ret;
   }
 
+  /* Step 4: Driver status */
   int status = disk_access_status("SD_HW");
+  printk("  [SD_RESET] Step 4 (disk_access_status): status=%d\n", status);
   if (status != DISK_STATUS_OK) {
     LOG_WRN("sd_resilient: card status not OK after re-init: %d", status);
     return -EIO;
   }
+
+  /* Step 5: Clock and bus state */
+  uint32_t clkcr = 0;
+#if defined(CONFIG_SOC_SERIES_STM32L4X)
+  clkcr = (uint32_t)SDMMC1->CLKCR;
+#endif
+  printk("  [SD_RESET] Step 5 (CLKCR after init): 0x%08X\n", (unsigned int)clkcr);
 
   sd_fault_inject_notify_reinit();
   return 0;

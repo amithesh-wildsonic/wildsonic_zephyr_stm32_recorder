@@ -60,6 +60,10 @@ else()
     src/solar_calculator.c
     src/sd_resilient.c
     src/sd_fault_inject.c
+    src/wildsonic_trace.c
+    src/retained_reboot.c
+    src/system_assert.c
+    src/watchdog.c
   )
   target_compile_definitions(app PRIVATE WILDSONIC_GIT_COMMIT=\"${WILDSONIC_GIT_COMMIT}\")
   target_sources_ifdef(CONFIG_WILDSONIC_VERBOSE_LOGS app PRIVATE src/psram_benchmark.c)

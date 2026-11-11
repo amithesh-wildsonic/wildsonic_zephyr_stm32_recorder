@@ -24,7 +24,7 @@ APP_SRC = APP_DIR / "src"
 # ==============================================================================
 
 APB1_CLOCK_HZ = 80_000_000
-WAV_HEADER_BYTES = 512
+WAV_HEADER_BYTES = 32768
 
 
 def calc_tim6_rate(requested_hz: int) -> tuple[int, int, int]:
@@ -273,7 +273,7 @@ def test_32bit_mono_wav_header_and_payload_accounting():
     byte_rate = struct.unpack_from("<I", hdr, 28)[0]
     assert block_align == 4
     assert byte_rate == rate * 4
-    assert len(hdr) == 512
+    assert len(hdr) == WAV_HEADER_BYTES
 
 
 # ==============================================================================

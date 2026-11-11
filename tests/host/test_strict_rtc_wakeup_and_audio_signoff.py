@@ -195,7 +195,7 @@ def test_autonomous_scheduler_enters_stop2_path():
     # Must re-read RTC calendar time upon wake
     assert "rtc_calendar_get(&now_cal)" in fn_body or "rtc_calendar_get(&wake_cal)" in fn_body
     # Must dispatch to recorder_thread without blocking console REPL
-    assert "k_sem_give(&s_rec_trigger_sem)" in fn_body
+    assert "dispatch_recording_session(&interval" in fn_body
 
 
 def test_short_and_long_scheduled_intervals_chunking():

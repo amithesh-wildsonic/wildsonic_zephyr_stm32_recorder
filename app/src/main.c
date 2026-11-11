@@ -1363,6 +1363,7 @@ struct recorder_request {
 static struct recorder_request s_rec_req;
 static struct k_sem s_rec_trigger_sem;
 static struct k_sem s_rec_done_sem;
+K_SEM_DEFINE(s_scheduler_event_sem, 0, 1);
 static atomic_t s_rec_busy = ATOMIC_INIT(0);
 static int s_rec_last_result = 0;
 static struct rec_stats s_rec_last_stats;
@@ -1404,6 +1405,7 @@ static void recorder_thread_fn(void *p1, void *p2, void *p3) {
       printk("[TEST] NEXT_RECORDING_STARTED: session=%u, duration=%u s\n", s_rec_req.cycle, s_rec_req.duration_sec);
     }
 #endif
+    recorder_set_scheduled_start_utc(s_rec_req.start_time_utc);
     s_rec_last_result = recorder_record_session(s_rec_req.duration_sec,
                                                s_rec_req.cycle,
                                                s_rec_req.mode,
@@ -1436,7 +1438,8 @@ static void recorder_thread_fn(void *p1, void *p2, void *p3) {
         s_last_end_time_local = end_utc + s_rec_req.tz_offset;
         s_last_evaluated_window_utc = 0;
         /* Do not update scheduler_retention_save on failed sessions: preserve last successful end */
-        /* Do not increment s_schedule_cycle on failure */
+        /* Increment s_schedule_cycle once per real session */
+        s_schedule_cycle++;
         printk("[SCHEDULER] Session %u failed (%d); recording opportunity skipped, schedule remains active for next window.\n\n> ",
                s_rec_req.cycle, failure);
         atomic_set(&s_schedule_paused, 0);
@@ -1455,6 +1458,7 @@ static void recorder_thread_fn(void *p1, void *p2, void *p3) {
 
     atomic_set(&s_rec_busy, 0);
     k_sem_give(&s_rec_done_sem);
+    k_sem_give(&s_scheduler_event_sem);
   }
 }
 
@@ -1506,8 +1510,11 @@ const char *main_get_shutdown_stage_name(enum system_shutdown_stage stage) {
   }
 }
 
+#define SCHEDULER_MIN_STOP2_SLEEP_SEC 30U
+#define SCHEDULER_WAKE_LEAD_SEC        2U
+
 static void dispatch_recording_session(const struct schedule_interval *interval, int32_t tz_offset) {
-  if (main_is_reboot_pending()) {
+  if (main_is_reboot_pending() || atomic_get(&s_rec_busy) || recorder_is_active()) {
     return;
   }
   struct rtc_calendar_time cur_time;
@@ -1546,6 +1553,7 @@ static void dispatch_recording_session(const struct schedule_interval *interval,
   printk("  Days of Week Mask     : %s (0x%02X)\n", dow_buf, scfg.day_of_week_mask);
   printk("  Session Duration      : %u seconds\n", interval->duration_seconds);
   printk("  Inter-Session Sleep   : %u seconds\n", scfg.sleep_interval);
+  printk("  Clock Source          : %s\n", rtc_calendar_is_untrusted() ? "UNTRUSTED (LSI fallback)" : "TRUSTED (LSE crystal)");
   printk("  Recording Mode        : %s\n", mode_to_string(settings.mode));
   printk("  Sampling Rate / Bits  : %u Hz / 16-bit\n", settings.sample_rate);
   printk("  Block Size / Pool     : %u samples (%u B) / %u blocks\n",
@@ -1608,8 +1616,36 @@ void main_scheduler_service_step(void) {
   }
   s_no_window_logged = false;
 
+  if (rtc_calendar_is_untrusted()) {
+    static bool s_lsi_warned = false;
+    if (!s_lsi_warned) {
+      LOG_WRN("RTC clock source is LSI (clock marked UNTRUSTED, +-5-10%% accuracy)");
+      printk("[SCHEDULER] WARNING: RTC clock source is LSI (UNTRUSTED, +-5-10%% drift)\n");
+      s_lsi_warned = true;
+    }
+  }
+
   if (interval.is_immediate || interval.wait_seconds == 0) {
     dispatch_recording_session(&interval, scfg.time_zone_offset);
+    return;
+  } else if (interval.wait_seconds < SCHEDULER_MIN_STOP2_SLEEP_SEC) {
+    /* Minimum sleep rule: if remaining wait is < 30 s, do not enter STOP2.
+     * Stay awake with SD mounted and console active until exact start time. */
+    while (!atomic_get(&s_schedule_paused) && !recorder_is_abort_requested()) {
+      struct rtc_calendar_time now_c;
+      if (rtc_calendar_get(&now_c) != 0 || !rtc_calendar_is_valid()) {
+        break;
+      }
+      time_t cur_u = scheduler_calendar_to_epoch(&now_c);
+      if (cur_u >= interval.start_time_utc) {
+        break;
+      }
+      while (log_process()) { k_yield(); }
+      k_sleep(K_MSEC(100));
+    }
+    if (!atomic_get(&s_schedule_paused) && !recorder_is_abort_requested()) {
+      dispatch_recording_session(&interval, scfg.time_zone_offset);
+    }
     return;
   } else {
     /* Standby wait for upcoming window: enter STM32L476 Stop 2 with strict RTC-only wakeup */
@@ -1639,13 +1675,20 @@ void main_scheduler_service_step(void) {
       }
       time_t cur_u = scheduler_calendar_to_epoch(&now_cal);
       int64_t remaining_sec = (int64_t)(interval.start_time_utc - cur_u);
-      if (remaining_sec <= 0) {
-        /* Scheduled start time reached */
+      if (remaining_sec <= (int64_t)SCHEDULER_WAKE_LEAD_SEC) {
+        /* Woke within lead time: stay awake and wait for exact start time */
+        break;
+      }
+
+      /* Compute sleep duration accounting for wake lead time */
+      int64_t target_sleep = remaining_sec - (int64_t)SCHEDULER_WAKE_LEAD_SEC;
+      if (target_sleep < (int64_t)SCHEDULER_MIN_STOP2_SLEEP_SEC) {
+        /* Remaining wait before lead time is < 30 s: stay awake */
         break;
       }
 
       /* Enforce safe sleep chunk bounds (max 65535 s for 16-bit RTC wake timer) */
-      uint32_t sleep_chunk = (remaining_sec > 65535) ? 65535 : (uint32_t)remaining_sec;
+      uint32_t sleep_chunk = (target_sleep > 65535) ? 65535 : (uint32_t)target_sleep;
 
 #if defined(CONFIG_WILDSONIC_VERBOSE_LOGS)
       printk("[TEST] SLEEP_INTERVAL_STARTED: duration=%u s\n", sleep_chunk);
@@ -1703,12 +1746,25 @@ void main_scheduler_service_step(void) {
     }
     time_t wake_utc = scheduler_calendar_to_epoch(&wake_cal);
     if (wake_utc < interval.start_time_utc) {
-      /* Woke early (e.g. chunk completion); return to let outer loop service or re-sleep */
+      /* Wait for exact scheduled start time (lead time synchronization) */
+      while (!atomic_get(&s_schedule_paused) && !recorder_is_abort_requested()) {
+        if (rtc_calendar_get(&wake_cal) != 0 || !rtc_calendar_is_valid()) {
+          return;
+        }
+        wake_utc = scheduler_calendar_to_epoch(&wake_cal);
+        if (wake_utc >= interval.start_time_utc) {
+          break;
+        }
+        while (log_process()) { k_yield(); }
+        k_msleep(10);
+      }
+    }
+
+    if (atomic_get(&s_schedule_paused) || recorder_is_abort_requested()) {
       return;
     }
 
     dispatch_recording_session(&interval, scfg.time_zone_offset);
-    k_sem_give(&s_rec_trigger_sem);
     return;
   }
 }
@@ -1722,7 +1778,10 @@ static void scheduler_thread_fn(void *p1, void *p2, void *p3) {
     if (!main_is_scheduler_paused()) {
       main_scheduler_service_step();
     }
-    k_sleep(K_MSEC(100));
+    while (log_process()) {
+      k_yield();
+    }
+    (void)k_sem_take(&s_scheduler_event_sem, K_MSEC(100));
   }
 }
 

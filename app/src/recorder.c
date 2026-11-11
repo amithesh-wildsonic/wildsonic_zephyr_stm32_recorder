@@ -570,20 +570,23 @@ static void recorder_write_gap_sidecar(const char *wav_path) {
   }
 }
 
-/* Bound final drain using observed fs_write throughput when it is slower than
- * the 4 KiB/s fallback, with five seconds reserved for filesystem metadata. */
+/* Bound final drain using observed fs_write throughput with a 200 KB/s floor
+ * and five seconds reserved for filesystem metadata, capped at 15 seconds. */
 static uint32_t writer_completion_timeout_ms(uint32_t pending_bytes) {
-  uint64_t service_bytes_per_sec = 4096ULL;
+  uint64_t service_bytes_per_sec = 200ULL * 1024ULL; /* 200 KB/s floor */
   if (sd_writer_write_us_sum > 0 && sd_writer_bytes_written > 0) {
     uint64_t observed = (sd_writer_bytes_written * 1000000ULL) /
                         sd_writer_write_us_sum;
-    if (observed > 0 && observed < service_bytes_per_sec) {
+    if (observed > service_bytes_per_sec) {
       service_bytes_per_sec = observed;
     }
   }
   uint64_t timeout = 5000ULL +
                      ((uint64_t)pending_bytes * 1000ULL / service_bytes_per_sec);
-  return (timeout > UINT32_MAX) ? UINT32_MAX : (uint32_t)timeout;
+  if (timeout > 15000ULL) {
+    timeout = 15000ULL;
+  }
+  return (uint32_t)timeout;
 }
 
 #ifdef CONFIG_AUDIO_PSRAM_STAGING
@@ -639,6 +642,23 @@ void recorder_set_psram_staging_enabled(bool enabled) {
 
 bool recorder_is_psram_staging_enabled(void) { return g_psram_staging_enabled; }
 
+static int64_t s_scheduled_start_utc = 0;
+
+void recorder_set_scheduled_start_utc(int64_t start_time_utc) {
+  s_scheduled_start_utc = start_time_utc;
+}
+
+int64_t recorder_get_scheduled_start_utc(void) {
+  return s_scheduled_start_utc;
+}
+
+static void sd_writer_notify_fatal_error(int err) {
+  sd_writer_err = err ? err : -EIO;
+  led_indicator_set(LED_IND_ERROR);
+  k_sem_give(&sd_writer_done_sem);
+  k_sem_give(&s_slot_free_sem);
+}
+
 static void psram_reader_thread_fn(void *p1, void *p2, void *p3) {
   ARG_UNUSED(p1);
   ARG_UNUSED(p2);
@@ -687,9 +707,7 @@ static void psram_reader_thread_fn(void *p1, void *p2, void *p3) {
         slot->err = peek_ret ? peek_ret : -EIO;
         slot->bytes = 0;
         slot->state = PINGPONG_BUF_READY_FOR_SD;
-        if (sd_writer_err == 0) {
-          sd_writer_err = slot->err;
-        }
+        sd_writer_notify_fatal_error(slot->err);
         k_sem_give(&s_slot_ready_sem);
         break;
       }
@@ -728,6 +746,7 @@ static void sd_writer_thread_fn(void *p1, void *p2, void *p3) {
             sd_writer_err = -EBADF;
           }
           sd_writer_failed_bytes = psram_staging_occupied();
+          sd_writer_notify_fatal_error(sd_writer_err);
           break;
         }
 
@@ -744,16 +763,16 @@ static void sd_writer_thread_fn(void *p1, void *p2, void *p3) {
         sd_writer_batch_count++;
         uint32_t cur_batch = sd_writer_batch_count;
         if (cur_batch == 1) {
-          printk("[SD] First SD batch submitted: %u bytes\n", to_write);
+          LOG_DBG("[SD] First SD batch submitted: %u bytes", to_write);
         }
 
         if (!sd_writer_flush_req) {
-          LOG_INF("Batch %u: draining %u KB batch to SD (PSRAM occupancy: %u "
+          LOG_DBG("Batch %u: draining %u KB batch to SD (PSRAM occupancy: %u "
                   "KB / %u KB)...",
                   cur_batch, to_write >> 10, psram_staging_occupied() >> 10,
                   psram_staging_capacity() >> 10);
         } else {
-          LOG_INF(
+          LOG_DBG(
               "Final flush: draining remaining %u bytes from PSRAM to SD...",
               to_write);
         }
@@ -777,8 +796,8 @@ static void sd_writer_thread_fn(void *p1, void *p2, void *p3) {
 
             if (peek_ret != 0 || bytes_peeked == 0) {
               LOG_ERR("PSRAM sync peek failed (%d)", peek_ret);
-              sd_writer_err = peek_ret ? peek_ret : -EIO;
               psram_staging_rewind_peek();
+              sd_writer_notify_fatal_error(peek_ret ? peek_ret : -EIO);
               break;
             }
 
@@ -883,8 +902,8 @@ static void sd_writer_thread_fn(void *p1, void *p2, void *p3) {
                 if (st_chk.consecutive_discards >= 16 || st_chk.time_in_recovery_us > 20000000ULL) {
                   LOG_ERR("Storage recovery abort criteria reached: discards=%u, rec_us=%llu; stopping capture",
                           st_chk.consecutive_discards, (unsigned long long)st_chk.time_in_recovery_us);
-                  sd_writer_err = w_ret;
                   psram_staging_rewind_peek();
+                  sd_writer_notify_fatal_error(w_ret);
                   break;
                 }
                 continue;
@@ -901,7 +920,7 @@ static void sd_writer_thread_fn(void *p1, void *p2, void *p3) {
 
             if (commit_ret != 0) {
               LOG_ERR("SD writer staging commit failed after successful write (%d)", commit_ret);
-              sd_writer_err = commit_ret;
+              sd_writer_notify_fatal_error(commit_ret);
               break;
             }
 
@@ -939,16 +958,17 @@ static void sd_writer_thread_fn(void *p1, void *p2, void *p3) {
           while (to_write > 0 && sd_writer_err == 0) {
             if (k_sem_take(&s_slot_ready_sem, K_MSEC(5000)) != 0) {
               LOG_ERR("SD writer wait slot timeout");
-              sd_writer_err = -ETIMEDOUT;
+              sd_writer_notify_fatal_error(-ETIMEDOUT);
               break;
             }
             if (sd_writer_err != 0) {
+              sd_writer_notify_fatal_error(sd_writer_err);
               break;
             }
 
             struct pingpong_slot *slot = &s_pingpong[w_idx];
             if (slot->err != 0) {
-              sd_writer_err = slot->err;
+              sd_writer_notify_fatal_error(slot->err);
               break;
             }
 
@@ -1064,8 +1084,8 @@ static void sd_writer_thread_fn(void *p1, void *p2, void *p3) {
                 if (st_chk.consecutive_discards >= 16 || st_chk.time_in_recovery_us > 20000000ULL) {
                   LOG_ERR("Storage recovery abort criteria reached: discards=%u, rec_us=%llu; stopping capture",
                           st_chk.consecutive_discards, (unsigned long long)st_chk.time_in_recovery_us);
-                  sd_writer_err = w_ret;
                   psram_staging_rewind_peek();
+                  sd_writer_notify_fatal_error(w_ret);
                   break;
                 }
                 continue;
@@ -1096,7 +1116,7 @@ static void sd_writer_thread_fn(void *p1, void *p2, void *p3) {
             if (commit_ret != 0) {
               LOG_ERR("SD writer staging commit failed after successful write (%d)",
                       commit_ret);
-              sd_writer_err = commit_ret;
+              sd_writer_notify_fatal_error(commit_ret);
               break;
             }
 
@@ -1118,6 +1138,9 @@ static void sd_writer_thread_fn(void *p1, void *p2, void *p3) {
           }
 
           /* Ensure reader thread has completed this batch */
+          if (sd_writer_err != 0) {
+            k_sem_give(&s_slot_free_sem);
+          }
           k_sem_take(&s_reader_done_sem, K_FOREVER);
         }
 
@@ -1134,7 +1157,7 @@ static void sd_writer_thread_fn(void *p1, void *p2, void *p3) {
         if (sd_writer_err == 0 && batch_bytes_written > 0) {
           uint32_t active_kb_s = batch_write_us_sum ? (uint32_t)(((uint64_t)batch_bytes_written * 1000000ULL) / (batch_write_us_sum * 1024ULL)) : 0;
           uint32_t wall_kb_s = batch_ms ? (uint32_t)(((uint64_t)batch_bytes_written * 1000ULL) / ((uint64_t)batch_ms * 1024ULL)) : 0;
-          LOG_INF("Batch %u completed: %u bytes written to SD in %u ms (wall rate: %u KB/s, write: %u ms / %u KB/s, peek: %u ms, total committed: %llu bytes, PSRAM occupied: %u KB)",
+          LOG_DBG("Batch %u completed: %u bytes written to SD in %u ms (wall rate: %u KB/s, write: %u ms / %u KB/s, peek: %u ms, total committed: %llu bytes, PSRAM occupied: %u KB)",
                   cur_batch, batch_bytes_written, batch_ms, wall_kb_s,
                   (uint32_t)(batch_write_us_sum / 1000ULL), active_kb_s,
                   (uint32_t)(batch_peek_us_sum / 1000ULL),
@@ -1144,6 +1167,7 @@ static void sd_writer_thread_fn(void *p1, void *p2, void *p3) {
         if (sd_writer_err != 0) {
           LOG_ERR("Batch %u interrupted: wrote %u of %u bytes to SD before failure (%d)",
                   cur_batch, batch_bytes_written, to_write + batch_bytes_written, sd_writer_err);
+          sd_writer_notify_fatal_error(sd_writer_err);
           break;
         }
       }
@@ -1162,6 +1186,10 @@ static void sd_writer_thread_fn(void *p1, void *p2, void *p3) {
       struct sd_block_msg msg;
       while (k_msgq_get(&sd_block_q, &msg, K_NO_WAIT) == 0) {
         if (sd_writer_err != 0 || !sd_file_ptr) {
+          if (sd_writer_err == 0) {
+            sd_writer_err = -EBADF;
+          }
+          sd_writer_notify_fatal_error(sd_writer_err);
           sd_writer_failed_bytes += msg.bytes;
           RELEASE_BLOCK(msg.blk);
           continue;
@@ -1202,7 +1230,7 @@ static void sd_writer_thread_fn(void *p1, void *p2, void *p3) {
           struct sd_resilient_stats st_chk;
           sd_resilient_get_stats(&st_chk);
           if (st_chk.consecutive_discards >= 16 || st_chk.time_in_recovery_us > 20000000ULL) {
-            sd_writer_err = w_ret;
+            sd_writer_notify_fatal_error(w_ret);
             break;
           }
           continue;
@@ -1537,6 +1565,10 @@ int recorder_init(void) {
         "  Cluster size       : %u bytes (statvfs f_frsize / allocation unit)",
         cluster_size);
     LOG_INF("  Sectors per cluster: %u", sec_per_clus);
+    if (cluster_size > 0 && cluster_size != WAV_HEADER_BYTES) {
+      LOG_WRN("Cluster size (%u B) differs from WAV header alignment (%u B)",
+              cluster_size, WAV_HEADER_BYTES);
+    }
   } else {
     LOG_INF("SD mounted: %s filesystem", fs_type_str);
   }
@@ -2048,17 +2080,17 @@ int recorder_verify_file_format(const char *path, uint32_t expected_rate,
     return ret;
   }
 
-  uint8_t hdr[WAV_HEADER_BYTES];
-  ssize_t r = fs_read(&vf, hdr, sizeof(hdr));
+  uint8_t *hdr = s_sd_writer_buf;
+  ssize_t r = fs_read(&vf, hdr, WAV_HEADER_BYTES);
   fs_close(&vf);
 
   if (r < 0) {
     LOG_ERR("Verify read %s failed with I/O error: %d", path, (int)r);
     return (int)r;
   }
-  if (r != sizeof(hdr)) {
+  if (r != WAV_HEADER_BYTES) {
     LOG_ERR("Verify read %s short read: %d bytes read (expected %zu)", path,
-            (int)r, sizeof(hdr));
+            (int)r, (size_t)WAV_HEADER_BYTES);
     return -EIO;
   }
 
@@ -2312,11 +2344,26 @@ int recorder_sleep(uint32_t seconds, uint32_t *wake_recovery_us) {
       psram_staging_flush_publish();
       sd_writer_flush_req = true;
       k_sem_give(&sd_writer_sem);
-      /* Hard deadline of 3.0 seconds for flush */
-      uint32_t timeout_ms = 3000U;
-      if (k_sem_take(&sd_writer_done_sem, K_MSEC(timeout_ms)) != 0) {
-        LOG_WRN("recorder_sleep: flush timed out after 3.0 s; discarding %u bytes dirty audio",
-                psram_staging_occupied());
+      /* Use bounded writer completion timeout function */
+      uint32_t timeout_ms = writer_completion_timeout_ms(psram_staging_occupied());
+      uint32_t elapsed_wait_ms = 0;
+      bool flush_done = false;
+      while (elapsed_wait_ms < timeout_ms) {
+        uint32_t wait_slice = (timeout_ms - elapsed_wait_ms > 100U)
+                                  ? 100U
+                                  : (timeout_ms - elapsed_wait_ms);
+        if (k_sem_take(&sd_writer_done_sem, K_MSEC(wait_slice)) == 0) {
+          flush_done = true;
+          break;
+        }
+        if (sd_writer_err != 0) {
+          break;
+        }
+        elapsed_wait_ms += wait_slice;
+      }
+      if (!flush_done && sd_writer_err == 0) {
+        LOG_WRN("recorder_sleep: flush timed out after %u ms; discarding %u bytes dirty audio",
+                timeout_ms, psram_staging_occupied());
         uint32_t dirty = psram_staging_occupied();
         sd_resilient_record_sleep_discard(dirty);
         psram_staging_reset();
@@ -2543,6 +2590,18 @@ int recorder_record_cycle(uint32_t seconds, uint32_t cycle,
   return recorder_record_session(seconds, cycle, REC_MODE_NORMAL, out);
 }
 
+static void recorder_print_failure_summary(int err, const struct rec_stats *st) {
+  printk("[ERROR] Recording session failed: %d\n", err);
+  printk("  Diagnostics: acquired=%llu, written=%llu, uncommitted=%llu, drops=%llu\n",
+         (unsigned long long)st->samples_acquired,
+         (unsigned long long)st->samples_written,
+         (unsigned long long)(st->samples_acquired > st->samples_written ? (st->samples_acquired - st->samples_written) : 0),
+         (unsigned long long)st->samples_dropped);
+  printk("  Pipeline: dma_err=%u, adc_ovr=%u, dsp_ovr=%u, psram_full=%u, sd_err=%d\n",
+         st->dma_errors, st->adc_overruns, st->dsp_overruns,
+         st->psram_full_events, st->sd_write_error);
+}
+
 int recorder_record_session(uint32_t seconds, uint32_t cycle,
                             enum recorder_mode mode, struct rec_stats *out) {
   printk("[RECORDER] Session entered: duration=%u s, cycle=%u\n", seconds, cycle);
@@ -2596,7 +2655,7 @@ int recorder_record_session(uint32_t seconds, uint32_t cycle,
 
   /* Keep the file object alive if a blocked writer outlives this call. */
   static struct fs_file_t f;
-  static uint8_t hdr[WAV_HEADER_BYTES] __aligned(4);
+  uint8_t *hdr = s_sd_writer_buf;
   int ret = 0;
   int err = 0;
 
@@ -2624,6 +2683,11 @@ int recorder_record_session(uint32_t seconds, uint32_t cycle,
   uint32_t bytes_per_frame = (uint32_t)st.channels * ((uint32_t)st.sample_bits / 8U);
   s_bytes_per_frame = bytes_per_frame;
   st.expected_samples = (uint64_t)seconds * st.sample_rate;
+  st.clock_untrusted = rtc_calendar_is_untrusted();
+  if (st.clock_untrusted) {
+    LOG_WRN("RTC clock source is LSI (clock marked UNTRUSTED, +-5-10%% accuracy)");
+    printk("[RTC WARNING] Clock is UNTRUSTED (LSI fallback in use)\n");
+  }
   const uint64_t want_blocks =
       (st.expected_samples + BLOCK_SAMPLES - 1) / BLOCK_SAMPLES;
   st.expected_blocks = (uint32_t)want_blocks;
@@ -2906,7 +2970,17 @@ int recorder_record_session(uint32_t seconds, uint32_t cycle,
   st.slowdown_active = false;
   st.slowdown_events = 0;
 
+  uint32_t capture_start_ms = k_uptime_get_32();
+  uint32_t last_progress_ms = capture_start_ms;
+  bool failure_summary_printed = false;
+
   while (samples_remaining > 0) {
+    if (sd_writer_err != 0) {
+      LOG_ERR("SD writer error detected in recording loop: %d", sd_writer_err);
+      led_indicator_set(LED_IND_ERROR);
+      err = sd_writer_err;
+      break;
+    }
     if (recorder_abort_requested) {
       LOG_INF("Stop requested: finalizing recorded frames early (%llu samples "
               "written)",
@@ -2922,11 +2996,44 @@ int recorder_record_session(uint32_t seconds, uint32_t cycle,
         break;
       }
     }
+
+    uint32_t now_ms = k_uptime_get_32();
+    if (now_ms - last_progress_ms >= 10000U) {
+      last_progress_ms = now_ms;
+      uint32_t elapsed_s = (now_ms - capture_start_ms) / 1000U;
+      uint32_t written_pct = (exact_bytes > 0)
+                                 ? (uint32_t)((sd_writer_bytes_written * 100ULL) / exact_bytes)
+                                 : 0;
+      if (written_pct > 100U) {
+        written_pct = 100U;
+      }
+      uint32_t err_cnt = (sd_writer_err != 0 || drops > 0 || st.blocks_dropped > 0) ? 1U : 0U;
+      printk("REC %u/%u s  written %u%%  err %u\n",
+             elapsed_s, seconds, written_pct, err_cnt);
+      (void)log_process();
+    }
+
     uint8_t buf_id = 0xFF;
     void *blk = NULL;
 
-    /* a healthy source delivers a block every ~10 ms; 2 s means it died */
-    if (k_msgq_get(&filled_q, &buf_id, K_SECONDS(2)) != 0) {
+    /* A healthy source delivers a block every ~10 ms; responsive check for sd_writer_err */
+    int q_rc = -ETIMEDOUT;
+    for (int wait_step = 0; wait_step < 20; wait_step++) {
+      if (sd_writer_err != 0) {
+        break;
+      }
+      if (k_msgq_get(&filled_q, &buf_id, K_MSEC(100)) == 0) {
+        q_rc = 0;
+        break;
+      }
+    }
+    if (sd_writer_err != 0) {
+      LOG_ERR("SD writer error detected in recording loop: %d", sd_writer_err);
+      led_indicator_set(LED_IND_ERROR);
+      err = sd_writer_err;
+      break;
+    }
+    if (q_rc != 0) {
       LOG_ERR("no audio for 2 s");
       if (s_session_no_audio_recoveries >= 3U) {
         LOG_ERR("Maximum no-audio recovery retries (3) exceeded; aborting session");
@@ -2972,6 +3079,18 @@ int recorder_record_session(uint32_t seconds, uint32_t cycle,
     if (st.blocks_processed == 1) {
       t_first_block_cyc = t_block_arrival;
       printk("[AUDIO] First audio block received: %u samples\n", BLOCK_SAMPLES);
+      struct rtc_calendar_time cur_c;
+      if (rtc_calendar_get(&cur_c) == 0 && rtc_calendar_is_valid()) {
+        st.first_sample_utc = scheduler_calendar_to_epoch(&cur_c);
+      }
+      st.sched_start_utc = s_scheduled_start_utc;
+      if (st.sched_start_utc > 0 && st.first_sample_utc > 0) {
+        st.start_delta_ms = (st.first_sample_utc - st.sched_start_utc) * 1000LL;
+      }
+      LOG_INF("scheduled start vs first sample time: sched=%lld, first=%lld (delta=%lld ms)",
+              (long long)st.sched_start_utc, (long long)st.first_sample_utc, (long long)st.start_delta_ms);
+      printk("  scheduled start vs first sample time: sched=%lld, first_sample=%lld (delta=%lld ms)\n",
+             (long long)st.sched_start_utc, (long long)st.first_sample_utc, (long long)st.start_delta_ms);
     }
     t_last_block_cyc = t_block_arrival;
 
@@ -3347,6 +3466,14 @@ int recorder_record_session(uint32_t seconds, uint32_t cycle,
     }
   }
 
+  if (err != 0 && !recorder_abort_requested && !failure_summary_printed) {
+    st.bytes_written = sd_writer_bytes_written;
+    st.samples_written = (bytes_per_frame > 0) ? (st.bytes_written / bytes_per_frame) : 0;
+    st.sd_write_error = (sd_writer_err != 0) ? sd_writer_err : err;
+    recorder_print_failure_summary(err, &st);
+    failure_summary_printed = true;
+  }
+
   uint32_t drained_blocks = drain_queue();
   st.queue_drained_blocks = drained_blocks;
   st.queue_drained_samples = drained_blocks * BLOCK_SAMPLES;
@@ -3403,7 +3530,22 @@ int recorder_record_session(uint32_t seconds, uint32_t cycle,
       ? psram_staging_occupied()
       : (uint32_t)k_msgq_num_used_get(&sd_block_q) * BLOCK_BYTES;
   uint32_t completion_timeout_ms = writer_completion_timeout_ms(pending_writer_bytes);
-  if (k_sem_take(&sd_writer_done_sem, K_MSEC(completion_timeout_ms)) != 0) {
+  uint32_t elapsed_wait_ms = 0;
+  bool flush_done = false;
+  while (elapsed_wait_ms < completion_timeout_ms) {
+    uint32_t wait_slice = (completion_timeout_ms - elapsed_wait_ms > 100U)
+                              ? 100U
+                              : (completion_timeout_ms - elapsed_wait_ms);
+    if (k_sem_take(&sd_writer_done_sem, K_MSEC(wait_slice)) == 0) {
+      flush_done = true;
+      break;
+    }
+    if (sd_writer_err != 0) {
+      break;
+    }
+    elapsed_wait_ms += wait_slice;
+  }
+  if (!flush_done && sd_writer_err == 0) {
     LOG_ERR("SD writer completion timeout after %u ms; closing file and reporting fault",
             completion_timeout_ms);
     st.err = -ETIMEDOUT;
@@ -3769,6 +3911,10 @@ int recorder_record_session(uint32_t seconds, uint32_t cycle,
          (unsigned long long)(st.sd_writer_commit_us / 1000ULL),
          (unsigned long long)(st.sd_writer_starve_us / 1000ULL));
   printk("  SD error                           : %d\n", st.sd_write_error);
+  printk("  Clock source accuracy              : %s\n",
+         st.clock_untrusted ? "UNTRUSTED (LSI fallback, +-5-10% drift)" : "TRUSTED (LSE crystal)");
+  printk("  scheduled start vs first sample time: sched=%lld, first_sample=%lld (delta=%lld ms)\n",
+         (long long)st.sched_start_utc, (long long)st.first_sample_utc, (long long)st.start_delta_ms);
   printk("  First error origin                 : %s\n", st.first_error_stage[0] ? st.first_error_stage : "NONE");
   struct sd_resilient_stats st_res_chk;
   sd_resilient_get_stats(&st_res_chk);
@@ -3862,16 +4008,19 @@ int recorder_record_session(uint32_t seconds, uint32_t cycle,
   printk("[RECORDER] State transition: RECORDING -> IDLE\n");
   if (err != 0 && !recorder_abort_requested) {
     led_indicator_set(LED_IND_ERROR);
-    printk("[ERROR] Recording session failed: %d\n", err);
+    if (!failure_summary_printed) {
+      printk("[ERROR] Recording session failed: %d\n", err);
 #if defined(CONFIG_WILDSONIC_VERBOSE_LOGS)
-    printk("  Diagnostics: acquired=%llu, written=%llu, uncommitted=%llu, drops=%llu\n",
-           (unsigned long long)st.samples_acquired,
-           (unsigned long long)st.samples_written,
-           (unsigned long long)st.sd_failed_samples,
-           (unsigned long long)st.samples_dropped);
-    printk("  Pipeline: dma_err=%u, adc_ovr=%u, dsp_ovr=%u, psram_full=%u, sd_err=%d\n",
-           st.dma_errors, st.adc_overruns, st.dsp_overruns, st.psram_full_events, st.sd_write_error);
+      printk("  Diagnostics: acquired=%llu, written=%llu, uncommitted=%llu, drops=%llu\n",
+             (unsigned long long)st.samples_acquired,
+             (unsigned long long)st.samples_written,
+             (unsigned long long)st.sd_failed_samples,
+             (unsigned long long)st.samples_dropped);
+      printk("  Pipeline: dma_err=%u, adc_ovr=%u, dsp_ovr=%u, psram_full=%u, sd_err=%d\n",
+             st.dma_errors, st.adc_overruns, st.dsp_overruns, st.psram_full_events, st.sd_write_error);
 #endif
+      failure_summary_printed = true;
+    }
     /* Only storage faults justify unmount/remount; acquisition/PSRAM errors do
      * not imply a bad SD card. Writer completion above establishes idle first. */
     int storage_error = (sd_writer_err != 0) ? sd_writer_err : st.sd_write_error;

@@ -233,6 +233,15 @@ void rtc_calendar_log_snapshot(const char *phase, int64_t target_utc)
 #endif
 }
 
+bool rtc_calendar_is_untrusted(void)
+{
+#if defined(CONFIG_SOC_SERIES_STM32L4X)
+	return (LL_RCC_GetRTCClockSource() == LL_RCC_RTC_CLKSOURCE_LSI);
+#else
+	return false;
+#endif
+}
+
 int rtc_calendar_set(const struct rtc_calendar_time *t)
 {
 	int ret = rtc_calendar_validate(t);

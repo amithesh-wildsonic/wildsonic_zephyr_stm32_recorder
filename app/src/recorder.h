@@ -91,6 +91,10 @@ struct rec_stats {
   uint32_t elapsed_ms;       /* independent elapsed wall time */
   uint32_t measured_sample_rate;
   bool wav_verified; /* read-back header and file size validation */
+  bool clock_untrusted; /* true if RTC source is LSI (+-5-10% drift) */
+  int64_t sched_start_utc;
+  int64_t first_sample_utc;
+  int64_t start_delta_ms;
   uint64_t file_size_bytes;
   int err;           /* first negative errno seen, 0 if none */
   char file[80];     /* expanded to hold /SD:/YYYYMMDD/YYYYMMDD_HH/YYYYMMDD_HHMMSS_NNN.wav */
@@ -224,6 +228,10 @@ void recorder_get_active_file(char *out_buf, size_t max_len);
 /* Runtime configuration for PSRAM audio staging buffer (ON/OFF) */
 void recorder_set_psram_staging_enabled(bool enabled);
 bool recorder_is_psram_staging_enabled(void);
+
+/* Scheduled session start time tracking */
+void recorder_set_scheduled_start_utc(int64_t start_time_utc);
+int64_t recorder_get_scheduled_start_utc(void);
 
 /* Validate WAV file on disk after recording */
 int recorder_verify_file(const char *path, uint32_t expected_rate,

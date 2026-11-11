@@ -50,6 +50,11 @@ int rtc_calendar_validate(const struct rtc_calendar_time *t);
 int rtc_calendar_init(void);
 
 /**
+ * @brief Check if RTC clock source is untrusted (e.g. LSI fallback, +-5-10% drift).
+ */
+bool rtc_calendar_is_untrusted(void);
+
+/**
  * @brief Check if hardware RTC calendar currently holds a valid programmed date and time.
  *
  * @return true if RTC calendar is synchronized and running, false if uninitialized/unset.
