@@ -341,6 +341,17 @@ config WILDSONIC_TEST_BUILD
 	  Explicitly labels the image as test-only and enables engineering
 	  diagnostics. Production configurations must leave this disabled.
 
+config WILDSONIC_SD_FAULT_INJECT
+	bool "Enable SD Fault Injection test hooks"
+	default n
+	help
+	  Enables fault injection for testing SDMMC retry and discard policies:
+	  F1: Fail next write once (CRC).
+	  F2: Fail every write for N attempts then succeed.
+	  F3: Return -9 for every FatFs call until a full re-init happens.
+	  F4: Fail all writes permanently (card dead).
+	  F5: Fail mount for M attempts after wake.
+
 config LOG_DEFAULT_LEVEL_WRN
 	bool "Default log level WARNING"
 	default n

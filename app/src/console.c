@@ -22,6 +22,8 @@
 #include "scheduler.h"
 #include "rtc_sleep.h"
 #include "rtc_calendar.h"
+#include "sd_fault_inject.h"
+#include "sd_resilient.h"
 #include "audio_in.h"
 #include "led_indicator.h"
 #include "recorder.h"
@@ -332,6 +334,9 @@ enum console_cmd_id {
 	CMD_GET_DEV_INFO,
 	CMD_GET_CONFIG,
 	CMD_STOP_RECORDING,
+#if defined(CONFIG_WILDSONIC_SD_FAULT_INJECT)
+	CMD_FAULT,
+#endif
 	CMD_NUM_CMDS
 };
 
@@ -402,6 +407,9 @@ static const char *console_cmd_lookup_table[] = {
 	"GET_DEV_INFO",
 	"GET_CONFIG",
 	"STOP_RECORDING",
+#if defined(CONFIG_WILDSONIC_SD_FAULT_INJECT)
+	"FAULT",
+#endif
 };
 
 /* Command Descriptions */
@@ -471,6 +479,9 @@ static const char *console_cmd_description_table[] = {
 	"Get hardware platform and firmware device information",
 	"Get current device audio, storage, and schedule configuration",
 	"Safely stop active recording, drain buffers, and close file",
+#if defined(CONFIG_WILDSONIC_SD_FAULT_INJECT)
+	"SD storage fault injection and resilience testing",
+#endif
 };
 
 BUILD_ASSERT(ARRAY_SIZE(console_cmd_lookup_table) == (size_t)CMD_NUM_CMDS,
@@ -527,6 +538,9 @@ static void display_console_help(void)
 	printk("\nEngineering Extensions (TEST build only):\n");
 	printk(" %s : %s\n", console_cmd_lookup_table[CMD_PSRAM], console_cmd_description_table[CMD_PSRAM]);
 	printk(" %s : %s\n", console_cmd_lookup_table[CMD_CONFIG_WIZARD], console_cmd_description_table[CMD_CONFIG_WIZARD]);
+#if defined(CONFIG_WILDSONIC_SD_FAULT_INJECT)
+	printk(" %s : %s\n", console_cmd_lookup_table[CMD_FAULT], console_cmd_description_table[CMD_FAULT]);
+#endif
 #endif
 	printk("\n");
 }
@@ -2118,6 +2132,61 @@ static void handle_stop_recording(void)
 	}
 }
 
+#if defined(CONFIG_WILDSONIC_SD_FAULT_INJECT)
+static void handle_fault(const char *args)
+{
+	char subcmd[16] = {0};
+	uint32_t val = 0;
+	int count = sscanf(args, "%15s %u", subcmd, &val);
+
+	if (count < 1 || strcasecmp(subcmd, "status") == 0) {
+		sd_fault_inject_status();
+		struct sd_resilient_stats st;
+		sd_resilient_get_stats(&st);
+		printk("\n=== SD RESILIENT STORAGE STATS ===\n");
+		printk("  Health State        : %s\n", sd_resilient_health_str(sd_resilient_get_health()));
+		printk("  Retry OK / Fail     : %u / %u\n", st.retry_ok, st.retry_fail);
+		printk("  Reopen OK / Fail    : %u / %u\n", st.reopen_ok, st.reopen_fail);
+		printk("  Errors (CRC/TO/Oth) : %u (CRC:%u, TO:%u, Other:%u)\n",
+		       st.err_total, st.err_crc, st.err_timeout, st.err_other);
+		printk("  Discards (Blk/Samp) : %u blocks, %llu samples\n",
+		       st.blocks_discarded, (unsigned long long)st.samples_discarded);
+		printk("  Recovery Time       : %llu us\n", (unsigned long long)st.time_in_recovery_us);
+		printk("  Gaps in RAM ring    : %u\n", sd_resilient_get_gap_count());
+		printk("OK\r\n");
+		return;
+	}
+
+	if (strcasecmp(subcmd, "f1") == 0) {
+		sd_fault_inject_f1();
+		printk("OK\r\n");
+	} else if (strcasecmp(subcmd, "f2") == 0) {
+		if (count < 2 || val == 0) {
+			val = 1;
+		}
+		sd_fault_inject_f2(val);
+		printk("OK\r\n");
+	} else if (strcasecmp(subcmd, "f3") == 0) {
+		sd_fault_inject_f3();
+		printk("OK\r\n");
+	} else if (strcasecmp(subcmd, "f4") == 0) {
+		sd_fault_inject_f4();
+		printk("OK\r\n");
+	} else if (strcasecmp(subcmd, "f5") == 0) {
+		if (count < 2 || val == 0) {
+			val = 1;
+		}
+		sd_fault_inject_f5(val);
+		printk("OK\r\n");
+	} else if (strcasecmp(subcmd, "clear") == 0) {
+		sd_fault_inject_clear();
+		printk("OK\r\n");
+	} else {
+		printk("\nUnknown fault subcommand: %s (usage: fault f1|f2 <n>|f3|f4|f5 <m>|clear|status)\n", subcmd);
+	}
+}
+#endif
+
 /* APPLY handler */
 static void handle_apply(void)
 {
@@ -2428,17 +2497,6 @@ static int console_process_line_internal(char *cmd_line, bool from_ble, char *ou
 		out_resp[0] = '\0';
 	}
 
-#if defined(CONFIG_WILDSONIC_TEST_BUILD)
-	if (strncasecmp(p, "TEST CONTINUE", 13) == 0 &&
-	    (p[13] == '\0' || isspace((unsigned char)p[13]))) {
-		main_test_gate_continue();
-		if (out_resp && out_resp_size > 0) {
-			snprintf(out_resp, out_resp_size, "OK");
-		}
-		return 0;
-	}
-#endif
-
 	if (strncasecmp(p, "BITS", 4) == 0 && (p[4] == ' ' || p[4] == '\0' || p[4] == '=')) {
 		const char *arg = p + 4;
 		while (*arg == ' ' || *arg == '=') arg++;
@@ -2718,6 +2776,11 @@ static int console_process_line_internal(char *cmd_line, bool from_ble, char *ou
 	case CMD_STOP_RECORDING:
 		handle_stop_recording();
 		break;
+#if defined(CONFIG_WILDSONIC_SD_FAULT_INJECT)
+	case CMD_FAULT:
+		handle_fault(p_args);
+		break;
+#endif
 
 	default:
 		if (!from_ble) {
@@ -2782,6 +2845,13 @@ void console_sync_staged_to_active(void)
 	struct app_settings *settings = main_get_settings();
 
 	if (!recorder_is_active()) {
+		uint32_t act_rate = 0, div = 0;
+		int err_hz = 0;
+		if (!audio_in_is_rate_supported(g_cfg.sampling_rate, &act_rate, &div, &err_hz)) {
+			LOG_WRN("Staged sample rate %u Hz unsupported, falling back to %u Hz",
+			        g_cfg.sampling_rate, CONFIG_AUDIO_SAMPLE_RATE);
+			g_cfg.sampling_rate = CONFIG_AUDIO_SAMPLE_RATE;
+		}
 		int rc = audio_in_set_rate(g_cfg.sampling_rate);
 		if (rc == 0) {
 			if (settings) {

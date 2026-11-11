@@ -50,9 +50,6 @@ void main_scheduler_pause(void);
 bool main_is_scheduler_paused(void);
 bool main_is_reboot_pending(void);
 void main_set_reboot_pending(bool pending);
-#if defined(CONFIG_WILDSONIC_TEST_BUILD)
-void main_test_gate_continue(void);
-#endif
 
 /* Graceful shutdown state machine */
 enum system_shutdown_stage {

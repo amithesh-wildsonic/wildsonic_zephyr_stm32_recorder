@@ -11,6 +11,7 @@
 #include "recorder.h"
 #include "audio_in.h"
 #include "dsp.h"
+#include "psram_is66wvs.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -171,7 +172,11 @@ void config_store_load_defaults(void)
 		settings->harmonic_notch_enabled = false;
 		settings->lpf_enabled = true;
 		settings->lpf_cutoff_hz = 24000;
-		settings->psram_staging_enabled = true;
+		if (psram_is_present() && psram_is_integrity_verified() && psram_is_quad_mode()) {
+			settings->psram_staging_enabled = true;
+		} else {
+			settings->psram_staging_enabled = false;
+		}
 	}
 
 	struct schedule_config scfg;
@@ -268,7 +273,11 @@ static void unpack_record_to_system(const struct wildsonic_persisted_config *rec
 		settings->hpf_enabled = (rec->lower_cutoff_frequency > 0);
 		settings->lpf_cutoff_hz = validated_lpf;
 		settings->lpf_enabled = (validated_lpf > 0);
-		settings->psram_staging_enabled = (rec->psram_staging_enabled != 0);
+		if (psram_is_present() && psram_is_integrity_verified() && psram_is_quad_mode()) {
+			settings->psram_staging_enabled = (rec->psram_staging_enabled != 0);
+		} else {
+			settings->psram_staging_enabled = false;
+		}
 	}
 
 	struct schedule_config scfg;

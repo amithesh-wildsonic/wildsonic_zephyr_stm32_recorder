@@ -209,6 +209,7 @@ void recorder_request_stop_reason(enum recorder_stop_reason reason);
 /* Request immediate safe stop of ongoing recording (finalizes WAV header
  * cleanly) */
 void recorder_request_stop(void);
+void recorder_clear_abort_request(void);
 bool recorder_is_active(void);
 bool recorder_is_shutdown_ready(void);
 int recorder_sd_verify_idle(void);

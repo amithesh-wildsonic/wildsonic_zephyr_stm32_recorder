@@ -104,64 +104,6 @@ static void psram_recover_controller(void) {
   psram_invalidate_state();
 }
 
-static int psram_dma_receive(uint32_t address, uint8_t *data, uint32_t length) {
-  if (!psram_present || !psram_initialized || !data || length == 0) {
-    return -ENODEV;
-  }
-
-  QSPI_CommandTypeDef cmd = {0};
-  cmd.Instruction = CMD_QUAD_FAST_READ;
-  cmd.InstructionMode = QSPI_INSTRUCTION_1_LINE;
-  cmd.AddressMode = QSPI_ADDRESS_4_LINES;
-  cmd.AddressSize = QSPI_ADDRESS_24_BITS;
-  cmd.AlternateByteMode = QSPI_ALTERNATE_BYTES_NONE;
-  cmd.DataMode = QSPI_DATA_4_LINES;
-  cmd.DummyCycles = 6;
-  cmd.Address = address;
-  cmd.NbData = length;
-  cmd.DdrMode = QSPI_DDR_MODE_DISABLE;
-  cmd.DdrHoldHalfCycle = QSPI_DDR_HHC_ANALOG_DELAY;
-  cmd.SIOOMode = QSPI_SIOO_INST_EVERY_CMD;
-
-  if (hqspi.State != HAL_QSPI_STATE_READY) {
-    if (HAL_QSPI_Abort(&hqspi) != HAL_OK ||
-        __HAL_QSPI_GET_FLAG(&hqspi, QSPI_FLAG_BUSY) != RESET) {
-      LOG_ERR("QSPI not idle before DMA read: state=0x%02X SR=0x%08X",
-              hqspi.State, (unsigned int)QUADSPI->SR);
-      psram_recover_controller();
-      return -EIO;
-    }
-  }
-
-  __HAL_QSPI_CLEAR_FLAG(&hqspi, QSPI_FLAG_TE | QSPI_FLAG_TC);
-  HAL_StatusTypeDef status = HAL_QSPI_Command(&hqspi, &cmd, 50);
-  if (status != HAL_OK) {
-    LOG_ERR("PSRAM DMA read command failed: status=%d addr=0x%06X len=%u",
-            (int)status, address, length);
-    psram_recover_controller();
-    return -EIO;
-  }
-
-  status = HAL_QSPI_Receive_DMA(&hqspi, data, length);
-  if (status != HAL_OK) {
-    LOG_ERR("PSRAM DMA receive launch failed: status=%d addr=0x%06X len=%u",
-            (int)status, address, length);
-    psram_recover_controller();
-    return -EIO;
-  }
-
-  while (HAL_QSPI_GetState(&hqspi) != HAL_QSPI_STATE_READY) {
-    k_yield();
-  }
-  if (hqspi.ErrorCode != 0U) {
-    LOG_ERR("PSRAM DMA receive error: err=0x%08X addr=0x%06X len=%u",
-            (unsigned int)hqspi.ErrorCode, address, length);
-    psram_recover_controller();
-    return -EIO;
-  }
-  return 0;
-}
-
 int psram_init(void) {
 #if defined(__ZEPHYR__)
   k_mutex_init(&psram_mutex);
@@ -461,20 +403,24 @@ int psram_read(uint32_t address, uint8_t *data, uint32_t length) {
   bool is_quad = (quad_mode_enabled || quad_test_active || quad_read_override);
   uint32_t burst_limit = is_quad ? active_burst_size : PSRAM_IS66WVS_SAFE_BURST_BYTES_SPI;
 
-  if (is_quad) {
-    int dma_ret = psram_dma_receive(address, data, length);
-    PSRAM_UNLOCK();
-    return dma_ret;
-  }
-
   QSPI_CommandTypeDef cmd = {0};
-  cmd.Instruction = CMD_READ;
-  cmd.InstructionMode = QSPI_INSTRUCTION_1_LINE;
-  cmd.AddressMode = QSPI_ADDRESS_1_LINE;
-  cmd.AddressSize = QSPI_ADDRESS_24_BITS;
-  cmd.AlternateByteMode = QSPI_ALTERNATE_BYTES_NONE;
-  cmd.DataMode = QSPI_DATA_1_LINE;
-  cmd.DummyCycles = 0;
+  if (is_quad) {
+    cmd.Instruction = CMD_QUAD_FAST_READ;
+    cmd.InstructionMode = QSPI_INSTRUCTION_1_LINE;
+    cmd.AddressMode = QSPI_ADDRESS_4_LINES;
+    cmd.AddressSize = QSPI_ADDRESS_24_BITS;
+    cmd.AlternateByteMode = QSPI_ALTERNATE_BYTES_NONE;
+    cmd.DataMode = QSPI_DATA_4_LINES;
+    cmd.DummyCycles = 6;
+  } else {
+    cmd.Instruction = CMD_READ;
+    cmd.InstructionMode = QSPI_INSTRUCTION_1_LINE;
+    cmd.AddressMode = QSPI_ADDRESS_1_LINE;
+    cmd.AddressSize = QSPI_ADDRESS_24_BITS;
+    cmd.AlternateByteMode = QSPI_ALTERNATE_BYTES_NONE;
+    cmd.DataMode = QSPI_DATA_1_LINE;
+    cmd.DummyCycles = 0;
+  }
   cmd.DdrMode = QSPI_DDR_MODE_DISABLE;
   cmd.DdrHoldHalfCycle = QSPI_DDR_HHC_ANALOG_DELAY;
   cmd.SIOOMode = QSPI_SIOO_INST_EVERY_CMD;

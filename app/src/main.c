@@ -313,7 +313,11 @@ static void print_banner(void) {
 static void print_settings(void) {
   uint32_t act_rate = 0, div = 0;
   int err_hz = 0;
-  audio_in_is_rate_supported(settings.sample_rate, &act_rate, &div, &err_hz);
+  if (!audio_in_is_rate_supported(settings.sample_rate, &act_rate, &div, &err_hz)) {
+    act_rate = settings.sample_rate;
+    div = 0;
+    err_hz = 0;
+  }
 
   uint64_t total_samples = (uint64_t)settings.record_seconds * act_rate;
   uint64_t pcm_bytes = total_samples * SAMPLE_BYTES;
@@ -1359,11 +1363,6 @@ struct recorder_request {
 static struct recorder_request s_rec_req;
 static struct k_sem s_rec_trigger_sem;
 static struct k_sem s_rec_done_sem;
-#if defined(CONFIG_WILDSONIC_TEST_BUILD)
-/* Host-controlled gate for deterministic automated multi-profile tests. */
-static struct k_sem s_test_host_gate_sem;
-static bool s_test_host_gate_initialized;
-#endif
 static atomic_t s_rec_busy = ATOMIC_INIT(0);
 static int s_rec_last_result = 0;
 static struct rec_stats s_rec_last_stats;
@@ -1379,10 +1378,18 @@ static void recorder_thread_fn(void *p1, void *p2, void *p3) {
 
     /* Ensure audio hardware rate matches active settings before session begins */
     if (audio_in_rate() != settings.sample_rate) {
-      int rc = audio_in_set_rate(settings.sample_rate);
-      if (rc != 0) {
-        LOG_WRN("Reconciling sample rate to hardware actual %u Hz (was %u)",
-                audio_in_rate(), settings.sample_rate);
+      uint32_t act_rate = 0, div = 0;
+      int err_hz = 0;
+      if (audio_in_is_rate_supported(settings.sample_rate, &act_rate, &div, &err_hz)) {
+        int rc = audio_in_set_rate(settings.sample_rate);
+        if (rc != 0) {
+          LOG_WRN("Reconciling sample rate to hardware actual %u Hz (was %u)",
+                  audio_in_rate(), settings.sample_rate);
+        }
+      } else {
+        LOG_WRN("Requested sample rate %u Hz unsupported, keeping hardware rate %u Hz",
+                settings.sample_rate, audio_in_rate());
+        settings.sample_rate = audio_in_rate();
       }
     }
     settings.sample_rate = audio_in_rate();
@@ -1469,11 +1476,6 @@ void main_set_reboot_pending(bool pending) {
   atomic_set(&s_reboot_pending, pending ? 1 : 0);
   if (pending) {
     atomic_set(&s_schedule_paused, 1);
-#if defined(CONFIG_WILDSONIC_TEST_BUILD)
-    if (s_test_host_gate_initialized) {
-      k_sem_give(&s_test_host_gate_sem);
-    }
-#endif
   }
 }
 
@@ -1552,16 +1554,6 @@ static void dispatch_recording_session(const struct schedule_interval *interval,
   printk("  Storage Destination   : SDMMC (/SD:)\n");
   printk("  Control               : Asynchronous console active; type commands or 'stop'\n");
   printk("=========================================================================\n");
-#endif
-
-#if defined(CONFIG_WILDSONIC_TEST_BUILD)
-  /* Hold the scheduler here so the PC test bench can configure/read back the next profile. */
-  printk("[TEST] HOST_GATE_WAIT: cycle=%u\n", s_schedule_cycle);
-  k_sem_take(&s_test_host_gate_sem, K_FOREVER);
-  printk("[TEST] HOST_GATE_RELEASED: cycle=%u\n", s_schedule_cycle);
-  if (main_is_reboot_pending() || recorder_is_abort_requested()) {
-    return;
-  }
 #endif
 
   /* Dispatch autonomous recording to recorder_thread without blocking console REPL */
@@ -1737,12 +1729,6 @@ static void scheduler_thread_fn(void *p1, void *p2, void *p3) {
 /* ==============================================================================
  * Bridge and Dispatch Functions for Console & Test Subsystems
  * ============================================================================== */
-
-#if defined(CONFIG_WILDSONIC_TEST_BUILD)
-void main_test_gate_continue(void) {
-  k_sem_give(&s_test_host_gate_sem);
-}
-#endif
 
 struct app_settings *main_get_settings(void) {
   return &settings;
@@ -2060,10 +2046,18 @@ int main(void) {
     return ret;
   }
 
+  uint32_t act_rate = 0, div = 0;
+  int err_hz = 0;
+  if (!audio_in_is_rate_supported(settings.sample_rate, &act_rate, &div, &err_hz)) {
+    LOG_WRN("Configured sample rate %u Hz unsupported, falling back to %u Hz",
+            settings.sample_rate, CONFIG_AUDIO_SAMPLE_RATE);
+    settings.sample_rate = CONFIG_AUDIO_SAMPLE_RATE;
+  }
   int rate_rc = audio_in_set_rate(settings.sample_rate);
   if (rate_rc != 0) {
     LOG_WRN("Configured sample rate %u could not be applied to hardware (%d), using %u",
             settings.sample_rate, rate_rc, audio_in_rate());
+    settings.sample_rate = audio_in_rate();
   }
   settings.sample_rate = audio_in_rate();
   apply_dsp_settings();
@@ -2106,9 +2100,22 @@ int main(void) {
            config_import_rc);
   }
 
+  /* Ensure PSRAM staging remains disabled if hardware or integrity verification failed */
+  if (!psram_is_present() || !psram_is_integrity_verified() || !psram_is_quad_mode()) {
+    settings.psram_staging_enabled = false;
+    recorder_set_psram_staging_enabled(false);
+  } else {
+    recorder_set_psram_staging_enabled(settings.psram_staging_enabled);
+  }
+
   /* Validate and apply final audio sampling rate and DSP parameters ONCE */
   settings.lpf_cutoff_hz = dsp_validate_lpf_cutoff(settings.sample_rate, settings.lpf_cutoff_hz);
-  audio_in_set_rate(settings.sample_rate);
+  if (!audio_in_is_rate_supported(settings.sample_rate, NULL, NULL, NULL)) {
+    settings.sample_rate = CONFIG_AUDIO_SAMPLE_RATE;
+  }
+  if (audio_in_set_rate(settings.sample_rate) != 0) {
+    settings.sample_rate = audio_in_rate();
+  }
   settings.sample_rate = audio_in_rate();
   dsp_init(settings.sample_rate);
   apply_dsp_settings();
@@ -2162,10 +2169,6 @@ int main(void) {
 
   k_sem_init(&s_rec_trigger_sem, 0, 1);
   k_sem_init(&s_rec_done_sem, 0, 1);
-#if defined(CONFIG_WILDSONIC_TEST_BUILD)
-  k_sem_init(&s_test_host_gate_sem, 0, 1);
-  s_test_host_gate_initialized = true;
-#endif
 
   recorder_tid = k_thread_create(
       &recorder_thread_data,
