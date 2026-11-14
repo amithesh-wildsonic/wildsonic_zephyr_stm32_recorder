@@ -229,16 +229,13 @@ def test_source_code_console_production_32bit_and_stereo_support():
     """Verify that console.c allows 32-bit depth and stereo channels in production."""
     src = (APP_SRC / "console.c").read_text(encoding="utf-8")
 
-    # BTPS / BITS: 32 must be valid in production
-    assert "g_cfg.audio_sampling_width = 32;" in src
-    assert "Value is set to 32" in src
+    # BTPS / BITS: 16/32 handled via feasibility check and assignment in production
+    assert "g_cfg.audio_sampling_width = val;" in src
+    assert "val != 16 && val != 32" in src
 
-    # 24-bit must remain deferred
-    assert "[DEFERRED] Bits per sample %d requires future hardware" in src
-
-    # NUMCH / CHANNELS: 2 must be valid in production
-    assert "g_cfg.num_audio_channels = 2;" in src
-    assert "Value is set to 2" in src
+    # NUMCH / CHANNELS: 1/2 handled uniformly in production
+    assert "g_cfg.num_audio_channels = val;" in src
+    assert "val != 1 && val != 2" in src
 
     # Packed AUDIO command allows 1/2 ch and 16/32 bits
     assert "(new_numch == 1 || new_numch == 2)" in src
@@ -335,12 +332,14 @@ def test_production_build_hygiene_and_quiet_console():
     src_rec = (APP_SRC / "recorder.c").read_text(encoding="utf-8")
     src_psram_staging = (APP_SRC / "psram_staging.c").read_text(encoding="utf-8")
 
-    # Benchmark conditionally compiled only when CONFIG_WILDSONIC_VERBOSE_LOGS is defined
-    assert "target_sources_ifdef(CONFIG_WILDSONIC_VERBOSE_LOGS app PRIVATE src/psram_benchmark.c)" in src_cmakelists
+    # Benchmark conditionally compiled only when CONFIG_WILDSONIC_BENCHMARKS is enabled
+    assert "target_sources_ifdef(CONFIG_WILDSONIC_BENCHMARKS app PRIVATE src/psram_benchmark.c)" in src_cmakelists
 
-    # Quiet logging policy in production
-    assert "LOG_MODULE_REGISTER(recorder, LOG_LEVEL_WRN);" in src_rec
-    assert "LOG_MODULE_REGISTER(psram_staging, LOG_LEVEL_WRN);" in src_psram_staging
+    # Unified quiet TRACE policy in recorder.c and psram_staging.c (no raw LOG_* in app modules)
+    assert '#include "wildsonic_trace.h"' in src_rec
+    assert '#include "wildsonic_trace.h"' in src_psram_staging
+    assert "LOG_MODULE_REGISTER(" not in src_rec
+    assert "LOG_MODULE_REGISTER(" not in src_psram_staging
 
     # SRAM2 retention section dedicated to audio buffer pool
     assert 'section("SRAM1")' in src_rec

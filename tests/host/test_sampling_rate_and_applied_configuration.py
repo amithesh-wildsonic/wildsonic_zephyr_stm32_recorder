@@ -123,60 +123,64 @@ def test_arbitrary_unsupported_rates_rejected():
 # ==============================================================================
 
 def test_source_audio_in_checks_timing_budget_in_is_rate_supported():
-    """audio_in_is_rate_supported() in audio_in_stm32l4.c must verify oversampling budget."""
+    """audio_in_is_rate_supported() in audio_in_stm32l4.c must delegate to rate_config_check_ex."""
     src = (APP_SRC / "audio_in_stm32l4.c").read_text(encoding="utf-8")
+    src_rc = (APP_SRC / "rate_check.c").read_text(encoding="utf-8")
     assert "bool audio_in_is_rate_supported" in src
-    # Must check conversion timing budget
-    assert "conv_ns * 100 > period_ns * 85" in src
+    assert "rate_config_check_ex" in src
+    # Timing budget checked in pure rate_check module
+    assert "period_ns64" in src_rc and "RATE_CHECK_ADC_BUDGET_PCT_MAX" in src_rc
     # audio_in_set_rate must call audio_in_is_rate_supported
     assert "audio_in_is_rate_supported(new_rate_hz" in src
 
 
 def test_source_console_samf_checks_hardware_set_rate():
-    """handle_samf() in console.c must verify audio_in_set_rate() return code."""
+    """handle_samf() in console.c must verify feasibility & audio_in_set_rate() return code."""
     src = (APP_SRC / "console.c").read_text(encoding="utf-8")
     assert "handle_samf" in src
+    assert "console_check_audio_config(" in src
     # Checks return code of audio_in_set_rate when idle
     assert "int rc = audio_in_set_rate(val);" in src
     assert "if (rc != 0)" in src
     assert "Unsupported sample rate" in src
-    # Must update settings->sample_rate from actual rate
-    assert "settings->sample_rate = audio_in_rate();" in src
+    # Keeps nominal sample rate in settings
+    assert "settings->sample_rate = val;" in src
 
 
 def test_source_console_sync_staged_to_active():
-    """console_sync_staged_to_active() must synchronize audio_in with g_cfg.sampling_rate."""
+    """console_sync_staged_to_active() must validate staged config cleanly without overwriting nominal rate."""
     src = (APP_SRC / "console.c").read_text(encoding="utf-8")
     assert "void console_sync_staged_to_active(void)" in src
-    assert "int rc = audio_in_set_rate(g_cfg.sampling_rate);" in src
-    assert "settings->sample_rate = audio_in_rate();" in src
+    assert "rate_config_check_ex(" in src
+    assert "settings->sample_rate = g_cfg.sampling_rate;" in src
 
 
 def test_source_config_store_validates_persisted_rate():
-    """unpack_record_to_system() in config_store.c must validate rec->sampling_rate."""
+    """unpack_record_to_system() and config_store_init() must validate persisted config via rate_config_check_ex."""
     src = (APP_SRC / "config_store.c").read_text(encoding="utf-8")
     assert "unpack_record_to_system" in src
-    assert "audio_in_is_rate_supported(eff_rate" in src
-    assert "reverting to" in src
+    assert "config_record_validate_rate(" in src
+    assert "Persisted config rejected" in src
 
 
 def test_source_main_boot_synchronizes_audio_in_rate():
-    """main() in main.c must call audio_in_set_rate() after loading config."""
+    """main() in main.c must validate before audio init and keep nominal settings.sample_rate."""
     src = (APP_SRC / "main.c").read_text(encoding="utf-8")
     # In main() startup:
-    assert "int rate_rc = audio_in_set_rate(settings.sample_rate);" in src
-    assert "settings.sample_rate = audio_in_rate();" in src
-    # In recorder_thread_fn():
-    assert "if (audio_in_rate() != settings.sample_rate)" in src
-    assert "settings.sample_rate = audio_in_rate();" in src
+    assert "rate_config_check_ex(&boot_p, &boot_rc);" in src
+    assert "ret = recorder_init_audio(settings.sample_rate);" in src
+    # In recorder_thread_fn() / recorder_reconcile_rate_before_session():
+    assert "if (audio_in_requested_rate() == settings.sample_rate)" in src
+    assert "audio_in_set_rate(settings.sample_rate);" in src
 
 
 def test_source_recorder_uses_actual_hardware_rate_and_exact_accounting():
-    """recorder_record_session() must calculate expected samples and WAV header from actual rate."""
+    """recorder_record_session() must check feasibility first and calculate expected samples from actual rate."""
     src = (APP_SRC / "recorder.c").read_text(encoding="utf-8")
+    assert "rate_config_check_ex(&rcp, &rc_res);" in src
     assert "st.sample_rate = audio_in_rate();" in src
     assert "st.expected_samples = (uint64_t)seconds * st.sample_rate;" in src
-    assert "exact_bytes = st.expected_samples * SAMPLE_BYTES;" in src
+    assert "exact_bytes = st.expected_samples * bytes_per_frame;" in src
     assert "wav_fill_header(hdr, st.sample_rate" in src
 
 

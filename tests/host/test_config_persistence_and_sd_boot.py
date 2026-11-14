@@ -411,50 +411,53 @@ def test_folder_structure_and_last_recording_scan():
 
 
 def test_assert_command_parity():
-    """Verify ASSERT command behavior matches Maxim reference (app/console.cpp:assert_info)."""
+    """Verify ASSERT command behavior preserves Maxim empty assert string and uses retained_reboot."""
     c_text = CONSOLE_C.read_text(encoding="utf-8")
     m_text = MAIN_C.read_text(encoding="utf-8")
 
     # Maxim canonical empty assert string: 'There is no assert information \n'
-    assert 'printk("There is no assert information \\n");' in c_text
-
-    # Normal boot must not dump reset flags unprompted in production
-    assert "print_reset_reason();" not in m_text or (
-        "#if defined(CONFIG_WILDSONIC_VERBOSE_LOGS)" in m_text
-    )
+    assert 'TRACE_RAW("There is no assert information \\n");' in c_text
+    assert "retained_reboot_get" in m_text
 
 
 def test_informative_boot_sequence_parity():
-    """Verify startup sequence includes operational information matching WildSonic reference."""
+    """Verify startup sequence includes approved boot template items."""
     m_text = MAIN_C.read_text(encoding="utf-8")
     cs_text = CONFIG_STORE_C.read_text(encoding="utf-8")
+    rec_text = (SRC_DIR / "recorder.c").read_text(encoding="utf-8")
+    ai_text = (SRC_DIR / "audio_in_stm32l4.c").read_text(encoding="utf-8")
+    rc_text = (SRC_DIR / "rtc_calendar.c").read_text(encoding="utf-8")
 
-    # Version, GIT Branch, Build Date
-    assert 'printk("Version: %s\\n", "v1.2.0");' in m_text
-    assert 'printk("GIT Branch: %s, SHA: %s\\n", "production", "d7a4f91");' in m_text
-    assert 'printk("Build Date: %s %s\\n", __DATE__, __TIME__);' in m_text
+    # Version, GIT Branch, Build Date, Basic System Init Done, Reset cause
+    assert 'TRACE_RAW("Version: %s\\n", "v1.2.0");' in m_text
+    assert 'TRACE_RAW("GIT Branch: %s, SHA: %s\\n", WILDSONIC_GIT_BRANCH, WILDSONIC_GIT_COMMIT);' in m_text
+    assert 'TRACE_RAW("Build Date: %s %s\\n", __DATE__, __TIME__);' in m_text
+    assert 'TRACE("Basic System Init Done");' in m_text
+    assert 'TRACE("Reset cause: %s", retained_reboot_reason_str(reason));' in m_text
 
     # SD card status
-    assert 'printk("SD card initialized successfully\\n");' in m_text
+    assert "recorder_log_sd_boot_status();" in m_text
+    assert 'TRACE("SD Card Init Done (%s, %llu MB free)"' in rec_text
 
-    # Configuration file status
-    assert 'printk("Configuration file is missing. Using earlier programmed configuration.\\n");' in cs_text
-    assert 'printk("Configuration file has been deleted\\n");' in cs_text
-    assert 'printk("Configuration status file has been created\\n");' in cs_text
+    # Configuration status & archive
+    assert 'TRACE("Config file deleted");' in cs_text
+    assert 'TRACE("Configuration loaded (slot %d, seq %u)"' in cs_text
 
     # Audio peripheral initialization
-    assert 'printk("Audio peripheral initialized\\n");' in m_text
+    assert "audio_in_log_boot_status();" in m_text
+    assert 'TRACE("ADC/DMA Init Done");' in ai_text
 
     # Last recording file scan output
-    assert "recorder_scan_last_file" in m_text
-    assert 'printk("Last file detected in folder: %s is %s\\n"' in m_text or \
-           'printk("Last file detected in' in m_text
+    assert "recorder_log_last_file();" in m_text
+    assert 'TRACE("Last file detected in' in rec_text
 
     # RTC UTC and Local time with timezone
-    assert 'printk("Current time UTC time is' in m_text
-    assert 'printk("Current time Local is' in m_text
+    assert "rtc_calendar_log_boot_times(" in m_text
+    assert 'TRACE("RTC Time UTC:' in rc_text
+    assert 'TRACE("RTC Time Local:' in rc_text
 
-    # System initialization complete
-    assert 'printk("System initialization complete\\n");' in m_text
+    # Initialization Complete & Last System Init Done
+    assert 'TRACE("Initialization Complete");' in m_text
+    assert 'TRACE("Last System Init Done");' in m_text
 
 

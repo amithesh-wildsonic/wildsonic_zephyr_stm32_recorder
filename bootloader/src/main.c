@@ -296,6 +296,10 @@ static bool validate_and_install_update(const char *file_path)
 	return true;
 }
 
+#ifndef WILDSONIC_GIT_COMMIT
+#define WILDSONIC_GIT_COMMIT "unknown"
+#endif
+
 static void boot_application(void)
 {
 	uint32_t initial_sp = *(volatile uint32_t *)APP_BANK2_START_ADDR;
@@ -307,8 +311,7 @@ static void boot_application(void)
 		return;
 	}
 
-	printk("[BOOTLOADER] Handoff to Bank 2 application @ 0x%08X (SP=0x%08X, Reset=0x%08X)...\n",
-	       APP_BANK2_START_ADDR, initial_sp, reset_handler);
+	printk("Jumping to the main firmware...\n");
 
 	/* Disable interrupts */
 	__disable_irq();
@@ -326,21 +329,14 @@ static void boot_application(void)
 
 int main(void)
 {
-	printk("\n==================================================\n");
-	printk("  WildSonic STM32 Dual-Bank SD Bootloader (v1.0) \n");
-	printk("  Target: STM32L476RG (1MB Dual-Bank Flash)       \n");
-	printk("  Bank 2 Load Address: 0x%08X                    \n", APP_BANK2_START_ADDR);
-	printk("==================================================\n");
+	printk("Bootloader SHA: %s\n", WILDSONIC_GIT_COMMIT);
+	printk("Bootloader Build Date: %s %s\n", __DATE__, __TIME__);
 
 	char update_path[128] = {0};
 	uint8_t maj = 0, min = 0, pat = 0;
 
 	if (scan_sd_for_update(update_path, sizeof(update_path), &maj, &min, &pat)) {
-		printk("[BOOTLOADER] Found candidate firmware image: %s (v%u.%u.%u)\n",
-		       update_path, maj, min, pat);
 		(void)validate_and_install_update(update_path);
-	} else {
-		printk("[BOOTLOADER] No firmware update files found on SD card.\n");
 	}
 
 	boot_application();

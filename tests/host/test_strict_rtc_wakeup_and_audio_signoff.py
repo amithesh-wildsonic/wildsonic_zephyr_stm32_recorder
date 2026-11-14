@@ -242,7 +242,7 @@ def test_rtc_sleep_timer_bounds():
 def test_rtc_initialization_failures_and_propagation():
     """Verify rtc_sleep_init fails safely on oscillator timeout and propagates errors."""
     rtc_sleep_c = (APP_SRC / "rtc_sleep.c").read_text(encoding="utf-8")
-    assert "LSI oscillator startup timed out; RTC initialization failed" in rtc_sleep_c
+    assert "LSI startup timeout; RTC init failed" in rtc_sleep_c
     assert "return -ETIMEDOUT;" in rtc_sleep_c
     assert "LL_RTC_SetAsynchPrescaler(RTC, 127);" in rtc_sleep_c
     assert "LL_RTC_SetSynchPrescaler(RTC, 255);" in rtc_sleep_c
@@ -256,7 +256,7 @@ def test_rtc_initialization_failures_and_propagation():
 def test_failed_psram_dpd_and_recovery():
     """Verify psram_sleep returns -EIO on failure, psram_wake initializes struct, and recorder_sleep propagates."""
     psram_c = (APP_SRC / "psram_is66wvs.c").read_text(encoding="utf-8")
-    assert "LOG_ERR(\"PSRAM DPD command failed: %d\", status);" in psram_c
+    assert 'TRACE("PSRAM DPD cmd failed: %d", status);' in psram_c
     assert "return -EIO;" in psram_c
     assert "struct psram_id id = {0};" in psram_c
 
@@ -289,7 +289,7 @@ def test_wrong_or_unexpected_wake_source():
     rtc_sleep_c = (APP_SRC / "rtc_sleep.c").read_text(encoding="utf-8")
     assert "bool rtc_wut_flag = (LL_RTC_IsActiveFlag_WUT(RTC) != 0);" in rtc_sleep_c
     assert "bool exti20_flag = (LL_EXTI_IsActiveFlag_0_31(LL_EXTI_LINE_20) != 0);" in rtc_sleep_c
-    assert "Unexpected wake event: RTC WUT flag not asserted" in rtc_sleep_c
+    assert "Unexpected Stop 2 wake (PR1=0x%08X, SR1=0x%08X)" in rtc_sleep_c
     assert "last_wake_source = RTC_WAKE_NONE;" in rtc_sleep_c
 
 
@@ -318,7 +318,7 @@ def test_rtc_wake_followed_by_correctly_scheduled_recording():
     # be drained/discarded or an open file closed as an implicit flush.
     sleep_src = recorder_c.split("int recorder_sleep(", 1)[1].split("void recorder_get_active_progress", 1)[0]
     pos_audio_stop = sleep_src.find("audio_in_stop()")
-    pos_pending_check = sleep_src.find("pending audio blocks remain")
+    pos_pending_check = sleep_src.find("recorder_sleep rejected: audio queues not empty")
     pos_staging_flush = sleep_src.find("psram_staging_flush_publish()")
     pos_open_file_guard = sleep_src.find("sd_file_ptr != NULL")
     pos_sd_idle = sleep_src.find("recorder_sd_verify_idle()")

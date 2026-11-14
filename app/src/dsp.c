@@ -1,16 +1,15 @@
 /* SPDX-License-Identifier: Apache-2.0 */
 #include "dsp.h"
+#include "rate_check.h"
 #include <math.h>
 #include <stdlib.h>
 #include <string.h>
 #include <zephyr/kernel.h>
 #include <zephyr/sys/time_units.h>
-#include <zephyr/logging/log.h>
+#include "wildsonic_trace.h"
 
-#if defined(CONFIG_WILDSONIC_VERBOSE_LOGS)
-LOG_MODULE_REGISTER(dsp, LOG_LEVEL_INF);
-#else
-LOG_MODULE_REGISTER(dsp, LOG_LEVEL_WRN);
+#if defined(CONFIG_CMSIS_DSP)
+#include <arm_math.h>
 #endif
 
 #ifndef M_PI
@@ -25,8 +24,21 @@ LOG_MODULE_REGISTER(dsp, LOG_LEVEL_WRN);
  * 4: Low-Pass Filter Stage 1 (e.g. 20 kHz, Q = 0.54119610)
  * 5: Low-Pass Filter Stage 2 (e.g. 20 kHz, Q = 1.30656296)
  */
-#define NUM_STAGES 6
+#define NUM_STAGES        6
+#define DSP_CHUNK_SAMPLES 128U
+
 static struct biquad_df2t stages[NUM_STAGES];
+static float cmsis_coeffs[NUM_STAGES * 5];
+static float cmsis_state[NUM_STAGES * 2];
+static uint32_t cmsis_num_active = 0;
+#if defined(CONFIG_CMSIS_DSP)
+static arm_biquad_cascade_df2T_instance_f32 cmsis_inst;
+#endif
+static bool high_rate_dc_only = false;
+static int32_t dc_fx16_x_prev = 0;
+static int32_t dc_fx16_y_prev = 0;
+static int64_t dc_fx32_x_prev = 0;
+static int64_t dc_fx32_y_prev = 0;
 static struct dsp_config active_cfg;
 static struct dsp_stats stats;
 static uint32_t current_fs = 192000;
@@ -35,6 +47,63 @@ static volatile uint32_t digital_clipping_count = 0;
 static volatile uint32_t dsp_input_clipping_count = 0;
 static volatile uint32_t dsp_filter_overshoot_count = 0;
 static volatile uint32_t dsp_gain_clipping_count = 0;
+
+static void dsp_rebuild_cascade(void)
+{
+	uint32_t n = 0;
+	for (int s = 0; s < NUM_STAGES; s++) {
+		if (!stages[s].enabled) {
+			continue;
+		}
+		if (high_rate_dc_only && s > 0) {
+			continue;
+		}
+		/* CMSIS DF2T computes d1 = b1*x + d2 + a1*acc; dsp stages negate a1/a2. */
+		cmsis_coeffs[n * 5 + 0] = stages[s].b0;
+		cmsis_coeffs[n * 5 + 1] = stages[s].b1;
+		cmsis_coeffs[n * 5 + 2] = stages[s].b2;
+		cmsis_coeffs[n * 5 + 3] = -stages[s].a1;
+		cmsis_coeffs[n * 5 + 4] = -stages[s].a2;
+		cmsis_state[n * 2 + 0] = 0.0f;
+		cmsis_state[n * 2 + 1] = 0.0f;
+		n++;
+	}
+	cmsis_num_active = n;
+#if defined(CONFIG_CMSIS_DSP)
+	if (n > 0U) {
+		arm_biquad_cascade_df2T_init_f32(&cmsis_inst, (uint8_t)n, cmsis_coeffs, cmsis_state);
+	}
+#endif
+}
+
+static inline void dsp_run_cascade_f32(float *buf, uint32_t count)
+{
+	if (cmsis_num_active == 0U || count == 0U) {
+		return;
+	}
+#if defined(CONFIG_CMSIS_DSP)
+	arm_biquad_cascade_df2T_f32(&cmsis_inst, buf, buf, count);
+#else
+	for (uint32_t s = 0U; s < cmsis_num_active; s++) {
+		const float b0 = cmsis_coeffs[s * 5U + 0U];
+		const float b1 = cmsis_coeffs[s * 5U + 1U];
+		const float b2 = cmsis_coeffs[s * 5U + 2U];
+		const float a1 = cmsis_coeffs[s * 5U + 3U];
+		const float a2 = cmsis_coeffs[s * 5U + 4U];
+		float d1 = cmsis_state[s * 2U + 0U];
+		float d2 = cmsis_state[s * 2U + 1U];
+		for (uint32_t i = 0U; i < count; i++) {
+			float xn = buf[i];
+			float acc = b0 * xn + d1;
+			d1 = b1 * xn + d2 + a1 * acc;
+			d2 = b2 * xn + a2 * acc;
+			buf[i] = acc;
+		}
+		cmsis_state[s * 2U + 0U] = d1;
+		cmsis_state[s * 2U + 1U] = d2;
+	}
+#endif
+}
 
 static inline float biquad_step(struct biquad_df2t *bq, float in)
 {
@@ -208,8 +277,7 @@ int dsp_configure(const struct dsp_config *cfg, uint32_t sample_rate_hz)
 	if (cfg->lpf_enabled && cfg->lpf_cutoff_hz > 0) {
 		float nyquist_bound = (float)sample_rate_hz * 0.49f;
 		if ((float)cfg->lpf_cutoff_hz >= nyquist_bound) {
-			LOG_WRN("LPF cutoff %u Hz is >= Nyquist boundary (%.0f Hz); bypassing stage to maintain filter stability",
-			        cfg->lpf_cutoff_hz, (double)nyquist_bound);
+			TRACE("LPF cutoff %u Hz >= Nyquist, bypassed", cfg->lpf_cutoff_hz);
 			biquad_set_bypass(&stages[4]);
 			biquad_set_bypass(&stages[5]);
 		} else {
@@ -222,13 +290,21 @@ int dsp_configure(const struct dsp_config *cfg, uint32_t sample_rate_hz)
 		biquad_set_bypass(&stages[5]);
 	}
 
-	LOG_INF("DSP configured for %u Hz: DC_Block=%d, HPF=%d (%u Hz), Notch=%d (%u Hz, Q=%.1f), LPF=%d (%u Hz, %s)",
-	        sample_rate_hz, cfg->dc_block_enabled, cfg->hpf_enabled, cfg->hpf_cutoff_hz,
-	        cfg->notch_enabled, cfg->notch_freq_hz, (double)cfg->notch_q,
-	        cfg->lpf_enabled, cfg->lpf_cutoff_hz,
-	        stages[4].enabled ? "4th-order" : "bypassed");
-
+	dsp_rebuild_cascade();
 	return 0;
+}
+
+void dsp_set_dc_only_mode(bool dc_only)
+{
+	if (high_rate_dc_only != dc_only) {
+		high_rate_dc_only = dc_only;
+		dsp_rebuild_cascade();
+	}
+}
+
+bool dsp_get_dc_only_mode(void)
+{
+	return high_rate_dc_only;
 }
 
 uint32_t dsp_validate_lpf_cutoff(uint32_t sample_rate_hz, uint32_t requested_cutoff_hz)
@@ -316,6 +392,11 @@ void dsp_reset(void)
 		stages[i].s1 = 0.0f;
 		stages[i].s2 = 0.0f;
 	}
+	memset(cmsis_state, 0, sizeof(cmsis_state));
+	dc_fx16_x_prev = 0;
+	dc_fx16_y_prev = 0;
+	dc_fx32_x_prev = 0;
+	dc_fx32_y_prev = 0;
 }
 
 void dsp_reset_stats(uint32_t sample_rate_hz, uint32_t block_samples)
@@ -338,75 +419,131 @@ void dsp_get_stats(struct dsp_stats *out)
 	}
 }
 
-void dsp_process_i16(int16_t *samples, uint32_t count)
+static void dsp_run_dc_only_i16(int16_t *samples, uint32_t count)
 {
-	if (!samples || count == 0) return;
+	int32_t x_prev = dc_fx16_x_prev;
+	int32_t y_prev = dc_fx16_y_prev;
 
-	uint64_t t0 = k_cycle_get_64();
-
-	/* Identify active filter stages */
-	struct biquad_df2t *active_stages[NUM_STAGES];
-	uint32_t num_active = 0;
-	for (int s = 0; s < NUM_STAGES; s++) {
-		if (stages[s].enabled) {
-			active_stages[num_active++] = &stages[s];
+	for (uint32_t i = 0U; i < count; i++) {
+		int16_t in_val = samples[i];
+		if (in_val == 32767 || in_val == -32768) {
+			dsp_input_clipping_count++;
+		}
+		int32_t x = (int32_t)in_val * 2048;
+		int32_t diff = x - x_prev;
+		x_prev = x;
+		int32_t decay = (y_prev >= 0) ? ((y_prev + 1024) >> 11) : -((-y_prev + 1024) >> 11);
+		int32_t y = diff + y_prev - decay;
+		y_prev = y;
+		int32_t out = (y >= 0) ? ((y + 1024) >> 11) : -((-y + 1024) >> 11);
+		if (out > 32767) {
+			samples[i] = 32767;
+			digital_clipping_count++;
+			dsp_filter_overshoot_count++;
+		} else if (out < -32768) {
+			samples[i] = -32768;
+			digital_clipping_count++;
+			dsp_filter_overshoot_count++;
+		} else {
+			samples[i] = (int16_t)out;
 		}
 	}
 
-	if (num_active > 0 || digital_gain != 1.0f) {
-		for (uint32_t i = 0; i < count; i++) {
-			int16_t in_val = samples[i];
-#if defined(CONFIG_WILDSONIC_VERBOSE_LOGS)
-			if (in_val >= 32767 || in_val <= -32768) {
-				dsp_input_clipping_count++;
-			}
-#endif
-			float x = (float)in_val;
+	dc_fx16_x_prev = x_prev;
+	dc_fx16_y_prev = y_prev;
+}
 
-			/* Cascade through active filter stages only */
-			for (uint32_t s = 0; s < num_active; s++) {
-				struct biquad_df2t *bq = active_stages[s];
-				float out = bq->b0 * x + bq->s1;
-				bq->s1 = bq->b1 * x - bq->a1 * out + bq->s2;
-				bq->s2 = bq->b2 * x - bq->a2 * out;
-				x = out;
-			}
+static void dsp_run_dc_only_i32(int32_t *samples, uint32_t count)
+{
+	int64_t x_prev = dc_fx32_x_prev;
+	int64_t y_prev = dc_fx32_y_prev;
 
-#if defined(CONFIG_WILDSONIC_VERBOSE_LOGS)
-			/* Detect filter overshoot before digital gain */
-			if ((x > 32767.0f || x < -32768.0f) && !(in_val >= 32767 || in_val <= -32768)) {
-				dsp_filter_overshoot_count++;
-			}
-#endif
+	for (uint32_t i = 0U; i < count; i++) {
+		int32_t in_val = samples[i];
+		if (in_val == INT32_MAX || in_val == INT32_MIN) {
+			dsp_input_clipping_count++;
+		}
+		int64_t x = (int64_t)in_val;
+		int64_t diff = x - x_prev;
+		x_prev = x;
+		int64_t decay = (y_prev >= 0) ? ((y_prev + 1024LL) >> 11) : -((-y_prev + 1024LL) >> 11);
+		int64_t y = diff + y_prev - decay;
+		y_prev = y;
+		if (y > (int64_t)INT32_MAX) {
+			samples[i] = INT32_MAX;
+			digital_clipping_count++;
+			dsp_filter_overshoot_count++;
+		} else if (y < (int64_t)INT32_MIN) {
+			samples[i] = INT32_MIN;
+			digital_clipping_count++;
+			dsp_filter_overshoot_count++;
+		} else {
+			samples[i] = (int32_t)y;
+		}
+	}
 
-			/* Apply post-filtering software digital gain */
-			if (digital_gain != 1.0f) {
-#if defined(CONFIG_WILDSONIC_VERBOSE_LOGS)
-				float x_pre_gain = x;
-#endif
-				x *= digital_gain;
-#if defined(CONFIG_WILDSONIC_VERBOSE_LOGS)
-				if ((x > 32767.0f || x < -32768.0f) &&
-				    (x_pre_gain <= 32767.0f && x_pre_gain >= -32768.0f)) {
-					dsp_gain_clipping_count++;
+	dc_fx32_x_prev = x_prev;
+	dc_fx32_y_prev = y_prev;
+}
+
+void dsp_process_i16(int16_t *samples, uint32_t count)
+{
+	if (!samples || count == 0U) {
+		return;
+	}
+
+	uint64_t t0 = k_cycle_get_64();
+	const uint32_t num_active = cmsis_num_active;
+	const float gain = digital_gain;
+
+	if (high_rate_dc_only && active_cfg.dc_block_enabled && gain == 1.0f) {
+		dsp_run_dc_only_i16(samples, count);
+	} else if (num_active > 0U || gain != 1.0f) {
+		float work[DSP_CHUNK_SAMPLES];
+		for (uint32_t off = 0U; off < count; off += DSP_CHUNK_SAMPLES) {
+			uint32_t n = (count - off > DSP_CHUNK_SAMPLES) ? DSP_CHUNK_SAMPLES : (count - off);
+			int16_t *p = &samples[off];
+
+			for (uint32_t i = 0U; i < n; i++) {
+				int16_t in_val = p[i];
+				if (in_val == 32767 || in_val == -32768) {
+					dsp_input_clipping_count++;
 				}
-#endif
+				work[i] = (float)in_val;
 			}
 
-			/* Saturate to 16-bit signed PCM range without integer wraparound */
-			if (x > 32767.0f) {
-				x = 32767.0f;
-				digital_clipping_count++;
-			} else if (x < -32768.0f) {
-				x = -32768.0f;
-				digital_clipping_count++;
+			if (num_active > 0U) {
+				dsp_run_cascade_f32(work, n);
 			}
-			samples[i] = (int16_t)x;
+
+			for (uint32_t i = 0U; i < n; i++) {
+				float x = work[i] * gain;
+				if (x >= 32767.0f) {
+					p[i] = 32767;
+					digital_clipping_count++;
+					if (gain > 1.0f && work[i] <= 32767.0f) {
+						dsp_gain_clipping_count++;
+					} else if (work[i] > 32767.0f) {
+						dsp_filter_overshoot_count++;
+					}
+				} else if (x <= -32768.0f) {
+					p[i] = -32768;
+					digital_clipping_count++;
+					if (gain > 1.0f && work[i] >= -32768.0f) {
+						dsp_gain_clipping_count++;
+					} else if (work[i] < -32768.0f) {
+						dsp_filter_overshoot_count++;
+					}
+				} else {
+					long v = lrintf(x);
+					p[i] = (v > 32767L) ? 32767 : ((v < -32768L) ? -32768 : (int16_t)v);
+				}
+			}
 		}
 	}
 
 	uint64_t t1 = k_cycle_get_64();
-	uint64_t cyc = (t1 >= t0) ? (t1 - t0) : 0;
+	uint64_t cyc = (t1 >= t0) ? (t1 - t0) : 0ULL;
 	uint32_t us = (uint32_t)k_cyc_to_us_floor64(cyc);
 
 	stats.total_cycles += cyc;
@@ -423,73 +560,62 @@ void dsp_process_i16(int16_t *samples, uint32_t count)
 
 void dsp_process_i32(int32_t *samples, uint32_t count)
 {
-	if (!samples || count == 0) return;
-
-	uint64_t t0 = k_cycle_get_64();
-
-	/* Identify active filter stages */
-	struct biquad_df2t *active_stages[NUM_STAGES];
-	uint32_t num_active = 0;
-	for (int s = 0; s < NUM_STAGES; s++) {
-		if (stages[s].enabled) {
-			active_stages[num_active++] = &stages[s];
-		}
+	if (!samples || count == 0U) {
+		return;
 	}
 
-	if (num_active > 0 || digital_gain != 1.0f) {
-		for (uint32_t i = 0; i < count; i++) {
-			int32_t in_val = samples[i];
-#if defined(CONFIG_WILDSONIC_VERBOSE_LOGS)
-			if (in_val >= 2147483647 || in_val <= -2147483648) {
-				dsp_input_clipping_count++;
-			}
-#endif
-			float x = (float)in_val;
+	uint64_t t0 = k_cycle_get_64();
+	const uint32_t num_active = cmsis_num_active;
+	const float gain = digital_gain;
 
-			/* Cascade through active filter stages only */
-			for (uint32_t s = 0; s < num_active; s++) {
-				struct biquad_df2t *bq = active_stages[s];
-				float out = bq->b0 * x + bq->s1;
-				bq->s1 = bq->b1 * x - bq->a1 * out + bq->s2;
-				bq->s2 = bq->b2 * x - bq->a2 * out;
-				x = out;
-			}
+	if (high_rate_dc_only && active_cfg.dc_block_enabled && gain == 1.0f) {
+		dsp_run_dc_only_i32(samples, count);
+	} else if (num_active > 0U || gain != 1.0f) {
+		float work[DSP_CHUNK_SAMPLES];
+		for (uint32_t off = 0U; off < count; off += DSP_CHUNK_SAMPLES) {
+			uint32_t n = (count - off > DSP_CHUNK_SAMPLES) ? DSP_CHUNK_SAMPLES : (count - off);
+			int32_t *p = &samples[off];
 
-#if defined(CONFIG_WILDSONIC_VERBOSE_LOGS)
-			/* Detect filter overshoot before digital gain */
-			if ((x > 2147483647.0f || x < -2147483648.0f) &&
-			    !(in_val >= 2147483647 || in_val <= -2147483648)) {
-				dsp_filter_overshoot_count++;
-			}
-#endif
-
-			/* Apply post-filtering software digital gain */
-			if (digital_gain != 1.0f) {
-#if defined(CONFIG_WILDSONIC_VERBOSE_LOGS)
-				float x_pre_gain = x;
-#endif
-				x *= digital_gain;
-#if defined(CONFIG_WILDSONIC_VERBOSE_LOGS)
-				if ((x > 2147483647.0f || x < -2147483648.0f) &&
-				    (x_pre_gain <= 2147483647.0f && x_pre_gain >= -2147483648.0f)) {
-					dsp_gain_clipping_count++;
+			for (uint32_t i = 0U; i < n; i++) {
+				int32_t in_val = p[i];
+				if (in_val == INT32_MAX || in_val == INT32_MIN) {
+					dsp_input_clipping_count++;
 				}
-#endif
+				work[i] = (float)in_val;
 			}
 
-			if (x > 2147483647.0f) {
-				x = 2147483647.0f;
-				digital_clipping_count++;
-			} else if (x < -2147483648.0f) {
-				x = -2147483648.0f;
-				digital_clipping_count++;
+			if (num_active > 0U) {
+				dsp_run_cascade_f32(work, n);
 			}
-			samples[i] = (int32_t)x;
+
+			for (uint32_t i = 0U; i < n; i++) {
+				float x = work[i] * gain;
+				/* 2147483520.0f is max finite float strictly < 2^31 (avoids INT32 UB/wrap). */
+				if (x >= 2147483520.0f) {
+					p[i] = INT32_MAX;
+					digital_clipping_count++;
+					if (gain > 1.0f && work[i] < 2147483520.0f) {
+						dsp_gain_clipping_count++;
+					} else if (work[i] >= 2147483520.0f) {
+						dsp_filter_overshoot_count++;
+					}
+				} else if (x <= -2147483648.0f) {
+					p[i] = INT32_MIN;
+					digital_clipping_count++;
+					if (gain > 1.0f && work[i] > -2147483648.0f) {
+						dsp_gain_clipping_count++;
+					} else if (work[i] <= -2147483648.0f) {
+						dsp_filter_overshoot_count++;
+					}
+				} else {
+					p[i] = (int32_t)lrintf(x);
+				}
+			}
 		}
 	}
 
 	uint64_t t1 = k_cycle_get_64();
-	uint64_t cyc = (t1 >= t0) ? (t1 - t0) : 0;
+	uint64_t cyc = (t1 >= t0) ? (t1 - t0) : 0ULL;
 	uint32_t us = (uint32_t)k_cyc_to_us_floor64(cyc);
 
 	stats.total_cycles += cyc;
@@ -504,6 +630,64 @@ void dsp_process_i32(int32_t *samples, uint32_t count)
 	}
 }
 
+void dsp_calibrate_cost(void)
+{
+	/* Measure real ns/sample on target hardware for DC-only and Full active cascade. */
+	struct dsp_config saved_cfg = active_cfg;
+	uint32_t saved_fs = current_fs;
+	bool saved_dc_only = high_rate_dc_only;
+	float saved_gain = digital_gain;
+	struct dsp_stats saved_stats = stats;
+
+	int16_t dummy[256];
+	for (uint32_t i = 0; i < 256U; i++) {
+		dummy[i] = (int16_t)(i * 17U - 2048);
+	}
+
+	/* 1. Bypass / gain-only path */
+	struct dsp_config bypass_cfg = { 0 };
+	digital_gain = 1.25f;
+	high_rate_dc_only = false;
+	dsp_configure(&bypass_cfg, saved_fs ? saved_fs : 48000U);
+	uint64_t t0 = k_cycle_get_64();
+	dsp_process_i16(dummy, 256U);
+	uint64_t cyc_bypass = k_cycle_get_64() - t0;
+
+	/* 2. DC-block-only path (fixed-point DC blocker) */
+	struct dsp_config dc_cfg = saved_cfg;
+	dc_cfg.dc_block_enabled = true;
+	digital_gain = 1.0f;
+	high_rate_dc_only = true;
+	dsp_configure(&dc_cfg, saved_fs ? saved_fs : 384000U);
+	t0 = k_cycle_get_64();
+	dsp_process_i16(dummy, 256U);
+	uint64_t cyc_dc = k_cycle_get_64() - t0;
+
+	/* 3. Full active filter path */
+	digital_gain = 1.0f;
+	high_rate_dc_only = false;
+	dsp_configure(&saved_cfg, saved_fs ? saved_fs : 48000U);
+	t0 = k_cycle_get_64();
+	dsp_process_i16(dummy, 256U);
+	uint64_t cyc_full = k_cycle_get_64() - t0;
+
+	uint32_t ns_bypass = (uint32_t)((k_cyc_to_ns_ceil64(cyc_bypass) + 128ULL) / 256ULL);
+	uint32_t ns_dc     = (uint32_t)((k_cyc_to_ns_ceil64(cyc_dc) + 128ULL) / 256ULL);
+	uint32_t ns_full   = (uint32_t)((k_cyc_to_ns_ceil64(cyc_full) + 128ULL) / 256ULL);
+
+	rate_check_set_measured_dsp_ns(ns_bypass ? ns_bypass : 1U,
+				       ns_dc ? ns_dc : 1U,
+				       ns_full ? ns_full : 1U);
+
+	/* Restore live state cleanly */
+	digital_gain = saved_gain;
+	high_rate_dc_only = saved_dc_only;
+	dsp_configure(&saved_cfg, saved_fs);
+	dsp_reset();
+	dsp_reset_all_clipping_counts();
+	stats = saved_stats;
+}
+
 
 
 void dsp_get_config(struct dsp_config *cfg)
@@ -516,11 +700,10 @@ void dsp_get_config(struct dsp_config *cfg)
 int dsp_set_digital_gain(float gain)
 {
 	if (gain < 0.1f || gain > 16.0f) {
-		LOG_ERR("Digital gain %.2f out of safe range [0.1 .. 16.0]", (double)gain);
+		TRACE("Digital gain %.2f out of range [0.1..16.0]", (double)gain);
 		return -EINVAL;
 	}
 	digital_gain = gain;
-	LOG_INF("Digital software gain set to %.2fx", (double)gain);
 	return 0;
 }
 

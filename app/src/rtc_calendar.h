@@ -48,6 +48,7 @@ int rtc_calendar_validate(const struct rtc_calendar_time *t);
  * @brief Initialize RTC calendar subsystem.
  */
 int rtc_calendar_init(void);
+void rtc_calendar_log_boot_times(int32_t tz_offset_sec);
 
 /**
  * @brief Check if RTC clock source is untrusted (e.g. LSI fallback, +-5-10% drift).

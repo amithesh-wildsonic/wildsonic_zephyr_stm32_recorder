@@ -2,6 +2,9 @@
 #include <string.h>
 #include "wav.h"
 
+_Static_assert((WAV_HEADER_BYTES % 512U) == 0U, "WAV header must be 512-byte sector aligned");
+_Static_assert(WAV_HEADER_BYTES >= 512U, "WAV header too small");
+
 static void put32(uint8_t *p, uint32_t v)
 {
 	p[0] = v & 0xff;
@@ -60,7 +63,17 @@ static uint16_t get16(const uint8_t *p)
 int wav_verify_header(const uint8_t hdr[WAV_HEADER_BYTES], uint32_t expected_rate,
 		      uint16_t expected_channels, uint16_t expected_bits, uint32_t expected_data_bytes)
 {
-	const uint16_t block_align = expected_channels * (expected_bits / 8);
+	if (expected_rate == 0U || (expected_channels != 1U && expected_channels != 2U) ||
+	    (expected_bits != 16U && expected_bits != 32U)) {
+		return -16;
+	}
+	const uint16_t block_align = expected_channels * (expected_bits / 8U);
+	if ((expected_data_bytes % block_align) != 0U) {
+		return -17;
+	}
+	if (expected_data_bytes > (UINT32_MAX - (WAV_HEADER_BYTES - 8U))) {
+		return -18;
+	}
 	const uint32_t junk_bytes = WAV_HEADER_BYTES - 12 - 24 - 8 - 8;
 
 	if (memcmp(hdr + 0, "RIFF", 4) != 0) {

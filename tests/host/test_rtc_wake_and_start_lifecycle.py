@@ -18,22 +18,20 @@ PRJ_CONF = str(APP_DIR / "prj.conf")
 
 
 def test_phase_markers_in_code():
-    print("Test 1: Verifying 8 Start Phase Markers in firmware sources...")
+    print("Test 1: Verifying session lifecycle markers in firmware sources...")
 
-    phases = [
-        (1, "Command received", ["src/main.c"]),
-        (2, "Configuration validated", ["src/main.c"]),
-        (3, "DSP initialized", ["src/recorder.c"]),
-        (4, "WAV file opened", ["src/recorder.c"]),
-        (5, "ADC/DMA configured", ["src/audio_in_stm32l4.c"]),
-        (6, "Timer started", ["src/audio_in_stm32l4.c"]),
-        (7, "First DMA callback received", ["src/audio_in_stm32l4.c"]),
-        (8, "First block accepted and written", ["src/recorder.c"]),
+    markers = [
+        ("Recording start:", ["src/recorder.c"]),
+        ("[TEST] CAPTURE_STARTED", ["src/recorder.c"]),
+        ("[TEST] CAPTURE_TARGET_REACHED", ["src/recorder.c"]),
+        ("[TEST] WAV_HEADER_FINALIZED", ["src/recorder.c"]),
+        ("[TEST] WAV_FILE_CLOSED", ["src/recorder.c"]),
+        ("[TEST] WAV_VERIFIED", ["src/recorder.c"]),
+        ("Recording done:", ["src/recorder.c"]),
     ]
 
-    for p_num, p_text, files in phases:
+    for target_marker, files in markers:
         found = False
-        target_marker = f"[PHASE {p_num}] {p_text}"
         for rel_file in files:
             path = os.path.join(PROJECT_ROOT, rel_file)
             with open(path, "r", encoding="utf-8") as f:
@@ -42,7 +40,6 @@ def test_phase_markers_in_code():
                     found = True
                     break
         assert found, f"Marker '{target_marker}' not found in {files}"
-        print(f"  [PASS] Phase {p_num}: '{target_marker}' verified in {files}")
 
 
 def test_prj_conf_synchronous_printk():
@@ -104,23 +101,25 @@ def test_adc_dma_reentrancy_guards():
 
 
 def test_production_startup_no_verbose_hexdump():
-    print("\nTest 6: Verifying verbose SD sector hex dumps are disabled in production startup...")
+    print("\nTest 6: Verifying verbose SD sector hex dumps are absent from recorder...")
     rec_c = os.path.join(SRC_DIR, "recorder.c")
     with open(rec_c, "r", encoding="utf-8") as f:
         code = f.read()
-    assert "#ifdef CONFIG_AUDIO_DIAGNOSTIC_MODE" in code, "CONFIG_AUDIO_DIAGNOSTIC_MODE guard missing"
-    assert code.count("LOG_HEXDUMP_INF") == 2, "Unexpected number of LOG_HEXDUMP_INF calls"
-    print("  [PASS] Verbose hex dumps guarded by CONFIG_AUDIO_DIAGNOSTIC_MODE.")
+    assert "LOG_HEXDUMP_" not in code, "Unexpected LOG_HEXDUMP call in recorder.c"
 
 
 def test_startup_log_flushed_before_prompt():
-    print("\nTest 7: Verifying all startup logs are flushed before prompt...")
+    print("\nTest 7: Verifying startup logs run synchronously and trace pump starts after boot...")
     main_c = os.path.join(SRC_DIR, "main.c")
     with open(main_c, "r", encoding="utf-8") as f:
         code = f.read()
-    assert "while (log_process())" in code, "log_process flush loop missing from main.c"
-    assert "zephyr/logging/log_ctrl.h" in code, "log_ctrl.h header missing"
-    print("  [PASS] Startup log flush loop verified.")
+    assert "wildsonic_trace_start_pump();" in code, "wildsonic_trace_start_pump missing from main.c"
+
+    trace_c = os.path.join(SRC_DIR, "wildsonic_trace.c")
+    with open(trace_c, "r", encoding="utf-8") as f:
+        tcode = f.read()
+    assert "while (log_process())" in tcode, "log_process flush loop missing from wildsonic_trace.c"
+    assert "zephyr/logging/log_ctrl.h" in tcode, "log_ctrl.h header missing from wildsonic_trace.c"
 
 
 def test_stop2_mode_and_clock_restoration():

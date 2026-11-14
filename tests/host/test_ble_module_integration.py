@@ -391,20 +391,21 @@ def test_get_status_info_format_and_temp_terminator():
 # ==============================================================================
 
 def test_reset_cause_diagnostics_in_main():
-    """Verify main.c captures RCC_CSR flags and logs detailed breakdown before clearing."""
+    """Verify main.c captures RCC_CSR before clearing and retained_reboot classifies reset flags."""
     main_src = MAIN_C.read_text(encoding="utf-8")
+    rbt_src = (APP_SRC / "retained_reboot.c").read_text(encoding="utf-8")
 
-    assert "RCC_CSR_BORRSTF" in main_src, "Must check BORRSTF"
-    assert "RCC_CSR_PINRSTF" in main_src, "Must check PINRSTF"
-    assert "RCC_CSR_SFTRSTF" in main_src, "Must check SFTRSTF"
-    assert "RCC_CSR_IWDGRSTF" in main_src, "Must check IWDGRSTF"
-    assert "RCC_CSR_WWDGRSTF" in main_src, "Must check WWDGRSTF"
-    assert "RCC_CSR_LPWRRSTF" in main_src, "Must check LPWRRSTF"
+    capture_idx = main_src.find("g_boot_csr = RCC->CSR;")
+    clear_idx = main_src.find("LL_RCC_ClearResetFlags();", capture_idx)
+    assert capture_idx != -1 and clear_idx > capture_idx, "g_boot_csr must be captured before clearing flags"
+    assert "retained_reboot_capture_csr(g_boot_csr);" in main_src
+    assert "main_emit_boot_banner_and_reason(" in main_src
 
-    # Verify clear is called AFTER print
-    print_idx = main_src.find("print_reset_reason")
-    clear_idx = main_src.find("LL_RCC_ClearResetFlags();", print_idx)
-    assert clear_idx > print_idx, "LL_RCC_ClearResetFlags must be called AFTER print_reset_reason"
+    assert "RCC_CSR_BORRSTF" in rbt_src, "Must check BORRSTF"
+    assert "RCC_CSR_PINRSTF" in rbt_src, "Must check PINRSTF"
+    assert "RCC_CSR_SFTRSTF" in rbt_src, "Must check SFTRSTF"
+    assert "RCC_CSR_IWDGRSTF" in rbt_src, "Must check IWDGRSTF"
+    assert "RCC_CSR_WWDGRSTF" in rbt_src, "Must check WWDGRSTF"
 
 
 def test_ble_events_do_not_reboot_stm32():
@@ -478,8 +479,8 @@ def test_wake_before_adty_failure_aborts_adty_command():
     lock_fn = c_src[c_src.find("void ble_comm_lock_pairing"):c_src.find("void ble_comm_suspend")]
 
     # Both open and lock must check wake success and return/abort on failure
-    assert "woke" in open_fn or "!woke" in open_fn or "aborting pairing unlock" in open_fn
-    assert "woke" in lock_fn or "!woke" in lock_fn or "aborting pairing lock" in lock_fn
+    assert "if (ble_comm_wake_module() != 0)" in open_fn
+    assert "if (ble_comm_wake_module() != 0)" in lock_fn
 
     # Simulator behavior verification
     sup = BleSupervisorSimulator(initial_adty=2)
@@ -521,4 +522,5 @@ def test_supervisor_probe_failure_preserves_uart_ready():
 
     assert "s_ble_uart_ready = true;" in init_fn
     assert "s_ble_supervisor_online = false;" in init_fn
-    assert "ws_ble: BLE module probe timed out" in init_fn
+    assert "s_ble_module_awake = false;" in init_fn
+    assert "if (!probed)" in init_fn

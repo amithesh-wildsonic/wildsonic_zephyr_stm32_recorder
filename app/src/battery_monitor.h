@@ -43,6 +43,7 @@ void battery_monitor_get_status(struct battery_status *status);
 void battery_monitor_publish_status(const struct battery_status *status);
 void battery_monitor_clear_status(void);
 int battery_monitor_init(void);
+void battery_monitor_log_boot_status(void);
 void battery_monitor_suspend(void);
 void battery_monitor_resume(void);
 

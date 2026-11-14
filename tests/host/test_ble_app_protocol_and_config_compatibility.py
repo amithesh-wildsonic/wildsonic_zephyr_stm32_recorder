@@ -153,11 +153,11 @@ def test_reboot_commands_single_response_ownership():
     src = CONSOLE_C.read_text(encoding="utf-8")
     rbt_pos = src.find("static void handle_rbt(void)")
     rbt_body = src[rbt_pos:src.find("/* ARBT handler", rbt_pos)]
-    assert rbt_body.count('printk("\\nRebooting device.\\n");') == 1
+    assert rbt_body.count('TRACE_RAW("\\nRebooting device.\\n");') == 1
 
     arbt_pos = src.find("static void handle_arbt(void)")
     arbt_body = src[arbt_pos:src.find("/* SDFMT handler", arbt_pos)]
-    assert arbt_body.count('printk("\\nRebooting device.\\n");') == 1
+    assert arbt_body.count('TRACE_RAW("\\nRebooting device.\\n");') == 1
 
 
 # ==============================================================================

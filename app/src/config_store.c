@@ -12,6 +12,7 @@
 #include "audio_in.h"
 #include "dsp.h"
 #include "psram_is66wvs.h"
+#include "rate_check.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -21,17 +22,11 @@
 #include <math.h>
 
 #ifdef __ZEPHYR__
+#include "wildsonic_trace.h"
 #include <zephyr/kernel.h>
 #include <zephyr/storage/flash_map.h>
 #include <zephyr/drivers/flash.h>
 #include <zephyr/fs/fs.h>
-#include <zephyr/logging/log.h>
-
-#if defined(CONFIG_WILDSONIC_VERBOSE_LOGS)
-LOG_MODULE_REGISTER(ws_config_store, LOG_LEVEL_INF);
-#else
-LOG_MODULE_REGISTER(ws_config_store, LOG_LEVEL_WRN);
-#endif
 #if defined(PARTITION_ID)
 #define STORAGE_PARTITION_ID PARTITION_ID(storage_partition)
 #else
@@ -40,9 +35,7 @@ LOG_MODULE_REGISTER(ws_config_store, LOG_LEVEL_WRN);
 #define STORAGE_PARTITION_NODE STORAGE_PARTITION_ID
 #else
 #include <errno.h>
-#define LOG_INF(...) do {} while (0)
-#define LOG_WRN(...) do {} while (0)
-#define LOG_ERR(...) do {} while (0)
+#define TRACE(...) do {} while (0)
 #endif
 
 static int s_active_slot = -1; /* 0 or 1, or -1 if uninitialized */
@@ -53,7 +46,7 @@ static bool s_has_pending = false;
 static struct wildsonic_persisted_config s_last_valid_applied_record;
 static bool s_has_last_valid_applied = false;
 
-static void unpack_record_to_system(const struct wildsonic_persisted_config *rec);
+static __attribute__((noinline)) void unpack_record_to_system(const struct wildsonic_persisted_config *rec);
 static void pack_system_to_record(struct wildsonic_persisted_config *rec);
 
 static uint32_t crc32_for_byte(uint32_t byte_val)
@@ -190,6 +183,9 @@ void config_store_load_defaults(void)
 	scheduler_reset_tod_ranges(scfg.tod_ranges, SCHEDULER_MAX_TIME_OF_DAY_RANGES);
 	scfg.day_of_week_mask = SCHEDULER_FULL_WEEK_MASK;
 	scfg.time_zone_offset = 0;
+	if (cfg) {
+		cfg->time_zone_offset = 0;
+	}
 	scfg.record_length = 600;
 	scfg.sleep_interval = 0;
 	scfg.latitude_e7 = SCHEDULER_INVALID_LOCATION_COORDINATE;
@@ -205,19 +201,69 @@ void config_store_load_defaults(void)
 	console_sync_staged_to_active();
 }
 
-static void unpack_record_to_system(const struct wildsonic_persisted_config *rec)
+static __attribute__((noinline)) bool config_record_validate_rate(
+    const struct wildsonic_persisted_config *rec, rate_check_result_t *res_out)
 {
-	uint32_t act = 0, div = 0;
-	int err = 0;
-	uint32_t eff_rate = rec->sampling_rate;
-	if (!audio_in_is_rate_supported(eff_rate, &act, &div, &err)) {
-		LOG_WRN("Persisted sampling rate %u unsupported by hardware, reverting to %u",
-		        rec->sampling_rate, (uint32_t)CONFIG_AUDIO_SAMPLE_RATE);
-		eff_rate = CONFIG_AUDIO_SAMPLE_RATE;
+	if (!rec || !res_out) {
+		return false;
 	}
+	rate_check_params_t p;
+	rate_check_init_params(&p);
+	p.nominal_rate_hz = rec->sampling_rate;
+	p.bits = (uint16_t)rec->audio_sampling_width;
+	p.channels = (uint16_t)rec->num_audio_channels;
+	p.duration_s = rec->recording_length;
+#ifdef __ZEPHYR__
+	p.psram_enabled = (rec->psram_staging_enabled != 0) &&
+	                  psram_is_present() && psram_is_quad_mode();
+#else
+	p.psram_enabled = (rec->psram_staging_enabled != 0);
+#endif
+	p.dsp_cfg.mode = RATE_DSP_AUTO;
+	p.dsp_cfg.hpf_hz = rec->lower_cutoff_frequency;
+	p.dsp_cfg.lpf_hz = rec->upper_cutoff_frequency;
+	p.dsp_cfg.notch_enabled = false;
+	rate_config_check_ex(&p, res_out);
+	return (res_out->status != RATE_STATUS_IMPOSSIBLE);
+}
 
+static void revert_record_audio_fields(struct wildsonic_persisted_config *rec,
+				       const struct wildsonic_persisted_config *good_fb)
+{
+	if (!rec) {
+		return;
+	}
+	if (good_fb) {
+		rec->sampling_rate = good_fb->sampling_rate;
+		rec->audio_sampling_width = good_fb->audio_sampling_width;
+		rec->num_audio_channels = good_fb->num_audio_channels;
+		rec->recording_length = good_fb->recording_length;
+		rec->upper_cutoff_frequency = good_fb->upper_cutoff_frequency;
+	} else {
+		rec->sampling_rate = CONFIG_AUDIO_SAMPLE_RATE;
+		rec->audio_sampling_width = 16U;
+		rec->num_audio_channels = 1U;
+		if (rec->recording_length == 0 || rec->recording_length > 86400U) {
+			rec->recording_length = 600U;
+		}
+		rec->upper_cutoff_frequency = dsp_validate_lpf_cutoff(rec->sampling_rate,
+								      rec->upper_cutoff_frequency);
+	}
+}
+
+static __attribute__((noinline)) void unpack_record_to_system(const struct wildsonic_persisted_config *rec)
+{
+	rate_check_result_t rc_res;
+	uint32_t eff_rate = rec->sampling_rate;
 	uint32_t eff_bits = (rec->audio_sampling_width == 32) ? 32 : 16;
 	uint32_t eff_ch = (rec->num_audio_channels == 2) ? 2 : 1;
+	if (!config_record_validate_rate(rec, &rc_res)) {
+		TRACE("Persisted config rejected (%s); reverting to %u Hz/%u-bit",
+		      rc_res.reason, (uint32_t)CONFIG_AUDIO_SAMPLE_RATE, 16U);
+		eff_rate = CONFIG_AUDIO_SAMPLE_RATE;
+		eff_bits = 16U;
+		eff_ch = 1U;
+	}
 
 	struct wildsonic_config *cfg = console_get_config();
 	if (cfg) {
@@ -249,6 +295,7 @@ static void unpack_record_to_system(const struct wildsonic_persisted_config *rec
 		uint32_t validated_lpf = dsp_validate_lpf_cutoff(eff_rate, rec->upper_cutoff_frequency);
 		cfg->upper_cutoff_frequency = validated_lpf;
 		cfg->folder_structure = rec->folder_structure;
+		cfg->time_zone_offset = rec->time_zone_offset;
 
 		cfg->location_lat_e7 = rec->latitude_e7 ? rec->latitude_e7 : SCHEDULER_INVALID_LOCATION_COORDINATE;
 		cfg->location_lon_e7 = rec->longitude_e7 ? rec->longitude_e7 : SCHEDULER_INVALID_LOCATION_COORDINATE;
@@ -378,7 +425,7 @@ static void pack_system_to_record(struct wildsonic_persisted_config *rec)
 	rec->checksum = config_store_calc_checksum(rec);
 }
 
-static bool config_record_is_valid(const struct wildsonic_persisted_config *rec)
+static bool config_record_header_valid(const struct wildsonic_persisted_config *rec)
 {
 	if (!rec) return false;
 	if (rec->magic != CONFIG_STORE_MAGIC) return false;
@@ -388,12 +435,13 @@ static bool config_record_is_valid(const struct wildsonic_persisted_config *rec)
 			return false;
 		}
 	}
+	return true;
+}
 
-	uint32_t act = 0, div = 0;
-	int err = 0;
-	if (!audio_in_is_rate_supported(rec->sampling_rate, &act, &div, &err)) {
-		return false;
-	}
+static bool config_record_is_valid(const struct wildsonic_persisted_config *rec)
+{
+	if (!config_record_header_valid(rec)) return false;
+
 	if (rec->audio_sampling_width != 16 && rec->audio_sampling_width != 32) {
 		return false;
 	}
@@ -403,16 +451,46 @@ static bool config_record_is_valid(const struct wildsonic_persisted_config *rec)
 	if (rec->recording_length == 0 || rec->recording_length > 86400) {
 		return false;
 	}
+	rate_check_result_t rc_res;
+	if (!config_record_validate_rate(rec, &rc_res)) {
+		return false;
+	}
 	return true;
 }
 
-int config_store_init(void)
+static bool config_records_payload_equal(const struct wildsonic_persisted_config *a,
+					 const struct wildsonic_persisted_config *b)
 {
+	if (!a || !b) {
+		return false;
+	}
+	struct wildsonic_persisted_config na = *a;
+	struct wildsonic_persisted_config nb = *b;
+	na.version = CONFIG_STORE_VERSION_2;
+	nb.version = CONFIG_STORE_VERSION_2;
+	na.sequence_number = 0;
+	nb.sequence_number = 0;
+	na.pending_apply = 0;
+	nb.pending_apply = 0;
+	na.pending_generation = 0;
+	nb.pending_generation = 0;
+	na.applied_generation = 0;
+	nb.applied_generation = 0;
+	na.crc32 = 0;
+	nb.crc32 = 0;
+	na.checksum = 0;
+	nb.checksum = 0;
+	return memcmp(&na, &nb, sizeof(na)) == 0;
+}
+
 #ifdef __ZEPHYR__
+static __attribute__((noinline)) int config_store_init_load_slots(bool *out_need_save)
+{
+	*out_need_save = false;
 	const struct flash_area *fa = NULL;
 	int rc = flash_area_open(STORAGE_PARTITION_ID, &fa);
 	if (rc != 0) {
-		LOG_ERR("Failed to open storage partition: %d", rc);
+		TRACE("Storage partition open failed (%d)", rc);
 		config_store_load_defaults();
 		return rc;
 	}
@@ -465,60 +543,60 @@ int config_store_init(void)
 		s_active_slot = primary_slot;
 		s_seq = primary->sequence_number;
 
-		if (primary->pending_apply) {
-			LOG_INF("Pending configuration detected in flash slot %d (seq: %u, gen: %u)",
-			        primary_slot, primary->sequence_number, primary->pending_generation);
-
-			if (config_record_is_valid(primary)) {
-				if (primary->version == CONFIG_STORE_VERSION_1) {
-					LOG_INF("Migrating config store record from Version 1 to Version 2");
-				}
-				unpack_record_to_system(primary);
+		rate_check_result_t primary_rc;
+		memset(&primary_rc, 0, sizeof(primary_rc));
+		bool primary_rate_ok = config_record_validate_rate(primary, &primary_rc);
+		if (primary_rate_ok && config_record_is_valid(primary)) {
+			unpack_record_to_system(primary);
+			if (primary->pending_apply) {
 				s_applied_gen = primary->pending_generation;
 				s_pending_gen = primary->pending_generation;
 				s_has_pending = false;
-				s_last_valid_applied_record = *primary;
-				s_last_valid_applied_record.pending_apply = 0;
-				s_last_valid_applied_record.applied_generation = s_applied_gen;
-				s_has_last_valid_applied = true;
+				s_has_last_valid_applied = false;
 
-				/* Clear pending marker in flash atomically by committing applied state */
-				(void)config_store_save();
-				LOG_INF("Applied pending configuration to active runtime (applied gen: %u)", s_applied_gen);
-				return 0;
+				/* Clear pending marker in flash atomically after releasing slot buffers */
+				*out_need_save = true;
 			} else {
-				LOG_ERR("Pending configuration validation failed! Falling back to last known valid applied configuration.");
-				if (fallback && config_record_is_valid(fallback) && !fallback->pending_apply) {
-					unpack_record_to_system(fallback);
-					s_applied_gen = fallback->applied_generation;
-					s_pending_gen = fallback->applied_generation;
-					s_has_pending = false;
-					s_last_valid_applied_record = *fallback;
-					s_has_last_valid_applied = true;
-					LOG_INF("Recovered using fallback flash slot (seq: %u, applied gen: %u)",
-					        fallback->sequence_number, s_applied_gen);
-					return 0;
-				} else {
-					LOG_WRN("No valid fallback configuration available; loading factory defaults");
-					config_store_load_defaults();
-					s_applied_gen = 0;
-					s_pending_gen = 0;
-					s_has_pending = false;
-					return 0;
-				}
+				s_applied_gen = primary->applied_generation;
+				s_pending_gen = primary->pending_generation;
+				s_has_pending = false;
+				s_last_valid_applied_record = *primary;
+				s_has_last_valid_applied = true;
 			}
-		} else {
-			/* Standard applied configuration */
-			unpack_record_to_system(primary);
-			s_applied_gen = primary->applied_generation;
-			s_pending_gen = primary->pending_generation;
-			s_has_pending = false;
-			s_last_valid_applied_record = *primary;
-			s_has_last_valid_applied = true;
-			LOG_INF("Loaded config from flash slot %d (seq: %u, applied gen: %u)",
-			        s_active_slot, s_seq, s_applied_gen);
 			return 0;
 		}
+
+		TRACE("Stored config invalid (%s); reverting audio to last good config",
+		      primary_rc.reason[0] ? primary_rc.reason : "invalid record");
+		if (config_record_header_valid(primary)) {
+			const struct wildsonic_persisted_config *good_fb =
+				(fallback && config_record_is_valid(fallback)) ? fallback : NULL;
+			revert_record_audio_fields(primary, good_fb);
+			unpack_record_to_system(primary);
+			s_applied_gen = primary->applied_generation;
+			s_pending_gen = primary->applied_generation;
+			s_has_pending = false;
+			s_has_last_valid_applied = false;
+			*out_need_save = true;
+			return 0;
+		}
+		if (fallback && config_record_is_valid(fallback)) {
+			unpack_record_to_system(fallback);
+			s_applied_gen = fallback->applied_generation;
+			s_pending_gen = fallback->applied_generation;
+			s_has_pending = false;
+			s_last_valid_applied_record = *fallback;
+			s_has_last_valid_applied = true;
+			*out_need_save = true;
+			return 0;
+		}
+
+		TRACE("No valid fallback config; using defaults");
+		config_store_load_defaults();
+		s_applied_gen = 0;
+		s_pending_gen = 0;
+		s_has_pending = false;
+		return 0;
 	} else {
 		/* Neither valid: load factory defaults */
 		s_active_slot = -1;
@@ -527,33 +605,76 @@ int config_store_init(void)
 		s_pending_gen = 0;
 		s_has_pending = false;
 		config_store_load_defaults();
-		LOG_INF("No valid flash configuration found. Loaded factory defaults.");
 		return 0;
 	}
+}
+#endif
+
+int config_store_init(void)
+{
+#ifdef __ZEPHYR__
+	bool need_save = false;
+	int rc = config_store_init_load_slots(&need_save);
+	if (rc != 0) {
+		return rc;
+	}
+	if (need_save) {
+		(void)config_store_save();
+	}
+	return 0;
 #else
 	config_store_load_defaults();
 	return 0;
 #endif
 }
 
-int config_store_save(void)
+void config_store_stage_pending(void)
 {
+	s_has_pending = true;
+	s_pending_gen++;
+}
+
+bool config_store_has_unsaved_changes(void)
+{
+	struct wildsonic_persisted_config rec;
+	pack_system_to_record(&rec);
+	if (!s_has_last_valid_applied) {
+		return true;
+	}
+	return !config_records_payload_equal(&rec, &s_last_valid_applied_record);
+}
+
+__attribute__((noinline)) int config_store_save(void)
+{
+#ifdef __ZEPHYR__
+	if (recorder_is_active()) {
+		return -EBUSY;
+	}
+#endif
+	struct wildsonic_persisted_config rec;
+	pack_system_to_record(&rec);
+	if (s_has_last_valid_applied &&
+	    config_records_payload_equal(&rec, &s_last_valid_applied_record)) {
+		s_has_pending = false;
+		s_applied_gen = s_pending_gen;
+		return 0;
+	}
+
 	s_has_pending = false;
 	s_applied_gen = s_pending_gen;
 	s_seq++;
-	struct wildsonic_persisted_config rec;
-	pack_system_to_record(&rec);
 	rec.pending_apply = 0;
 	rec.applied_generation = s_applied_gen;
 	rec.pending_generation = s_pending_gen;
 	rec.sequence_number = s_seq;
+	rec.crc32 = config_store_calc_crc32(&rec);
 	rec.checksum = config_store_calc_checksum(&rec);
 
 #ifdef __ZEPHYR__
 	const struct flash_area *fa = NULL;
 	int rc = flash_area_open(STORAGE_PARTITION_ID, &fa);
 	if (rc != 0) {
-		LOG_ERR("Failed to open storage partition for write: %d", rc);
+		TRACE("Flash config open failed (%d)", rc);
 		return rc;
 	}
 
@@ -562,14 +683,14 @@ int config_store_save(void)
 
 	rc = flash_area_erase(fa, target_offset, CONFIG_STORE_SLOT_SIZE);
 	if (rc != 0) {
-		LOG_ERR("flash_area_erase failed on slot %d: %d", target_slot, rc);
+		TRACE("Flash erase slot %d failed (%d)", target_slot, rc);
 		flash_area_close(fa);
 		return rc;
 	}
 
 	rc = flash_area_write(fa, target_offset, &rec, sizeof(rec));
 	if (rc != 0) {
-		LOG_ERR("flash_area_write failed on slot %d: %d", target_slot, rc);
+		TRACE("Flash write slot %d failed (%d)", target_slot, rc);
 		flash_area_close(fa);
 		return rc;
 	}
@@ -579,7 +700,7 @@ int config_store_save(void)
 	rc = flash_area_read(fa, target_offset, &verify, sizeof(verify));
 	if (rc != 0 || verify.magic != CONFIG_STORE_MAGIC ||
 	    verify.checksum != rec.checksum || memcmp(&verify, &rec, sizeof(rec)) != 0) {
-		LOG_ERR("Verification failed for slot %d", target_slot);
+		TRACE("Flash verify slot %d failed", target_slot);
 		flash_area_close(fa);
 		return -EIO;
 	}
@@ -588,7 +709,6 @@ int config_store_save(void)
 	s_active_slot = target_slot;
 	s_last_valid_applied_record = rec;
 	s_has_last_valid_applied = true;
-	LOG_INF("Saved config to flash slot %d (seq: %u, applied gen: %u)", s_active_slot, s_seq, s_applied_gen);
 	return 0;
 #else
 	s_active_slot = (s_active_slot == 0) ? 1 : 0;
@@ -609,13 +729,14 @@ int config_store_save_pending(void)
 	rec.pending_generation = s_pending_gen;
 	rec.applied_generation = s_applied_gen;
 	rec.sequence_number = s_seq;
+	rec.crc32 = config_store_calc_crc32(&rec);
 	rec.checksum = config_store_calc_checksum(&rec);
 
 #ifdef __ZEPHYR__
 	const struct flash_area *fa = NULL;
 	int rc = flash_area_open(STORAGE_PARTITION_ID, &fa);
 	if (rc != 0) {
-		LOG_ERR("Failed to open storage partition for write: %d", rc);
+		TRACE("Flash pending open failed (%d)", rc);
 		s_pending_gen--;
 		s_seq--;
 		return rc;
@@ -626,7 +747,7 @@ int config_store_save_pending(void)
 
 	rc = flash_area_erase(fa, target_offset, CONFIG_STORE_SLOT_SIZE);
 	if (rc != 0) {
-		LOG_ERR("flash_area_erase failed on slot %d: %d", target_slot, rc);
+		TRACE("Flash pending erase slot %d failed (%d)", target_slot, rc);
 		flash_area_close(fa);
 		s_pending_gen--;
 		s_seq--;
@@ -635,7 +756,7 @@ int config_store_save_pending(void)
 
 	rc = flash_area_write(fa, target_offset, &rec, sizeof(rec));
 	if (rc != 0) {
-		LOG_ERR("flash_area_write failed on slot %d: %d", target_slot, rc);
+		TRACE("Flash pending write slot %d failed (%d)", target_slot, rc);
 		flash_area_close(fa);
 		s_pending_gen--;
 		s_seq--;
@@ -647,7 +768,7 @@ int config_store_save_pending(void)
 	rc = flash_area_read(fa, target_offset, &verify, sizeof(verify));
 	if (rc != 0 || verify.magic != CONFIG_STORE_MAGIC ||
 	    verify.checksum != rec.checksum || memcmp(&verify, &rec, sizeof(rec)) != 0) {
-		LOG_ERR("Verification failed for slot %d", target_slot);
+		TRACE("Flash pending verify slot %d failed", target_slot);
 		flash_area_close(fa);
 		s_pending_gen--;
 		s_seq--;
@@ -656,8 +777,6 @@ int config_store_save_pending(void)
 
 	flash_area_close(fa);
 	s_active_slot = target_slot;
-	LOG_INF("Saved pending config to flash slot %d (seq: %u, pending gen: %u)",
-	        s_active_slot, s_seq, s_pending_gen);
 	return 0;
 #else
 	s_active_slot = (s_active_slot == 0) ? 1 : 0;
@@ -681,14 +800,14 @@ int config_store_write_status_file(const char *path)
 
 	int rc = fs_open(&file, path, FS_O_CREATE | FS_O_WRITE);
 	if (rc != 0) {
-		LOG_ERR("config_store_write_status_file: fs_open failed (%d)", rc);
+		TRACE("Status file open failed (%d)", rc);
 		return rc;
 	}
 
 	/* Truncate if already exists */
 	rc = fs_truncate(&file, 0);
 	if (rc != 0) {
-		LOG_ERR("config_store_write_status_file: fs_truncate failed (%d)", rc);
+		TRACE("Status file truncate failed (%d)", rc);
 		fs_close(&file);
 		return rc;
 	}
@@ -705,7 +824,7 @@ int config_store_write_status_file(const char *path)
 			ssize_t w = fs_write(&file, buf, (size_t)n); \
 			if (w != (ssize_t)n) { \
 				int err_code = (w < 0) ? (int)w : -EIO; \
-				LOG_ERR("config_store_write_status_file: write failed (%d)", err_code); \
+				TRACE("Status write failed (%d)", err_code); \
 				fs_close(&file); \
 				return err_code; \
 			} \
@@ -765,10 +884,9 @@ int config_store_write_status_file(const char *path)
 
 	rc = fs_close(&file);
 	if (rc != 0) {
-		LOG_ERR("config_store_write_status_file: fs_close failed (%d)", rc);
+		TRACE("Status file close failed (%d)", rc);
 		return rc;
 	}
-	printk("Configuration status file has been created\n");
 	return 0;
 #else
 	ARG_UNUSED(path);
@@ -785,9 +903,10 @@ int config_store_import_sd(void)
 
 	struct fs_dirent entry;
 	if (fs_stat(ini_path, &entry) != 0) {
-		/* config.ini not present on SD card; create config_status.txt with current settings */
-		printk("Configuration file is missing. Using earlier programmed configuration.\n");
-		config_store_write_status_file(status_path);
+		/* config.ini not present on SD card; create config_status.txt if missing */
+		if (fs_stat(status_path, &entry) != 0) {
+			config_store_write_status_file(status_path);
+		}
 		return 0;
 	}
 
@@ -795,7 +914,7 @@ int config_store_import_sd(void)
 	fs_file_t_init(&file);
 	int rc = fs_open(&file, ini_path, FS_O_READ);
 	if (rc != 0) {
-		LOG_ERR("Failed to open %s: %d", ini_path, rc);
+		TRACE("Failed to open %s (%d)", ini_path, rc);
 		config_store_write_status_file(status_path);
 		return rc;
 	}
@@ -828,7 +947,7 @@ int config_store_import_sd(void)
 
 			if (ch != '\n') {
 				if (line_pos >= sizeof(line) - 1) {
-					LOG_WRN("config_store_import_sd: line exceeds 127 bytes, discarding");
+					TRACE("SD config line >127B, skipping");
 					import_error = true;
 					discarding_oversized = true;
 					line_pos = 0;
@@ -864,7 +983,7 @@ int config_store_import_sd(void)
 
 		char *eq = strchr(start, '=');
 		if (!eq) {
-			printk("\nUnknown or BAD config option : %s\n", start);
+			TRACE("Unknown/bad config option: %s", start);
 			import_error = true;
 			if (read_bytes != 1) break;
 			continue;
@@ -914,7 +1033,7 @@ int config_store_import_sd(void)
 				int idx = key[12] - '0';
 				snprintf(cmd_buf, sizeof(cmd_buf), "TIMEOFDAY %d %s", idx, val);
 			} else {
-				printk("\nUnknown or BAD config option : %s\n", key);
+				TRACE("Unknown/bad config option: %s", key);
 				import_error = true;
 				if (read_bytes != 1) break;
 				continue;
@@ -1059,11 +1178,10 @@ int config_store_import_sd(void)
 		} else if (strcasecmp(key, "build_version") == 0 ||
 		           strcasecmp(key, "build_datetime") == 0 ||
 		           strcasecmp(key, "build_sha") == 0) {
-			LOG_INF("config_store_import_sd: ignoring status metadata '%s'", key);
 			if (read_bytes != 1) break;
 			continue;
 		} else {
-			printk("\nUnknown or BAD config option : %s\n", key);
+			TRACE("Unknown/bad config option: %s", key);
 			import_error = true;
 			if (read_bytes != 1) break;
 			continue;
@@ -1074,7 +1192,7 @@ int config_store_import_sd(void)
 			if (rc == 0) {
 				updated = true;
 			} else {
-				LOG_WRN("config_store_import_sd: command '%s' failed (%d)", cmd_buf, rc);
+				TRACE("SD config command failed (%d): %s", rc, cmd_buf);
 				import_error = true;
 			}
 		}
@@ -1083,14 +1201,24 @@ int config_store_import_sd(void)
 	}
 
 	if (read_bytes < 0) {
-		LOG_ERR("config_store_import_sd: fs_read failed (%d)", (int)read_bytes);
+		TRACE("SD config read failed (%d)", (int)read_bytes);
 		import_error = true;
 	}
 
 	fs_close(&file);
 
+	if (!import_error && updated) {
+		struct wildsonic_persisted_config probe;
+		pack_system_to_record(&probe);
+		rate_check_result_t imp_rc;
+		if (!config_record_validate_rate(&probe, &imp_rc)) {
+			TRACE("SD config rejected (%s); rolling back", imp_rc.reason);
+			import_error = true;
+		}
+	}
+
 	if (import_error) {
-		LOG_ERR("config_store_import_sd: import failed, rolling back to previous configuration");
+		TRACE("SD config import failed; rolling back");
 		*console_get_config() = orig_cfg;
 		scheduler_set_config(&orig_scfg);
 		config_store_rollback_pending();
@@ -1106,10 +1234,10 @@ int config_store_import_sd(void)
 	/* Rename config.ini to config.bak (or unlink if rename fails) */
 	fs_unlink(bak_path);
 	if (fs_rename(ini_path, bak_path) == 0) {
-		printk("Configuration file has been archived to config.bak\n");
+		TRACE("Config file archived to config.bak");
 	} else {
 		fs_unlink(ini_path);
-		printk("Configuration file has been deleted\n");
+		TRACE("Config file deleted");
 	}
 
 	config_store_write_status_file(status_path);
@@ -1117,4 +1245,13 @@ int config_store_import_sd(void)
 #else
 	return 0;
 #endif
+}
+
+void config_store_log_boot_status(void)
+{
+	if (s_active_slot >= 0) {
+		TRACE("Configuration loaded (slot %d, seq %u)", s_active_slot, s_seq);
+	} else {
+		TRACE("Configuration loaded (defaults)");
+	}
 }

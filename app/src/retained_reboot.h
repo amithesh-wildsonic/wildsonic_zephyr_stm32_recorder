@@ -20,6 +20,8 @@ typedef enum {
 	REBOOT_REASON_PIN_RESET,
 	REBOOT_REASON_POWER_ON_RESET,
 	REBOOT_REASON_SOFTWARE_RESET,
+	REBOOT_REASON_SLEEP_WAKE_RTC,
+	REBOOT_REASON_SLEEP_WAKE_GPIO,
 	REBOOT_REASON_UNKNOWN
 } reboot_reason_t;
 
@@ -31,6 +33,7 @@ struct retained_reboot_info {
 };
 
 void retained_reboot_init(void);
+void retained_reboot_capture_csr(uint32_t csr);
 void retained_reboot_set_reason(reboot_reason_t reason);
 void retained_reboot_set_assert(uint32_t id, const char *file, uint32_t line);
 reboot_reason_t retained_reboot_get(struct retained_reboot_info *out_info);

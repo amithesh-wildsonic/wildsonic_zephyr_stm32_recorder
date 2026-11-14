@@ -8,20 +8,14 @@
 #include <string.h>
 
 #if defined(__ZEPHYR__)
+#include "wildsonic_trace.h"
 #include <zephyr/kernel.h>
-#include <zephyr/logging/log.h>
 #include <zephyr/sys/time_units.h>
-#if defined(CONFIG_WILDSONIC_VERBOSE_LOGS)
-LOG_MODULE_REGISTER(psram_bench, LOG_LEVEL_INF);
-#else
-LOG_MODULE_REGISTER(psram_bench, LOG_LEVEL_WRN);
-#endif
 #else
 #include <stdio.h>
 #include <time.h>
-#define LOG_INF(...) do {} while (0)
-#define LOG_ERR(...) do {} while (0)
-#define LOG_WRN(...) do {} while (0)
+#define TRACE_TEST(...) do {} while (0)
+#define TRACE_RAW_TEST(...) do {} while (0)
 __attribute__((weak)) bool recorder_is_active(void) { return false; }
 #endif
 
@@ -161,12 +155,10 @@ int psram_benchmark_run(enum psram_bench_mode mode,
 					if (chunk_mismatches > 0) {
 						out->mismatch_blocks++;
 						out->mismatch_count++;
-#if defined(CONFIG_WILDSONIC_VERBOSE_LOGS) || !defined(__ZEPHYR__)
-						LOG_WRN("[BENCH DIAG] Chunk %u (addr 0x%08X): %u/%u bytes mismatch! First at +%u (0x%08X): exp=0x%02X act=0x%02X (diff=0x%02X)",
-						        chunk_idx, current_addr, chunk_mismatches, chunk_len,
-						        out->first_mismatch_offset, out->first_mismatch_addr,
-						        out->first_expected_byte, out->first_actual_byte, out->first_diff_mask);
-#endif
+						TRACE_TEST("[BENCH DIAG] Chunk %u (0x%08X): %u/%u mismatch @ +%u: exp=0x%02X act=0x%02X",
+						           chunk_idx, current_addr, chunk_mismatches, chunk_len,
+						           out->first_mismatch_offset,
+						           out->first_expected_byte, out->first_actual_byte);
 					}
 				}
 			}
@@ -201,11 +193,9 @@ int psram_benchmark_run(enum psram_bench_mode mode,
 					if (chunk_mismatches > 0) {
 						out->mismatch_blocks++;
 						out->mismatch_count++;
-#if defined(CONFIG_WILDSONIC_VERBOSE_LOGS) || !defined(__ZEPHYR__)
-						LOG_WRN("[BENCH DIAG REPEAT] Iteration %u: %u/%u bytes mismatch! exp=0x%02X act=0x%02X",
-						        chunk_idx, chunk_mismatches, chunk_len,
-						        out->first_expected_byte, out->first_actual_byte);
-#endif
+						TRACE_TEST("[BENCH DIAG REPEAT] Iter %u: %u/%u mismatch exp=0x%02X act=0x%02X",
+						           chunk_idx, chunk_mismatches, chunk_len,
+						           out->first_expected_byte, out->first_actual_byte);
 					}
 				}
 			}
@@ -245,11 +235,9 @@ int psram_benchmark_run(enum psram_bench_mode mode,
 					if (chunk_mismatches > 0) {
 						out->mismatch_blocks++;
 						out->mismatch_count++;
-#if defined(CONFIG_WILDSONIC_VERBOSE_LOGS) || !defined(__ZEPHYR__)
-						LOG_WRN("[BENCH DIAG STREAM] Chunk %u (read 0x%08X): %u/%u bytes mismatch! exp=0x%02X act=0x%02X",
-						        chunk_idx, read_addr, chunk_mismatches, chunk_len,
-						        out->first_expected_byte, out->first_actual_byte);
-#endif
+						TRACE_TEST("[BENCH DIAG STREAM] Chunk %u (0x%08X): %u/%u mismatch exp=0x%02X act=0x%02X",
+						           chunk_idx, read_addr, chunk_mismatches, chunk_len,
+						           out->first_expected_byte, out->first_actual_byte);
 					}
 				}
 			}
@@ -300,23 +288,23 @@ int psram_benchmark_run_matrix(void)
 	const size_t num_sizes = sizeof(test_sizes) / sizeof(test_sizes[0]);
 
 #if defined(__ZEPHYR__)
-	printk("\n====================================================================================================================================================\n");
-	printk("                                     ISSI IS66WVS4M8 QUADSPI PSRAM PHYSICAL THROUGHPUT BENCHMARK                                                    \n");
-	printk("====================================================================================================================================================\n");
-	printk("  Bus Clock        : %u Hz (Prescaler divider = %u)\n", psram_get_clock_hz(),
-	       HAL_RCC_GetHCLKFreq() / psram_get_clock_hz());
-	printk("  Bus Interface    : %s\n", psram_is_quad_mode() ? "Quad I/O Mode (4-lines)" : "SPI Mode (1-line)");
-	printk("  Hardware Burst   : %u bytes per transaction (constrained strictly by tCEM <= 4.0 us)\n",
-	       psram_get_burst_size());
-	printk("  Memory Region    : 0x%08X - 0x%08X (1 MiB Dedicated Diagnostic Span, outside live audio)\n",
-	       PSRAM_DIAG_TEST_BASE_ADDR, PSRAM_DIAG_TEST_MAX_ADDR);
-	printk("  Step Chunk Size  : %u bytes (MinStepUs / AvgStepUs / MaxStepUs are latency per 4 KiB chunk operation)\n",
-	       BENCH_CHUNK_SIZE);
-	printk("  Throughput Units : kB/s = 1000 Bytes/s (decimal standard) | KiB/s = 1024 Bytes/s (binary standard)\n");
-	printk("----------------------------------------------------------------------------------------------------------------------------------------------------\n");
-	printk("%-26s | %8s | %17s | %10s | %21s | %9s | %9s | %9s | %s\n",
-	       "Mode", "Span", "Transferred (W/R)", "BusTimeUs", "Throughput(kB/s|KiB/s)", "MinStepUs", "AvgStepUs", "MaxStepUs", "Data Verification Status");
-	printk("----------------------------------------------------------------------------------------------------------------------------------------------------\n");
+	TRACE_RAW_TEST("\n====================================================================================================================================================\n");
+	TRACE_RAW_TEST("                                     ISSI IS66WVS4M8 QUADSPI PSRAM PHYSICAL THROUGHPUT BENCHMARK                                                    \n");
+	TRACE_RAW_TEST("====================================================================================================================================================\n");
+	TRACE_RAW_TEST("  Bus Clock        : %u Hz (Prescaler divider = %u)\n", psram_get_clock_hz(),
+	               HAL_RCC_GetHCLKFreq() / psram_get_clock_hz());
+	TRACE_RAW_TEST("  Bus Interface    : %s\n", psram_is_quad_mode() ? "Quad I/O Mode (4-lines)" : "SPI Mode (1-line)");
+	TRACE_RAW_TEST("  Hardware Burst   : %u bytes per transaction (constrained strictly by tCEM <= 4.0 us)\n",
+	               psram_get_burst_size());
+	TRACE_RAW_TEST("  Memory Region    : 0x%08X - 0x%08X (1 MiB Dedicated Diagnostic Span, outside live audio)\n",
+	               PSRAM_DIAG_TEST_BASE_ADDR, PSRAM_DIAG_TEST_MAX_ADDR);
+	TRACE_RAW_TEST("  Step Chunk Size  : %u bytes (MinStepUs / AvgStepUs / MaxStepUs are latency per 4 KiB chunk operation)\n",
+	               BENCH_CHUNK_SIZE);
+	TRACE_RAW_TEST("  Throughput Units : kB/s = 1000 Bytes/s (decimal standard) | KiB/s = 1024 Bytes/s (binary standard)\n");
+	TRACE_RAW_TEST("----------------------------------------------------------------------------------------------------------------------------------------------------\n");
+	TRACE_RAW_TEST("%-26s | %8s | %17s | %10s | %21s | %9s | %9s | %9s | %s\n",
+	               "Mode", "Span", "Transferred (W/R)", "BusTimeUs", "Throughput(kB/s|KiB/s)", "MinStepUs", "AvgStepUs", "MaxStepUs", "Data Verification Status");
+	TRACE_RAW_TEST("----------------------------------------------------------------------------------------------------------------------------------------------------\n");
 #endif
 
 	for (int m = 0; m < PSRAM_BENCH_MODE_COUNT; m++) {
@@ -325,9 +313,9 @@ int psram_benchmark_run_matrix(void)
 			int rc = psram_benchmark_run((enum psram_bench_mode)m, test_sizes[s], &res);
 			if (rc != 0) {
 #if defined(__ZEPHYR__)
-				printk("%-26s | %6u KB | FAILED (code %d)\n",
-				       psram_benchmark_mode_name((enum psram_bench_mode)m),
-				       test_sizes[s] >> 10, rc);
+				TRACE_RAW_TEST("%-26s | %6u KB | FAILED (code %d)\n",
+				               psram_benchmark_mode_name((enum psram_bench_mode)m),
+				               test_sizes[s] >> 10, rc);
 #endif
 				continue;
 			}
@@ -341,64 +329,64 @@ int psram_benchmark_run_matrix(void)
 			snprintf(tp_str, sizeof(tp_str), "%u | %u", dec_kbs, bin_kibs);
 
 			if (res.error_count > 0) {
-				printk("%-26s | %6u KB | %17s | %10llu | %21s | %9u | %9u | %9u | HW ERROR (%u bus errs)\n",
-				       psram_benchmark_mode_name((enum psram_bench_mode)m),
-				       res.test_size_bytes >> 10,
-				       xfer_str,
-				       (unsigned long long)res.bus_elapsed_us,
-				       tp_str,
-				       res.min_chunk_us,
-				       res.avg_chunk_us,
-				       res.max_chunk_us,
-				       res.error_count);
+				TRACE_RAW_TEST("%-26s | %6u KB | %17s | %10llu | %21s | %9u | %9u | %9u | HW ERROR (%u bus errs)\n",
+				               psram_benchmark_mode_name((enum psram_bench_mode)m),
+				               res.test_size_bytes >> 10,
+				               xfer_str,
+				               (unsigned long long)res.bus_elapsed_us,
+				               tp_str,
+				               res.min_chunk_us,
+				               res.avg_chunk_us,
+				               res.max_chunk_us,
+				               res.error_count);
 			} else if (res.mismatch_count > 0 || res.mismatch_bytes > 0) {
-				printk("%-26s | %6u KB | %17s | %10llu | %21s | %9u | %9u | %9u | MISMATCH: %u blks / %u B (first +%u @ 0x%08X exp=0x%02X act=0x%02X diff=0x%02X)\n",
-				       psram_benchmark_mode_name((enum psram_bench_mode)m),
-				       res.test_size_bytes >> 10,
-				       xfer_str,
-				       (unsigned long long)res.bus_elapsed_us,
-				       tp_str,
-				       res.min_chunk_us,
-				       res.avg_chunk_us,
-				       res.max_chunk_us,
-				       res.mismatch_blocks,
-				       res.mismatch_bytes,
-				       res.first_mismatch_offset,
-				       res.first_mismatch_addr,
-				       res.first_expected_byte,
-				       res.first_actual_byte,
-				       res.first_diff_mask);
+				TRACE_RAW_TEST("%-26s | %6u KB | %17s | %10llu | %21s | %9u | %9u | %9u | MISMATCH: %u blks / %u B (first +%u @ 0x%08X exp=0x%02X act=0x%02X diff=0x%02X)\n",
+				               psram_benchmark_mode_name((enum psram_bench_mode)m),
+				               res.test_size_bytes >> 10,
+				               xfer_str,
+				               (unsigned long long)res.bus_elapsed_us,
+				               tp_str,
+				               res.min_chunk_us,
+				               res.avg_chunk_us,
+				               res.max_chunk_us,
+				               res.mismatch_blocks,
+				               res.mismatch_bytes,
+				               res.first_mismatch_offset,
+				               res.first_mismatch_addr,
+				               res.first_expected_byte,
+				               res.first_actual_byte,
+				               res.first_diff_mask);
 			} else if (!res.verified_mode) {
 				const char *vmsg = (m == PSRAM_BENCH_SEQ_WRITE) ?
 				                   "WRITE OK (unverified - no readback)" :
 				                   "READ OK (unverified - untracked pattern)";
-				printk("%-26s | %6u KB | %17s | %10llu | %21s | %9u | %9u | %9u | %s\n",
-				       psram_benchmark_mode_name((enum psram_bench_mode)m),
-				       res.test_size_bytes >> 10,
-				       xfer_str,
-				       (unsigned long long)res.bus_elapsed_us,
-				       tp_str,
-				       res.min_chunk_us,
-				       res.avg_chunk_us,
-				       res.max_chunk_us,
-				       vmsg);
+				TRACE_RAW_TEST("%-26s | %6u KB | %17s | %10llu | %21s | %9u | %9u | %9u | %s\n",
+				               psram_benchmark_mode_name((enum psram_bench_mode)m),
+				               res.test_size_bytes >> 10,
+				               xfer_str,
+				               (unsigned long long)res.bus_elapsed_us,
+				               tp_str,
+				               res.min_chunk_us,
+				               res.avg_chunk_us,
+				               res.max_chunk_us,
+				               vmsg);
 			} else {
-				printk("%-26s | %6u KB | %17s | %10llu | %21s | %9u | %9u | %9u | PASS (bit-exact verified)\n",
-				       psram_benchmark_mode_name((enum psram_bench_mode)m),
-				       res.test_size_bytes >> 10,
-				       xfer_str,
-				       (unsigned long long)res.bus_elapsed_us,
-				       tp_str,
-				       res.min_chunk_us,
-				       res.avg_chunk_us,
-				       res.max_chunk_us);
+				TRACE_RAW_TEST("%-26s | %6u KB | %17s | %10llu | %21s | %9u | %9u | %9u | PASS (bit-exact verified)\n",
+				               psram_benchmark_mode_name((enum psram_bench_mode)m),
+				               res.test_size_bytes >> 10,
+				               xfer_str,
+				               (unsigned long long)res.bus_elapsed_us,
+				               tp_str,
+				               res.min_chunk_us,
+				               res.avg_chunk_us,
+				               res.max_chunk_us);
 			}
 #endif
 		}
 	}
 
 #if defined(__ZEPHYR__)
-	printk("====================================================================================================================================================\n\n");
+	TRACE_RAW_TEST("====================================================================================================================================================\n\n");
 #endif
 	return 0;
 }
@@ -418,9 +406,9 @@ int psram_benchmark_run_pattern_validation(void)
 	const size_t num_addrs = sizeof(test_addrs) / sizeof(test_addrs[0]);
 
 #if defined(__ZEPHYR__)
-	printk("\n=========================================================================================\n");
-	printk("          DETERMINISTIC MULTI-PATTERN 4 KIB PSRAM VERIFICATION TEST (10 PATTERNS)       \n");
-	printk("=========================================================================================\n");
+	TRACE_RAW_TEST("\n=========================================================================================\n");
+	TRACE_RAW_TEST("          DETERMINISTIC MULTI-PATTERN 4 KIB PSRAM VERIFICATION TEST (10 PATTERNS)       \n");
+	TRACE_RAW_TEST("=========================================================================================\n");
 #endif
 
 	uint32_t total_tests = 0;
@@ -442,8 +430,8 @@ int psram_benchmark_run_pattern_validation(void)
 
 			if (wret != 0 || rret != 0) {
 #if defined(__ZEPHYR__)
-				printk("  Pattern %-28s @ 0x%08X: BUS ERROR (wret=%d rret=%d)\n",
-				       psram_get_pattern_name(pat), addr, wret, rret);
+				TRACE_RAW_TEST("  Pattern %-28s @ 0x%08X: BUS ERROR (wret=%d rret=%d)\n",
+				               psram_get_pattern_name(pat), addr, wret, rret);
 #endif
 				continue;
 			}
@@ -467,24 +455,24 @@ int psram_benchmark_run_pattern_validation(void)
 			if (mismatches == 0) {
 				total_passed++;
 #if defined(__ZEPHYR__)
-				printk("  Pattern %-28s @ 0x%08X: PASS (4096 B verified)\n",
-				       psram_get_pattern_name(pat), addr);
+				TRACE_RAW_TEST("  Pattern %-28s @ 0x%08X: PASS (4096 B verified)\n",
+				               psram_get_pattern_name(pat), addr);
 #endif
 			} else {
 				total_byte_mismatches += mismatches;
 #if defined(__ZEPHYR__)
-				printk("  Pattern %-28s @ 0x%08X: FAIL (%u mismatches, first +%u: exp=0x%02X act=0x%02X diff=0x%02X)\n",
-				       psram_get_pattern_name(pat), addr, mismatches, first_off, exp, act, diff);
+				TRACE_RAW_TEST("  Pattern %-28s @ 0x%08X: FAIL (%u mismatches, first +%u: exp=0x%02X act=0x%02X diff=0x%02X)\n",
+				               psram_get_pattern_name(pat), addr, mismatches, first_off, exp, act, diff);
 #endif
 			}
 		}
 	}
 
 #if defined(__ZEPHYR__)
-	printk("-----------------------------------------------------------------------------------------\n");
-	printk("  Pattern Validation Summary: %u / %u tests passed, %u total byte mismatches\n",
-	       total_passed, total_tests, total_byte_mismatches);
-	printk("=========================================================================================\n\n");
+	TRACE_RAW_TEST("-----------------------------------------------------------------------------------------\n");
+	TRACE_RAW_TEST("  Pattern Validation Summary: %u / %u tests passed, %u total byte mismatches\n",
+	               total_passed, total_tests, total_byte_mismatches);
+	TRACE_RAW_TEST("=========================================================================================\n\n");
 #endif
 
 	return (total_passed == total_tests) ? 0 : -EBADMSG;
@@ -561,19 +549,19 @@ int psram_benchmark_run_isolated_diagnostic(void)
 
 #if defined(__ZEPHYR__)
 	if (recorder_is_active()) {
-		LOG_WRN("Cannot run PSRAM diagnostic while recorder is active");
+		TRACE_TEST("Cannot run PSRAM diagnostic while recorder is active");
 		return -EBUSY;
 	}
 #endif
 
 #if defined(__ZEPHYR__)
-	printk("\n=========================================================================================================\n");
-	printk("             MINIMAL ISOLATED PSRAM TRANSACTION DIAGNOSTIC SUITE (PHASE 2)                              \n");
-	printk("=========================================================================================================\n");
-	printk("  Target Region    : 0x%08X - 0x%08X (Strictly outside live audio staging)\n",
-	       PSRAM_DIAG_TEST_BASE_ADDR, PSRAM_DIAG_TEST_MAX_ADDR);
-	printk("  Burst Constraint : %u bytes (tCEM <= 4.0 us)\n", psram_get_burst_size());
-	printk("---------------------------------------------------------------------------------------------------------\n");
+	TRACE_RAW_TEST("\n=========================================================================================================\n");
+	TRACE_RAW_TEST("             MINIMAL ISOLATED PSRAM TRANSACTION DIAGNOSTIC SUITE (PHASE 2)                              \n");
+	TRACE_RAW_TEST("=========================================================================================================\n");
+	TRACE_RAW_TEST("  Target Region    : 0x%08X - 0x%08X (Strictly outside live audio staging)\n",
+	               PSRAM_DIAG_TEST_BASE_ADDR, PSRAM_DIAG_TEST_MAX_ADDR);
+	TRACE_RAW_TEST("  Burst Constraint : %u bytes (tCEM <= 4.0 us)\n", psram_get_burst_size());
+	TRACE_RAW_TEST("---------------------------------------------------------------------------------------------------------\n");
 #endif
 
 	uint32_t total_subtests = 0;
@@ -595,21 +583,21 @@ int psram_benchmark_run_isolated_diagnostic(void)
 		if (rc == 0) {
 			total_passed++;
 #if defined(__ZEPHYR__)
-			printk("  [PASS] %-18s %-24s @ 0x%08X (len %3u B): OK\n",
-			       res.category, res.name, res.addr, res.len);
+			TRACE_RAW_TEST("  [PASS] %-18s %-24s @ 0x%08X (len %3u B): OK\n",
+			               res.category, res.name, res.addr, res.len);
 #endif
 		} else {
 			total_failed++;
 			total_byte_mismatches += res.mismatch_bytes;
 #if defined(__ZEPHYR__)
 			if (res.bus_error != 0) {
-				printk("  [ERR ] %-18s %-24s @ 0x%08X (len %3u B): BUS ERROR %d\n",
-				       res.category, res.name, res.addr, res.len, res.bus_error);
+				TRACE_RAW_TEST("  [ERR ] %-18s %-24s @ 0x%08X (len %3u B): BUS ERROR %d\n",
+				               res.category, res.name, res.addr, res.len, res.bus_error);
 			} else {
-				printk("  [FAIL] %-18s %-24s @ 0x%08X (len %3u B): %u mismatches! First +%u (@ 0x%08X): exp=0x%02X act=0x%02X diff=0x%02X\n",
-				       res.category, res.name, res.addr, res.len,
-				       res.mismatch_bytes, res.first_mismatch_offset, res.first_mismatch_addr,
-				       res.first_expected, res.first_actual, res.first_diff_mask);
+				TRACE_RAW_TEST("  [FAIL] %-18s %-24s @ 0x%08X (len %3u B): %u mismatches! First +%u (@ 0x%08X): exp=0x%02X act=0x%02X diff=0x%02X\n",
+				               res.category, res.name, res.addr, res.len,
+				               res.mismatch_bytes, res.first_mismatch_offset, res.first_mismatch_addr,
+				               res.first_expected, res.first_actual, res.first_diff_mask);
 			}
 #endif
 		}
@@ -633,21 +621,21 @@ int psram_benchmark_run_isolated_diagnostic(void)
 		if (rc == 0) {
 			total_passed++;
 #if defined(__ZEPHYR__)
-			printk("  [PASS] %-18s %-24s @ 0x%08X (len %3u B): OK\n",
-			       res.category, res.name, res.addr, res.len);
+			TRACE_RAW_TEST("  [PASS] %-18s %-24s @ 0x%08X (len %3u B): OK\n",
+			               res.category, res.name, res.addr, res.len);
 #endif
 		} else {
 			total_failed++;
 			total_byte_mismatches += res.mismatch_bytes;
 #if defined(__ZEPHYR__)
 			if (res.bus_error != 0) {
-				printk("  [ERR ] %-18s %-24s @ 0x%08X (len %3u B): BUS ERROR %d\n",
-				       res.category, res.name, res.addr, res.len, res.bus_error);
+				TRACE_RAW_TEST("  [ERR ] %-18s %-24s @ 0x%08X (len %3u B): BUS ERROR %d\n",
+				               res.category, res.name, res.addr, res.len, res.bus_error);
 			} else {
-				printk("  [FAIL] %-18s %-24s @ 0x%08X (len %3u B): %u mismatches! First +%u (@ 0x%08X): exp=0x%02X act=0x%02X diff=0x%02X\n",
-				       res.category, res.name, res.addr, res.len,
-				       res.mismatch_bytes, res.first_mismatch_offset, res.first_mismatch_addr,
-				       res.first_expected, res.first_actual, res.first_diff_mask);
+				TRACE_RAW_TEST("  [FAIL] %-18s %-24s @ 0x%08X (len %3u B): %u mismatches! First +%u (@ 0x%08X): exp=0x%02X act=0x%02X diff=0x%02X\n",
+				               res.category, res.name, res.addr, res.len,
+				               res.mismatch_bytes, res.first_mismatch_offset, res.first_mismatch_addr,
+				               res.first_expected, res.first_actual, res.first_diff_mask);
 			}
 #endif
 		}
@@ -667,21 +655,21 @@ int psram_benchmark_run_isolated_diagnostic(void)
 		if (rc == 0) {
 			total_passed++;
 #if defined(__ZEPHYR__)
-			printk("  [PASS] %-18s %-24s @ 0x%08X (len %3u B): OK\n",
-			       res.category, res.name, res.addr, res.len);
+			TRACE_RAW_TEST("  [PASS] %-18s %-24s @ 0x%08X (len %3u B): OK\n",
+			               res.category, res.name, res.addr, res.len);
 #endif
 		} else {
 			total_failed++;
 			total_byte_mismatches += res.mismatch_bytes;
 #if defined(__ZEPHYR__)
 			if (res.bus_error != 0) {
-				printk("  [ERR ] %-18s %-24s @ 0x%08X (len %3u B): BUS ERROR %d\n",
-				       res.category, res.name, res.addr, res.len, res.bus_error);
+				TRACE_RAW_TEST("  [ERR ] %-18s %-24s @ 0x%08X (len %3u B): BUS ERROR %d\n",
+				               res.category, res.name, res.addr, res.len, res.bus_error);
 			} else {
-				printk("  [FAIL] %-18s %-24s @ 0x%08X (len %3u B): %u mismatches! First +%u (@ 0x%08X): exp=0x%02X act=0x%02X diff=0x%02X\n",
-				       res.category, res.name, res.addr, res.len,
-				       res.mismatch_bytes, res.first_mismatch_offset, res.first_mismatch_addr,
-				       res.first_expected, res.first_actual, res.first_diff_mask);
+				TRACE_RAW_TEST("  [FAIL] %-18s %-24s @ 0x%08X (len %3u B): %u mismatches! First +%u (@ 0x%08X): exp=0x%02X act=0x%02X diff=0x%02X\n",
+				               res.category, res.name, res.addr, res.len,
+				               res.mismatch_bytes, res.first_mismatch_offset, res.first_mismatch_addr,
+				               res.first_expected, res.first_actual, res.first_diff_mask);
 			}
 #endif
 		}
@@ -697,21 +685,21 @@ int psram_benchmark_run_isolated_diagnostic(void)
 		if (rc == 0) {
 			total_passed++;
 #if defined(__ZEPHYR__)
-			printk("  [PASS] %-18s %-24s @ 0x%08X (len %3u B): OK\n",
-			       res.category, res.name, res.addr, res.len);
+			TRACE_RAW_TEST("  [PASS] %-18s %-24s @ 0x%08X (len %3u B): OK\n",
+			               res.category, res.name, res.addr, res.len);
 #endif
 		} else {
 			total_failed++;
 			total_byte_mismatches += res.mismatch_bytes;
 #if defined(__ZEPHYR__)
 			if (res.bus_error != 0) {
-				printk("  [ERR ] %-18s %-24s @ 0x%08X (len %3u B): BUS ERROR %d\n",
-				       res.category, res.name, res.addr, res.len, res.bus_error);
+				TRACE_RAW_TEST("  [ERR ] %-18s %-24s @ 0x%08X (len %3u B): BUS ERROR %d\n",
+				               res.category, res.name, res.addr, res.len, res.bus_error);
 			} else {
-				printk("  [FAIL] %-18s %-24s @ 0x%08X (len %3u B): %u mismatches! First +%u (@ 0x%08X): exp=0x%02X act=0x%02X diff=0x%02X\n",
-				       res.category, res.name, res.addr, res.len,
-				       res.mismatch_bytes, res.first_mismatch_offset, res.first_mismatch_addr,
-				       res.first_expected, res.first_actual, res.first_diff_mask);
+				TRACE_RAW_TEST("  [FAIL] %-18s %-24s @ 0x%08X (len %3u B): %u mismatches! First +%u (@ 0x%08X): exp=0x%02X act=0x%02X diff=0x%02X\n",
+				               res.category, res.name, res.addr, res.len,
+				               res.mismatch_bytes, res.first_mismatch_offset, res.first_mismatch_addr,
+				               res.first_expected, res.first_actual, res.first_diff_mask);
 			}
 #endif
 		}
@@ -735,21 +723,21 @@ int psram_benchmark_run_isolated_diagnostic(void)
 		if (rc == 0) {
 			total_passed++;
 #if defined(__ZEPHYR__)
-			printk("  [PASS] %-18s %-24s @ 0x%08X (len %3u B): OK\n",
-			       res.category, res.name, res.addr, res.len);
+			TRACE_RAW_TEST("  [PASS] %-18s %-24s @ 0x%08X (len %3u B): OK\n",
+			               res.category, res.name, res.addr, res.len);
 #endif
 		} else {
 			total_failed++;
 			total_byte_mismatches += res.mismatch_bytes;
 #if defined(__ZEPHYR__)
 			if (res.bus_error != 0) {
-				printk("  [ERR ] %-18s %-24s @ 0x%08X (len %3u B): BUS ERROR %d\n",
-				       res.category, res.name, res.addr, res.len, res.bus_error);
+				TRACE_RAW_TEST("  [ERR ] %-18s %-24s @ 0x%08X (len %3u B): BUS ERROR %d\n",
+				               res.category, res.name, res.addr, res.len, res.bus_error);
 			} else {
-				printk("  [FAIL] %-18s %-24s @ 0x%08X (len %3u B): %u mismatches! First +%u (@ 0x%08X): exp=0x%02X act=0x%02X diff=0x%02X\n",
-				       res.category, res.name, res.addr, res.len,
-				       res.mismatch_bytes, res.first_mismatch_offset, res.first_mismatch_addr,
-				       res.first_expected, res.first_actual, res.first_diff_mask);
+				TRACE_RAW_TEST("  [FAIL] %-18s %-24s @ 0x%08X (len %3u B): %u mismatches! First +%u (@ 0x%08X): exp=0x%02X act=0x%02X diff=0x%02X\n",
+				               res.category, res.name, res.addr, res.len,
+				               res.mismatch_bytes, res.first_mismatch_offset, res.first_mismatch_addr,
+				               res.first_expected, res.first_actual, res.first_diff_mask);
 			}
 #endif
 		}
@@ -769,21 +757,21 @@ int psram_benchmark_run_isolated_diagnostic(void)
 		if (rc == 0) {
 			total_passed++;
 #if defined(__ZEPHYR__)
-			printk("  [PASS] %-18s %-24s @ 0x%08X (len %3u B): OK\n",
-			       res.category, res.name, res.addr, res.len);
+			TRACE_RAW_TEST("  [PASS] %-18s %-24s @ 0x%08X (len %3u B): OK\n",
+			               res.category, res.name, res.addr, res.len);
 #endif
 		} else {
 			total_failed++;
 			total_byte_mismatches += res.mismatch_bytes;
 #if defined(__ZEPHYR__)
 			if (res.bus_error != 0) {
-				printk("  [ERR ] %-18s %-24s @ 0x%08X (len %3u B): BUS ERROR %d\n",
-				       res.category, res.name, res.addr, res.len, res.bus_error);
+				TRACE_RAW_TEST("  [ERR ] %-18s %-24s @ 0x%08X (len %3u B): BUS ERROR %d\n",
+				               res.category, res.name, res.addr, res.len, res.bus_error);
 			} else {
-				printk("  [FAIL] %-18s %-24s @ 0x%08X (len %3u B): %u mismatches! First +%u (@ 0x%08X): exp=0x%02X act=0x%02X diff=0x%02X\n",
-				       res.category, res.name, res.addr, res.len,
-				       res.mismatch_bytes, res.first_mismatch_offset, res.first_mismatch_addr,
-				       res.first_expected, res.first_actual, res.first_diff_mask);
+				TRACE_RAW_TEST("  [FAIL] %-18s %-24s @ 0x%08X (len %3u B): %u mismatches! First +%u (@ 0x%08X): exp=0x%02X act=0x%02X diff=0x%02X\n",
+				               res.category, res.name, res.addr, res.len,
+				               res.mismatch_bytes, res.first_mismatch_offset, res.first_mismatch_addr,
+				               res.first_expected, res.first_actual, res.first_diff_mask);
 			}
 #endif
 		}
@@ -800,21 +788,21 @@ int psram_benchmark_run_isolated_diagnostic(void)
 		if (rc == 0) {
 			total_passed++;
 #if defined(__ZEPHYR__)
-			printk("  [PASS] %-18s %-24s @ 0x%08X (len %3u B): OK\n",
-			       res.category, res.name, res.addr, res.len);
+			TRACE_RAW_TEST("  [PASS] %-18s %-24s @ 0x%08X (len %3u B): OK\n",
+			               res.category, res.name, res.addr, res.len);
 #endif
 		} else {
 			total_failed++;
 			total_byte_mismatches += res.mismatch_bytes;
 #if defined(__ZEPHYR__)
 			if (res.bus_error != 0) {
-				printk("  [ERR ] %-18s %-24s @ 0x%08X (len %3u B): BUS ERROR %d\n",
-				       res.category, res.name, res.addr, res.len, res.bus_error);
+				TRACE_RAW_TEST("  [ERR ] %-18s %-24s @ 0x%08X (len %3u B): BUS ERROR %d\n",
+				               res.category, res.name, res.addr, res.len, res.bus_error);
 			} else {
-				printk("  [FAIL] %-18s %-24s @ 0x%08X (len %3u B): %u mismatches! First +%u (@ 0x%08X): exp=0x%02X act=0x%02X diff=0x%02X\n",
-				       res.category, res.name, res.addr, res.len,
-				       res.mismatch_bytes, res.first_mismatch_offset, res.first_mismatch_addr,
-				       res.first_expected, res.first_actual, res.first_diff_mask);
+				TRACE_RAW_TEST("  [FAIL] %-18s %-24s @ 0x%08X (len %3u B): %u mismatches! First +%u (@ 0x%08X): exp=0x%02X act=0x%02X diff=0x%02X\n",
+				               res.category, res.name, res.addr, res.len,
+				               res.mismatch_bytes, res.first_mismatch_offset, res.first_mismatch_addr,
+				               res.first_expected, res.first_actual, res.first_diff_mask);
 			}
 #endif
 		}
@@ -831,21 +819,21 @@ int psram_benchmark_run_isolated_diagnostic(void)
 		if (rc == 0) {
 			total_passed++;
 #if defined(__ZEPHYR__)
-			printk("  [PASS] %-18s %-24s @ 0x%08X (len %3u B): OK\n",
-			       res.category, res.name, res.addr, res.len);
+			TRACE_RAW_TEST("  [PASS] %-18s %-24s @ 0x%08X (len %3u B): OK\n",
+			               res.category, res.name, res.addr, res.len);
 #endif
 		} else {
 			total_failed++;
 			total_byte_mismatches += res.mismatch_bytes;
 #if defined(__ZEPHYR__)
 			if (res.bus_error != 0) {
-				printk("  [ERR ] %-18s %-24s @ 0x%08X (len %3u B): BUS ERROR %d\n",
-				       res.category, res.name, res.addr, res.len, res.bus_error);
+				TRACE_RAW_TEST("  [ERR ] %-18s %-24s @ 0x%08X (len %3u B): BUS ERROR %d\n",
+				               res.category, res.name, res.addr, res.len, res.bus_error);
 			} else {
-				printk("  [FAIL] %-18s %-24s @ 0x%08X (len %3u B): %u mismatches! First +%u (@ 0x%08X): exp=0x%02X act=0x%02X diff=0x%02X\n",
-				       res.category, res.name, res.addr, res.len,
-				       res.mismatch_bytes, res.first_mismatch_offset, res.first_mismatch_addr,
-				       res.first_expected, res.first_actual, res.first_diff_mask);
+				TRACE_RAW_TEST("  [FAIL] %-18s %-24s @ 0x%08X (len %3u B): %u mismatches! First +%u (@ 0x%08X): exp=0x%02X act=0x%02X diff=0x%02X\n",
+				               res.category, res.name, res.addr, res.len,
+				               res.mismatch_bytes, res.first_mismatch_offset, res.first_mismatch_addr,
+				               res.first_expected, res.first_actual, res.first_diff_mask);
 			}
 #endif
 		}
@@ -860,23 +848,23 @@ int psram_benchmark_run_isolated_diagnostic(void)
 		if (w_oob == -EINVAL && r_oob == -EINVAL) {
 			total_passed++;
 #if defined(__ZEPHYR__)
-			printk("  [PASS] %-18s %-24s @ 0x%08X (len   2 B): OK (rejected with -EINVAL)\n",
-			       "Boundary Term", "Out-of-Bounds Rejection", PSRAM_DIAG_TEST_MAX_ADDR);
+			TRACE_RAW_TEST("  [PASS] %-18s %-24s @ 0x%08X (len   2 B): OK (rejected with -EINVAL)\n",
+			               "Boundary Term", "Out-of-Bounds Rejection", PSRAM_DIAG_TEST_MAX_ADDR);
 #endif
 		} else {
 			total_failed++;
 #if defined(__ZEPHYR__)
-			printk("  [FAIL] %-18s %-24s @ 0x%08X (len   2 B): FAIL (w_oob=%d r_oob=%d, exp -EINVAL)\n",
-			       "Boundary Term", "Out-of-Bounds Rejection", PSRAM_DIAG_TEST_MAX_ADDR, w_oob, r_oob);
+			TRACE_RAW_TEST("  [FAIL] %-18s %-24s @ 0x%08X (len   2 B): FAIL (w_oob=%d r_oob=%d, exp -EINVAL)\n",
+			               "Boundary Term", "Out-of-Bounds Rejection", PSRAM_DIAG_TEST_MAX_ADDR, w_oob, r_oob);
 #endif
 		}
 	}
 
 #if defined(__ZEPHYR__)
-	printk("---------------------------------------------------------------------------------------------------------\n");
-	printk("  Isolated Diagnostic Summary: %u / %u tests passed (%u failed), %u total byte mismatches\n",
-	       total_passed, total_subtests, total_failed, total_byte_mismatches);
-	printk("=========================================================================================================\n\n");
+	TRACE_RAW_TEST("---------------------------------------------------------------------------------------------------------\n");
+	TRACE_RAW_TEST("  Isolated Diagnostic Summary: %u / %u tests passed (%u failed), %u total byte mismatches\n",
+	               total_passed, total_subtests, total_failed, total_byte_mismatches);
+	TRACE_RAW_TEST("=========================================================================================================\n\n");
 #endif
 
 	return (total_passed == total_subtests) ? 0 : -EBADMSG;

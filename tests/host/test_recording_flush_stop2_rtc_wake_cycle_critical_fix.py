@@ -84,7 +84,7 @@ def test_dsp_nyquist_boundary_and_bypass_optimization():
 
     assert "float nyquist_bound = (float)sample_rate_hz * 0.49f;" in dsp_code
     assert "if ((float)cfg->lpf_cutoff_hz >= nyquist_bound)" in dsp_code
-    assert "if (num_active > 0 || digital_gain != 1.0f)" in dsp_code
+    assert "if (num_active > 0U || gain != 1.0f)" in dsp_code
 
 
 def test_rtc_shadow_register_rsf_synchronization():
@@ -202,7 +202,8 @@ def test_presence_of_all_twenty_three_milestone_tags():
         "[TEST] WAV_FILE_CLOSED",
         "[TEST] WAV_VERIFIED",
         "[TEST] SDMMC_IDLE",
-        "[TEST] RECORDING ACCOUNTING SUMMARY:",
+        "RECORDING ACCOUNTING SUMMARY:",
+        "Accounting: acquired %llu",
         "[TEST] SLEEP_INTERVAL_STARTED:",
         "[TEST] RTC_WUT_ARMED:",
         "[TEST] STOP2_EXITED",

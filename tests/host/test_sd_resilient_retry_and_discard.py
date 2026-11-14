@@ -340,7 +340,7 @@ def test_scenario_7_post_wake_mount_backoff_and_schedule_continuation():
 
     assert "static const uint32_t mnt_backoffs[3] = {500, 1000, 2000};" in sleep_fn
     assert "sd_resilient_set_health(STORAGE_HEALTH_FAULT);" in sleep_fn
-    assert "[STORAGE] Wake mount failed after 3 attempts; card inaccessible" in sleep_fn
+    assert 'TRACE("Wake mount failed after 3 attempts");' in sleep_fn
 
 # ==============================================================================
 # 8. SCENARIO 8: TRUTHFUL METRICS & "ZERO LOSS" INTEGRITY
@@ -350,12 +350,13 @@ def test_scenario_8_truthful_metrics_and_zero_loss_contract():
     """Scenario 8: ZERO LOSS reported ONLY if all discard/gap counters are strictly 0."""
     rec_c = (APP_SRC / "recorder.c").read_text(encoding="utf-8")
 
-    assert "(sd_resilient_get_gap_count() == 0)" in rec_c
+    assert "sd_resilient_get_gap_count()" in rec_c
+    assert "(total_gaps == 0)" in rec_c
     assert "(st_res_chk.blocks_discarded == 0)" in rec_c
 
     # Check truthful zero-fill logging
-    assert 'LOG_INF("wrote zero-fill block (%u bytes)' in rec_c
-    assert 'LOG_WRN("zero-fill skipped: card offline (err=%d)", w_ret);' in rec_c
+    assert 'TRACE("Wrote zero-fill (%u B) at 0x%llX"' in rec_c
+    assert 'TRACE("Zero-fill skipped: card offline (%d)", w_ret);' in rec_c
 
 # ==============================================================================
 # 9. ARCHITECTURAL CODE AUDIT & MEMORY OWNERSHIP (mem_slab.c:270 FIX)
@@ -406,10 +407,10 @@ def test_sd_resilient_hardware_reset_diagnostics_and_power_cycle_gpio():
     kconfig = (REPO_ROOT / "app" / "Kconfig").read_text(encoding="utf-8")
 
     assert "config SD_POWER_GPIO" in kconfig
-    assert "Step 1 (CTRL_DEINIT)" in res_c
-    assert "Step 2 (VDD power cycle)" in res_c
-    assert "Step 3 (disk_access_init)" in res_c
-    assert "Step 4 (disk_access_status)" in res_c
-    assert "Step 5 (CLKCR" in res_c
+    assert "SD reset step1 DEINIT rc=%d st=%d" in res_c
+    assert "SD reset step2 VDD" in res_c
+    assert 'TRACE("SD card re-init failed: %d", ret);' in res_c
+    assert 'TRACE("SD card status error after re-init: %d", status);' in res_c
+    assert "SD reset step5 CLKCR=0x%08X" in res_c
     assert "DT_ALIAS(sd_power)" in res_c
 

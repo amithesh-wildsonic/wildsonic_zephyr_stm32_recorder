@@ -5,17 +5,11 @@
 #include <errno.h>
 
 #if defined(__ZEPHYR__)
+#include "wildsonic_trace.h"
 #include <zephyr/kernel.h>
-#include <zephyr/logging/log.h>
-#if defined(CONFIG_WILDSONIC_VERBOSE_LOGS)
-LOG_MODULE_REGISTER(psram_staging, LOG_LEVEL_INF);
 #else
-LOG_MODULE_REGISTER(psram_staging, LOG_LEVEL_WRN);
-#endif
-#else
-#define LOG_INF(...) do {} while (0)
-#define LOG_ERR(...) do {} while (0)
-#define LOG_WRN(...) do {} while (0)
+#define TRACE(...) do {} while (0)
+#define TRACE_TEST(...) do {} while (0)
 #endif
 
 static bool staging_active = false;
@@ -70,7 +64,7 @@ int psram_staging_init(uint32_t capacity_bytes, uint32_t batch_size_bytes)
 		STAGING_LOCK();
 		staging_active = false;
 		STAGING_UNLOCK();
-		LOG_WRN("PSRAM staging init rejected: memory integrity not verified");
+		TRACE("PSRAM staging init rejected: memory not verified");
 		return -ENODEV;
 	}
 
@@ -139,8 +133,8 @@ int psram_staging_init(uint32_t capacity_bytes, uint32_t batch_size_bytes)
 #endif
 	STAGING_UNLOCK();
 
-	LOG_INF("PSRAM audio staging initialized: %u slots x %u KB = %u KB total (Reserved: %u KB)",
-	        num_batch_buffers, batch_size >> 10, buf_capacity >> 10, PSRAM_RESERVED_BYTES >> 10);
+	TRACE_TEST("PSRAM staging: %u slots x %u KB = %u KB (res %u KB)",
+	           num_batch_buffers, batch_size >> 10, buf_capacity >> 10, PSRAM_RESERVED_BYTES >> 10);
 	return 0;
 }
 
@@ -268,7 +262,7 @@ int psram_staging_push(const void *src, uint32_t bytes, uint32_t samples)
 		full_events++;
 		rejected_blocks++;
 		STAGING_UNLOCK();
-		LOG_WRN("PSRAM staging busy at capacity: rejected %u samples (%u bytes)", samples, bytes);
+		TRACE("PSRAM staging busy: rejected %u samples (%u bytes)", samples, bytes);
 		return -ENOBUFS;
 	}
 
@@ -298,7 +292,7 @@ int psram_staging_push(const void *src, uint32_t bytes, uint32_t samples)
 		full_events++;
 		rejected_blocks++;
 		STAGING_UNLOCK();
-		LOG_WRN("PSRAM staging capacity unavailable: rejected %u samples (%u bytes)", samples, bytes);
+		TRACE("PSRAM staging full: rejected %u samples (%u bytes)", samples, bytes);
 		return -ENOBUFS;
 	}
 
@@ -315,8 +309,8 @@ int psram_staging_push(const void *src, uint32_t bytes, uint32_t samples)
 	int ret = psram_write(write_offset, (const uint8_t *)src, bytes);
 
 	if (ret != 0) {
-		LOG_ERR("PSRAM physical write failed at addr 0x%06X (code %d)",
-		        write_offset, ret);
+		TRACE("PSRAM physical write failed at 0x%06X (code %d)",
+		      write_offset, ret);
 		STAGING_LOCK();
 		reserved_bytes = 0;
 		write_in_flight = false;
@@ -405,8 +399,8 @@ int psram_staging_peek(void *dst, uint32_t bytes_requested, uint32_t *bytes_read
 
 	int ret = psram_read(read_offset, (uint8_t *)dst, to_read);
 	if (ret != 0) {
-		LOG_ERR("PSRAM physical peek failed at addr 0x%06X (code %d)",
-		        read_offset, ret);
+		TRACE("PSRAM physical peek failed at 0x%06X (code %d)",
+		      read_offset, ret);
 		STAGING_LOCK();
 		if (drain->peeked_bytes >= to_read) {
 			drain->peeked_bytes -= to_read;

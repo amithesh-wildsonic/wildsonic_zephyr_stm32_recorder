@@ -104,9 +104,19 @@ uint32_t audio_in_get_ovs_ratio(void);
 /* Select block size while capture is stopped. */
 int audio_in_set_block_size(uint32_t samples);
 
+/* Select runtime sample format (16 or 32 bits, 1 or 2 channels) while stopped. */
+int audio_in_set_output_format(uint16_t bits, uint16_t channels);
+
+/* Effective ADC ENOB derived from active hardware oversampling ratio (12..16). */
+uint32_t audio_in_get_effective_adc_bits(void);
+
+/* Measure unused bytes on acquisition thread stack (returns 0 on success). */
+int audio_in_get_stack_free(size_t *total_bytes, size_t *unused_bytes);
+
 int audio_in_start(void);
 int audio_in_stop(void);
 int audio_in_verify_ready(void);
+void audio_in_log_boot_status(void);
 
 /* Check whether audio DMA is actively running */
 bool audio_in_is_dma_active(void);

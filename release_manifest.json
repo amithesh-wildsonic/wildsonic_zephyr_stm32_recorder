@@ -1,0 +1,66 @@
+{
+  "schema_version": 1,
+  "generated_utc": "2026-11-12T07:02:18Z",
+  "git": {
+    "commit": "f20997ed8150b0e2cbebdb138cc7e28e239b5be1",
+    "short_commit": "f20997ed8150",
+    "branch": "production-2",
+    "dirty": true
+  },
+  "images": {
+    "production": {
+      "build_dir": "/home/amithesh/workspaces/stm32/wildsonic_zephyr_stm32_recorder/build/prod",
+      "zephyr.elf": {
+        "path": "/home/amithesh/workspaces/stm32/wildsonic_zephyr_stm32_recorder/build/prod/zephyr/zephyr.elf",
+        "size_bytes": 3202856,
+        "sha256": "00e50fbd8c9729a9e88b45b48b65786a88802320b39fb77a5232202ea20db52e"
+      },
+      "zephyr.bin": {
+        "path": "/home/amithesh/workspaces/stm32/wildsonic_zephyr_stm32_recorder/build/prod/zephyr/zephyr.bin",
+        "size_bytes": 267600,
+        "sha256": "e5877715a39d90d107c44c9bd0cf2c0342744793f88a0e41aa986f37b2a244f9"
+      },
+      "zephyr.hex": {
+        "path": "/home/amithesh/workspaces/stm32/wildsonic_zephyr_stm32_recorder/build/prod/zephyr/zephyr.hex",
+        "size_bytes": 752707,
+        "sha256": "97e9b410990255111eb341a1b913f573be65bd9d202db018dc7daa6d8b1f10ba"
+      }
+    },
+    "test": {
+      "build_dir": "/home/amithesh/workspaces/stm32/wildsonic_zephyr_stm32_recorder/build/test",
+      "zephyr.elf": {
+        "path": "/home/amithesh/workspaces/stm32/wildsonic_zephyr_stm32_recorder/build/test/zephyr/zephyr.elf",
+        "size_bytes": 3317344,
+        "sha256": "6f679d174464b05fe2bf4eb923f9c41f2d05d56e9652f379bd2292f99fa1f774"
+      },
+      "zephyr.bin": {
+        "path": "/home/amithesh/workspaces/stm32/wildsonic_zephyr_stm32_recorder/build/test/zephyr/zephyr.bin",
+        "size_bytes": 299616,
+        "sha256": "95c1cf6298d2d9d22c6a699c6e62da699723a5ccaf1780fd5d53ff853c54a155"
+      },
+      "zephyr.hex": {
+        "path": "/home/amithesh/workspaces/stm32/wildsonic_zephyr_stm32_recorder/build/test/zephyr/zephyr.hex",
+        "size_bytes": 842760,
+        "sha256": "f74911079f0f96d75d6e6332d696b9260b6835d6060bbe61751cbec3c781cc35"
+      }
+    },
+    "bootloader": {
+      "build_dir": "/home/amithesh/workspaces/stm32/wildsonic_zephyr_stm32_recorder/build/bootloader",
+      "zephyr.elf": {
+        "path": "/home/amithesh/workspaces/stm32/wildsonic_zephyr_stm32_recorder/build/bootloader/zephyr/zephyr.elf",
+        "size_bytes": 933272,
+        "sha256": "89adc4dde443edf5895fcae09b20b882297cc9177331a8847a5de3d7b25fd0fc"
+      },
+      "zephyr.bin": {
+        "path": "/home/amithesh/workspaces/stm32/wildsonic_zephyr_stm32_recorder/build/bootloader/zephyr/zephyr.bin",
+        "size_bytes": 45280,
+        "sha256": "88ead6349b138d2c1184c19ff6921bb15feb47e2fd2cbeca93713e450db4174b"
+      },
+      "zephyr.hex": {
+        "path": "/home/amithesh/workspaces/stm32/wildsonic_zephyr_stm32_recorder/build/bootloader/zephyr/zephyr.hex",
+        "size_bytes": 127505,
+        "sha256": "361d674b84a2e7e90c1d2cf9f24b9f25ba86247d235f4288a00d4156d74546b9"
+      }
+    }
+  }
+}

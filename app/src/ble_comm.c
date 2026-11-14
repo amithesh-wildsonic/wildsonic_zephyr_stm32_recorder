@@ -15,8 +15,8 @@
 #include <zephyr/drivers/uart.h>
 #include <zephyr/fs/fs.h>
 #include <zephyr/kernel.h>
-#include <zephyr/logging/log.h>
 #include <zephyr/sys/ring_buffer.h>
+#include "wildsonic_trace.h"
 
 #if defined(CONFIG_SOC_SERIES_STM32L4X)
 #include <stm32_ll_usart.h>
@@ -28,15 +28,9 @@
 #include <string.h>
 #include <strings.h>
 
-#if defined(CONFIG_WILDSONIC_VERBOSE_LOGS)
-LOG_MODULE_REGISTER(ws_ble, LOG_LEVEL_INF);
-#else
-LOG_MODULE_REGISTER(ws_ble, LOG_LEVEL_WRN);
-#endif
-
 #define BLE_RX_BUF_SIZE 512
 #define BLE_TX_BUF_SIZE 1024
-#define BLE_COMM_STACK_SIZE 3072
+#define BLE_COMM_STACK_SIZE 2560
 #define BLE_COMM_PRIORITY 8
 /* Keep BLE status/telemetry responses immediate. Per-line sleep pacing blocks the
  * UART command-processing thread and stretches mobile command latency without
@@ -187,7 +181,7 @@ int ble_comm_send_cmd_expect(const char *cmd, const char *expected_ack,
 
   /* Guard: AT commands are strictly blocked while BLE is connected */
   if (s_ble_connected) {
-    LOG_WRN("AT command '%s' rejected: BLE connection active", cmd);
+    TRACE("BLE AT '%s' rejected: connected", cmd);
     return -EBUSY;
   }
 
@@ -265,13 +259,11 @@ static void ble_comm_process_line(char *line) {
     s_ble_module_awake = true;
     s_ble_supervisor_online = true;
     s_lock_pending_on_disconnect = false;
-    LOG_INF("[BLE] Central connected (timestamp=%lld ms)", k_uptime_get());
     return;
   }
   if (strcmp(p, "OK+LOST") == 0) {
     s_ble_connected = false;
     s_ble_module_awake = false;
-    LOG_INF("[BLE] Central disconnected (timestamp=%lld ms)", k_uptime_get());
     if (s_name_update_pending) {
       s_name_update_pending = false;
       ble_comm_apply_advertised_name();
@@ -344,19 +336,16 @@ static void ble_comm_process_line(char *line) {
   if (strcmp(p, "WS+ALIVE") == 0) {
     s_pairing_window_active = true;
     s_lock_pending_on_disconnect = false;
-    LOG_INF("[BLE] RX: WS+ALIVE (keep-alive, pairing window active)");
     return;
   }
 
   if (strcasecmp(p, "GET_DEV_INFO") == 0) {
     s_ble_module_awake = true;
-    LOG_INF("[BLE] RX: GET_DEV_INFO (dispatching formatted device report)");
     ble_comm_send_dev_info();
     return;
   }
   if (strcasecmp(p, "GET_STATUS_INFO") == 0 || strcasecmp(p, "STATUS") == 0) {
     s_ble_module_awake = true;
-    LOG_INF("[BLE] RX: GET_STATUS_INFO (dispatching formatted status report)");
     ble_comm_send_status_info();
     return;
   }
@@ -364,8 +353,6 @@ static void ble_comm_process_line(char *line) {
   /* 4. Configuration & Control Commands (Forwarded to existing dispatcher) */
   s_ble_module_awake = true;
 
-  /* Show the command source in the local console without exposing its value
-   * (for example, a password or other credential-bearing argument). */
   const char *cmd_end = p;
   while (*cmd_end && !isspace((unsigned char)*cmd_end)) {
     cmd_end++;
@@ -373,8 +360,8 @@ static void ble_comm_process_line(char *line) {
 
   char resp_buf[128] = {0};
   int rc = console_process_line_source(p, true, resp_buf, sizeof(resp_buf));
-  printk("[BLE] Command %.*s %s\n", (int)(cmd_end - p), p,
-         rc == 0 ? "accepted" : "rejected");
+  TRACE("BLE cmd %.*s %s", (int)(cmd_end - p), p,
+        rc == 0 ? "accepted" : "rejected");
   if (rc == 0) {
     if (resp_buf[0] != '\0') {
       ble_comm_printf("%s\r\n", resp_buf);
@@ -414,8 +401,7 @@ static void ble_comm_handle_rx_byte(char c) {
       ble_comm_capture_overflow_diag((const uint8_t *)s_ble_cmd_buf,
                                     s_ble_cmd_len);
 #endif
-      LOG_WRN("[BLE] Command line oversized (>%u bytes), dropping excess",
-              (unsigned int)sizeof(s_ble_cmd_buf));
+      TRACE("BLE cmd oversized (>%u B)", (unsigned int)sizeof(s_ble_cmd_buf));
       s_ble_last_was_cr = true;
       s_ble_cmd_len = 0;
       memset(s_ble_cmd_buf, 0, sizeof(s_ble_cmd_buf));
@@ -443,8 +429,7 @@ static void ble_comm_handle_rx_byte(char c) {
       ble_comm_capture_overflow_diag((const uint8_t *)s_ble_cmd_buf,
                                     s_ble_cmd_len);
 #endif
-      LOG_WRN("[BLE] Command line oversized (>%u bytes), dropping excess",
-              (unsigned int)sizeof(s_ble_cmd_buf));
+      TRACE("BLE cmd oversized (>%u B)", (unsigned int)sizeof(s_ble_cmd_buf));
       s_ble_cmd_len = 0;
       memset(s_ble_cmd_buf, 0, sizeof(s_ble_cmd_buf));
       return;
@@ -466,8 +451,7 @@ static void ble_comm_handle_rx_byte(char c) {
     ble_comm_capture_overflow_diag((const uint8_t *)s_ble_cmd_buf,
                                   s_ble_cmd_len);
 #endif
-    LOG_WRN("[BLE] Command line oversized (>%u bytes), dropping excess",
-            (unsigned int)sizeof(s_ble_cmd_buf));
+    TRACE("BLE cmd oversized (>%u B)", (unsigned int)sizeof(s_ble_cmd_buf));
     return;
   }
 
@@ -494,8 +478,6 @@ static void ble_comm_thread_fn(void *arg1, void *arg2, void *arg3) {
         s_pairing_window_active = false;
         if (s_ble_connected) {
           s_lock_pending_on_disconnect = true;
-          LOG_INF("[BLE] Pairing window expired while connected; will lock on "
-                  "disconnect");
         } else {
           k_work_submit(&s_ble_lock_work);
         }
@@ -572,10 +554,6 @@ int ble_comm_init(const struct device *uart_dev) {
     s_pairing_window_active = false;
     s_pairing_window_end_ms = 0;
     s_lock_pending_on_disconnect = false;
-    LOG_INF("[BLE] Access: UNLOCKED (initial boot state)");
-#if defined(CONFIG_WILDSONIC_VERBOSE_LOGS)
-    printk("[BLE] Access: UNLOCKED (initial boot state)\n");
-#endif
     return 0;
   }
 
@@ -596,14 +574,11 @@ int ble_comm_init(const struct device *uart_dev) {
   if (!probed) {
     s_ble_supervisor_online = false;
     s_ble_module_awake = false;
-    LOG_INF("ws_ble: BLE module probe timed out; supervisor UART wake path "
-            "unavailable; proceeding normally without BLE");
     return 0;
   }
 
   s_ble_supervisor_online = true;
   s_ble_module_awake = true;
-  LOG_INF("[BLE] Supervisor detected and responsive on USART1");
 
   /*
    * Phase 3: Configure normal transparent mode (AT+WS=0)
@@ -611,10 +586,7 @@ int ble_comm_init(const struct device *uart_dev) {
    * bridge).
    */
   bool prov_ok = true;
-  if (ble_comm_send_cmd_expect("AT+WS=0\r\n", "OK+Set:0", NULL, 0, 150) == 0) {
-    LOG_INF("[BLE] Configured normal transparent mode (AT+WS=0)");
-  } else {
-    LOG_WRN("[BLE] Warning: AT+WS=0 returned unexpected response");
+  if (ble_comm_send_cmd_expect("AT+WS=0\r\n", "OK+Set:0", NULL, 0, 150) != 0) {
     prov_ok = false;
   }
 
@@ -632,23 +604,18 @@ int ble_comm_init(const struct device *uart_dev) {
    */
   char name_cmd[64];
   snprintf(name_cmd, sizeof(name_cmd), "AT+NAME%s\r\n", adv_name);
-  if (ble_comm_send_cmd_expect(name_cmd, "OK+Set:", NULL, 0, 150) == 0) {
-    LOG_INF("[BLE] Configured advertised name: %s", adv_name);
-  } else {
-    LOG_WRN("[BLE] Warning: AT+NAME failed");
+  if (ble_comm_send_cmd_expect(name_cmd, "OK+Set:", NULL, 0, 150) != 0) {
     prov_ok = false;
   }
 
   /* Configure bond authentication: AT+TYPE3 */
   if (ble_comm_send_cmd_expect("AT+TYPE3\r\n", "OK+Set:3", NULL, 0, 150) != 0) {
-    LOG_WRN("[BLE] Warning: AT+TYPE3 failed");
     prov_ok = false;
   }
 
   /* Configure pairing PIN: AT+PASS123456 (do not log PIN) */
   if (ble_comm_send_cmd_expect("AT+PASS123456\r\n", "OK+Set:", NULL, 0, 150) !=
       0) {
-    LOG_WRN("[BLE] Warning: AT+PASS failed");
     prov_ok = false;
   }
 
@@ -658,12 +625,7 @@ int ble_comm_init(const struct device *uart_dev) {
     s_pairing_window_active = false;
     s_pairing_window_end_ms = 0;
     s_lock_pending_on_disconnect = false;
-    LOG_INF("[BLE] Access: UNLOCKED (initial boot state)");
-#if defined(CONFIG_WILDSONIC_VERBOSE_LOGS)
-    printk("[BLE] Access: UNLOCKED (initial boot state)\n");
-#endif
   } else {
-    LOG_WRN("[BLE] Warning: initial unlock (AT+ADTY0) failed");
     prov_ok = false;
   }
 
@@ -673,14 +635,12 @@ int ble_comm_init(const struct device *uart_dev) {
   if (ble_comm_send_cmd_expect("AT+SLEEP\r\n", "OK+SLEEP", NULL, 0, 100) == 0) {
     s_ble_module_awake = false;
   } else {
-    LOG_WRN("[BLE] Warning: AT+SLEEP failed");
     prov_ok = false;
   }
 
   /* Commit fingerprint only upon 100% successful provisioning */
   if (prov_ok) {
     ble_retention_save_fingerprint(target_fp);
-    LOG_INF("[BLE] Provisioning successfully persisted (fp=0x%08X)", target_fp);
   }
 
   return 0;
@@ -747,8 +707,6 @@ void ble_comm_apply_advertised_name(void) {
   }
   if (s_ble_connected) {
     s_name_update_pending = true;
-    LOG_INF(
-        "[BLE] Central connected: deferring AT+NAME update until disconnect");
     return;
   }
 
@@ -757,14 +715,14 @@ void ble_comm_apply_advertised_name(void) {
   if (ble_comm_build_advertised_name(cfg ? cfg->device_name : NULL,
                                      cfg ? cfg->serial_number : NULL, adv_name,
                                      sizeof(adv_name)) != 0) {
-    LOG_ERR("[BLE] Failed to build advertised name (exceeds max length)");
+    TRACE("BLE adv name exceeds max length");
     return;
   }
 
   bool was_awake = s_ble_module_awake;
   if (!s_ble_module_awake) {
     if (ble_comm_wake_module() != 0) {
-      LOG_ERR("[BLE] Failed to wake module for AT+NAME update");
+      TRACE("BLE wake failed for AT+NAME");
       return;
     }
   }
@@ -772,11 +730,10 @@ void ble_comm_apply_advertised_name(void) {
   char cmd[48];
   snprintf(cmd, sizeof(cmd), "AT+NAME%s\r\n", adv_name);
   if (ble_comm_send_cmd_expect(cmd, "OK+Set:", NULL, 0, 150) == 0) {
-    LOG_INF("[BLE] Advertised name updated to: %s", adv_name);
     uint32_t new_fp = ble_comm_calc_fingerprint(adv_name, "123456", 0, 1, 0, 3);
     ble_retention_save_fingerprint(new_fp);
   } else {
-    LOG_WRN("[BLE] AT+NAME command failed");
+    TRACE("BLE AT+NAME failed");
   }
 
   if (!was_awake) {
@@ -789,7 +746,6 @@ void ble_comm_apply_advertised_name(void) {
 void ble_comm_notify_name_changed(void) {
   if (s_ble_connected) {
     s_name_update_pending = true;
-    LOG_INF("[BLE] Device name/SN updated while connected; AT+NAME deferred");
   } else {
     ble_comm_apply_advertised_name();
   }
@@ -884,12 +840,11 @@ void ble_comm_open_pairing_window(uint32_t seconds) {
   }
 
   if (!s_ble_supervisor_online) {
-    LOG_WRN("BLE supervisor offline; cannot open pairing window");
+    TRACE("BLE offline; cannot unlock pairing");
     return;
   }
 
   if (s_ble_connected) {
-    LOG_INF("[BLE] Device already connected; extending active session");
     s_pairing_window_active = true;
     s_pairing_window_end_ms = k_uptime_get() + ((int64_t)seconds * 1000);
     s_lock_pending_on_disconnect = false;
@@ -898,8 +853,7 @@ void ble_comm_open_pairing_window(uint32_t seconds) {
 
   /* If module is asleep, wake it with AT ping; abort if wake fails */
   if (ble_comm_wake_module() != 0) {
-    LOG_ERR("BLE wake failed; aborting pairing unlock");
-    printk("\n[ERROR] Failed to wake BLE module\n>");
+    TRACE("BLE wake failed");
     return;
   }
 
@@ -910,12 +864,9 @@ void ble_comm_open_pairing_window(uint32_t seconds) {
     s_pairing_window_active = true;
     s_pairing_window_end_ms = k_uptime_get() + ((int64_t)seconds * 1000);
     s_lock_pending_on_disconnect = false;
-    LOG_INF("BLE Access: UNLOCKED (%u s)", (unsigned int)seconds);
-    printk("\nBLE Access: UNLOCKED (%u s)\n>", (unsigned int)seconds);
+    TRACE("BLE Access: UNLOCKED (%u s)", (unsigned int)seconds);
   } else {
-    LOG_ERR("BLE unlock failed: no OK+Set:0 response (rc=%d)", rc);
-    printk(
-        "\n[ERROR] Failed to unlock BLE pairing (supervisor unresponsive)\n>");
+    TRACE("BLE unlock failed (rc=%d)", rc);
   }
 }
 
@@ -930,13 +881,12 @@ void ble_comm_lock_pairing(void) {
    * lock until disconnect */
   if (s_ble_connected) {
     s_lock_pending_on_disconnect = true;
-    LOG_INF("[BLE] Connection active; deferring pairing lock until disconnect");
     return;
   }
 
   /* If module is asleep, wake it with AT ping; abort if wake fails */
   if (ble_comm_wake_module() != 0) {
-    LOG_ERR("BLE wake failed; aborting pairing lock");
+    TRACE("BLE wake failed (lock)");
     return;
   }
 
@@ -947,14 +897,13 @@ void ble_comm_lock_pairing(void) {
     s_pairing_window_active = false;
     s_pairing_window_end_ms = 0;
     s_lock_pending_on_disconnect = false;
-    LOG_INF("BLE Access: LOCKED");
-    printk("\nBLE Access: LOCKED\n>");
+    TRACE("BLE Access: LOCKED");
 
     /* Enter low-power sleep under Mode 1 */
     ble_comm_send_cmd_expect("AT+SLEEP\r\n", "OK+SLEEP", NULL, 0, 100);
     s_ble_module_awake = false;
   } else {
-    LOG_ERR("BLE lock failed: no OK+Set:2 response (rc=%d)", rc);
+    TRACE("BLE lock failed (rc=%d)", rc);
   }
 }
 
@@ -1295,6 +1244,20 @@ int ble_comm_drain_tx_bytes(uint8_t *buf, size_t max_len) {
 
 void ble_comm_set_test_capture(bool enabled) {
   s_ble_test_capture_enabled = enabled;
+}
+
+int ble_comm_get_stack_free(size_t *total_bytes, size_t *unused_bytes) {
+  if (total_bytes) {
+    *total_bytes = BLE_COMM_STACK_SIZE;
+  }
+  if (!unused_bytes) {
+    return -EINVAL;
+  }
+  if (!s_ble_thread_started) {
+    *unused_bytes = BLE_COMM_STACK_SIZE;
+    return -ENODEV;
+  }
+  return k_thread_stack_space_get(&s_ble_thread, unused_bytes);
 }
 
 void ble_comm_reset_test_state(void) {

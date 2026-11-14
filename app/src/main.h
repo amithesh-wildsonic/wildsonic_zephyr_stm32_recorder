@@ -5,6 +5,7 @@
 #include <stdbool.h>
 #include <stdint.h>
 #include <stddef.h>
+#include <zephyr/kernel.h>
 #include "recorder.h"
 #include "audio_in.h"
 
@@ -50,6 +51,7 @@ void main_scheduler_pause(void);
 bool main_is_scheduler_paused(void);
 bool main_is_reboot_pending(void);
 void main_set_reboot_pending(bool pending);
+void main_get_thread_tids(k_tid_t *main_tid, k_tid_t *rec_tid, k_tid_t *sched_tid);
 
 /* Graceful shutdown state machine */
 enum system_shutdown_stage {

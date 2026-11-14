@@ -142,6 +142,9 @@ uint32_t psram_get_clock_hz(void);
 /* Check if PSRAM memory integrity has been verified through self-test */
 bool psram_is_integrity_verified(void);
 
+/* Emit standardized single-line boot status via TRACE */
+void psram_log_boot_status(void);
+
 /* Pattern helper */
 const char *psram_get_pattern_name(enum psram_pattern_type type);
 void psram_fill_pattern(enum psram_pattern_type type, uint8_t *buf, uint32_t len, uint32_t base_addr);

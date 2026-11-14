@@ -1,8 +1,9 @@
 /* SPDX-License-Identifier: Apache-2.0 */
-#if defined(CONFIG_WILDSONIC_VERBOSE_LOGS)
+#if defined(CONFIG_WILDSONIC_BENCHMARKS)
 
 #include "sd_benchmark.h"
 #include "recorder.h"
+#include "wildsonic_trace.h"
 #include <zephyr/kernel.h>
 #include <zephyr/fs/fs.h>
 #include <zephyr/storage/disk_access.h>
@@ -58,7 +59,7 @@ int sd_benchmark_run_test(enum sd_bench_type type,
 		 */
 		rc = fs_open(&f, test_path, FS_O_CREATE | FS_O_WRITE);
 		if (rc != 0) {
-			printk("[SDBENCH] Failed to create raw placeholder file: %d\n", rc);
+			TRACE_TEST("[SDBENCH] Failed to create raw placeholder file: %d", rc);
 			return rc;
 		}
 
@@ -91,7 +92,7 @@ int sd_benchmark_run_test(enum sd_bench_type type,
 				uint32_t sector_count = chunk / 512U;
 				int d_rc = disk_access_write("SD", s_bench_buf, cur_sector, sector_count);
 				if (d_rc != 0) {
-					printk("[SDBENCH] disk_access_write failed at sector %u (rc=%d)\n", cur_sector, d_rc);
+					TRACE_TEST("[SDBENCH] disk_access_write failed at sector %u (rc=%d)", cur_sector, d_rc);
 					fs_unlink(test_path);
 					return d_rc;
 				}
@@ -118,7 +119,7 @@ int sd_benchmark_run_test(enum sd_bench_type type,
 		/* Filesystem benchmark: dynamic allocation vs pre-allocated */
 		rc = fs_open(&f, test_path, FS_O_CREATE | FS_O_WRITE);
 		if (rc != 0) {
-			printk("[SDBENCH] fs_open failed: %d\n", rc);
+			TRACE_TEST("[SDBENCH] fs_open failed: %d", rc);
 			return rc;
 		}
 
@@ -146,7 +147,7 @@ int sd_benchmark_run_test(enum sd_bench_type type,
 				uint32_t chunk = (remaining > BENCH_BUF_SIZE) ? BENCH_BUF_SIZE : remaining;
 				ssize_t w = fs_write(&f, s_bench_buf, chunk);
 				if (w != (ssize_t)chunk) {
-					printk("[SDBENCH] fs_write failed: %d\n", (int)w);
+					TRACE_TEST("[SDBENCH] fs_write failed: %d", (int)w);
 					fs_close(&f);
 					fs_unlink(test_path);
 					return (w < 0) ? (int)w : -EIO;
@@ -180,21 +181,21 @@ int sd_benchmark_run_test(enum sd_bench_type type,
 int sd_benchmark_run_matrix(void)
 {
 	if (recorder_is_active()) {
-		printk("\n[REJECTED] Cannot run SD benchmark while recording is active.\n\n");
+		TRACE_RAW_TEST("\n[REJECTED] Cannot run SD benchmark while recording is active.\n\n");
 		return -EBUSY;
 	}
 
-	printk("\n=========================================================================================================\n");
-	printk("                        WILDSONIC SD STORAGE PERFORMANCE & THROUGHPUT BENCHMARK                           \n");
-	printk("=========================================================================================================\n");
-	printk("Target Audio Requirement: 384 KB/s (192 kHz, 16-bit mono PCM)\n");
-	printk("Operating Margin Target : 768 KB/s (2.0x margin)\n");
-	printk("SDMMC Interface Clock   : 6 MHz 4-bit bus (3.0 MB/s raw bus capacity)\n");
-	printk("Filesystem Type         : exFAT (FatFs ELM)\n");
-	printk("---------------------------------------------------------------------------------------------------------\n");
-	printk("%-18s | %-10s | %-10s | %-6s | %-12s | %-12s | %-12s | %-8s\n",
-	       "Mode", "Block Size", "Total Data", "Ops", "Avg Latency", "Max Latency", "Throughput", "Margin");
-	printk("-------------------+------------+------------+--------+--------------+--------------+--------------+----------\n");
+	TRACE_RAW_TEST("\n=========================================================================================================\n");
+	TRACE_RAW_TEST("                        WILDSONIC SD STORAGE PERFORMANCE & THROUGHPUT BENCHMARK                           \n");
+	TRACE_RAW_TEST("=========================================================================================================\n");
+	TRACE_RAW_TEST("Target Audio Requirement: 384 KB/s (192 kHz, 16-bit mono PCM)\n");
+	TRACE_RAW_TEST("Operating Margin Target : 768 KB/s (2.0x margin)\n");
+	TRACE_RAW_TEST("SDMMC Interface Clock   : 6 MHz 4-bit bus (3.0 MB/s raw bus capacity)\n");
+	TRACE_RAW_TEST("Filesystem Type         : exFAT (FatFs ELM)\n");
+	TRACE_RAW_TEST("---------------------------------------------------------------------------------------------------------\n");
+	TRACE_RAW_TEST("%-18s | %-10s | %-10s | %-6s | %-12s | %-12s | %-12s | %-8s\n",
+	               "Mode", "Block Size", "Total Data", "Ops", "Avg Latency", "Max Latency", "Throughput", "Margin");
+	TRACE_RAW_TEST("-------------------+------------+------------+--------+--------------+--------------+--------------+----------\n");
 
 	const uint32_t test_sizes[] = {
 		32 * 1024,
@@ -219,26 +220,26 @@ int sd_benchmark_run_matrix(void)
 			if (rc == 0) {
 				const char *margin_str = res.passed_margin ? "PASS (>=2x)" :
 				                         res.passed_audio_rate ? "PASS (1x)" : "FAIL";
-				printk("%-18s | %4u KB    | %4u KB    | %4u   | %6u us     | %6u us     | %5u KB/s    | %s\n",
-				       mode_names[m],
-				       blk >> 10,
-				       total_data >> 10,
-				       res.num_operations,
-				       res.avg_write_us,
-				       res.max_write_us,
-				       res.throughput_kb_s,
-				       margin_str);
+				TRACE_RAW_TEST("%-18s | %4u KB    | %4u KB    | %4u   | %6u us     | %6u us     | %5u KB/s    | %s\n",
+				               mode_names[m],
+				               blk >> 10,
+				               total_data >> 10,
+				               res.num_operations,
+				               res.avg_write_us,
+				               res.max_write_us,
+				               res.throughput_kb_s,
+				               margin_str);
 			} else {
-				printk("%-18s | %4u KB    | FAILED (code %d)\n",
-				       mode_names[m], blk >> 10, rc);
+				TRACE_RAW_TEST("%-18s | %4u KB    | FAILED (code %d)\n",
+				               mode_names[m], blk >> 10, rc);
 			}
 		}
-		printk("-------------------+------------+------------+--------+--------------+--------------+--------------+----------\n");
+		TRACE_RAW_TEST("-------------------+------------+------------+--------+--------------+--------------+--------------+----------\n");
 	}
 
-	printk("=========================================================================================================\n\n");
+	TRACE_RAW_TEST("=========================================================================================================\n\n");
 	return 0;
 }
 
-#endif /* CONFIG_WILDSONIC_VERBOSE_LOGS */
+#endif /* CONFIG_WILDSONIC_BENCHMARKS */
 

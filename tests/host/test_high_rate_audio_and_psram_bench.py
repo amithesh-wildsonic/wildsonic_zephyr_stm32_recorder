@@ -386,7 +386,8 @@ def test_cmakelists_integrates_new_modules():
 
 
 def test_production_build_separation_and_quietness():
-    """Verify that benchmark runner is gated under CONFIG_WILDSONIC_VERBOSE_LOGS in main.c."""
+    """Verify that benchmark runner is gated under CONFIG_WILDSONIC_TEST_OUTPUT and CONFIG_WILDSONIC_BENCHMARKS in main.c."""
     main_c = (SRC_DIR / "main.c").read_text(encoding="utf-8")
-    assert "#if defined(CONFIG_WILDSONIC_VERBOSE_LOGS)" in main_c
+    assert "#if defined(CONFIG_WILDSONIC_TEST_OUTPUT)" in main_c
+    assert "#if defined(CONFIG_WILDSONIC_BENCHMARKS)" in main_c
     assert "psram_benchmark_run_matrix" in main_c

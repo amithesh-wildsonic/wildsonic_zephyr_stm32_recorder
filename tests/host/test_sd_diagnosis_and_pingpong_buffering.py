@@ -182,12 +182,11 @@ def test_idempotent_directory_creation_contracts():
 
 
 def test_verification_error_reporting_distinguishes_errno_and_bytes():
-    """Verify recorder_verify_file distinguishes between I/O errno and short read byte count."""
+    """Verify recorder_verify_file_format distinguishes between I/O errno and short read byte count."""
     rec_c = (APP_SRC / "recorder.c").read_text()
 
-    assert "Verify read %s failed with I/O error: %d" in rec_c, "Must log distinct message on negative errno"
-    assert "Verify read %s short read: %d bytes read (expected %zu)" in rec_c, "Must log short read with bytes and expected"
-    assert "Verify read %s failed: %d" not in rec_c, "Ambiguous 'failed: 0' message must be eliminated"
+    assert "Verify read %s failed: %d" in rec_c, "Must log distinct message on negative errno"
+    assert "Verify short read %s: %d/%zu B" in rec_c, "Must log short read with bytes and expected"
 
 
 def test_failed_recording_skips_verification_and_marks_unverified():

@@ -1,5 +1,6 @@
 /* SPDX-License-Identifier: Apache-2.0 */
 #include "battery_monitor.h"
+#include "wildsonic_trace.h"
 
 #include <errno.h>
 #include <string.h>
@@ -7,13 +8,6 @@
 #include <zephyr/devicetree.h>
 #include <zephyr/drivers/i2c.h>
 #include <zephyr/kernel.h>
-#include <zephyr/logging/log.h>
-
-#if defined(CONFIG_WILDSONIC_VERBOSE_LOGS)
-LOG_MODULE_REGISTER(battery_monitor, LOG_LEVEL_INF);
-#else
-LOG_MODULE_REGISTER(battery_monitor, LOG_LEVEL_WRN);
-#endif
 
 #define BQ34110_REG_VOLTAGE             0x08U
 #define BQ34110_REG_CURRENT             0x0CU
@@ -67,7 +61,6 @@ static void battery_monitor_read_cycle(void)
 	}
 
 	if (!i2c_is_ready_dt(&s_gauge)) {
-		LOG_WRN("I2C1 or BQ34110 node is not ready");
 		s_gauge_available = false;
 		return;
 	}
@@ -85,7 +78,6 @@ static void battery_monitor_read_cycle(void)
 		current.voltage_mv = raw; /* mV */
 		current.valid_fields |= BATTERY_VALID_VOLTAGE;
 	} else {
-		LOG_WRN("BQ34110 voltage read failed: %d", rc);
 		s_gauge_available = false;
 		goto publish_snapshot;
 	}
@@ -95,7 +87,6 @@ static void battery_monitor_read_cycle(void)
 		current.current_ma = (int16_t)raw; /* signed mA */
 		current.valid_fields |= BATTERY_VALID_CURRENT;
 	} else {
-		LOG_WRN("BQ34110 current read failed: %d", rc);
 		s_gauge_available = false;
 		goto publish_snapshot;
 	}
@@ -108,7 +99,6 @@ static void battery_monitor_read_cycle(void)
 		current.remaining_capacity_mah = raw;
 		current.valid_fields |= BATTERY_VALID_REMAINING_CAPACITY;
 	} else {
-		LOG_WRN("BQ34110 remaining-capacity read failed: %d", rc);
 		s_gauge_available = false;
 		goto publish_snapshot;
 	}
@@ -118,7 +108,6 @@ static void battery_monitor_read_cycle(void)
 		current.full_charge_capacity_mah = raw;
 		current.valid_fields |= BATTERY_VALID_FULL_CAPACITY;
 	} else {
-		LOG_WRN("BQ34110 full-capacity read failed: %d", rc);
 		s_gauge_available = false;
 		goto publish_snapshot;
 	}
@@ -128,7 +117,6 @@ static void battery_monitor_read_cycle(void)
 		current.average_current_ma = (int16_t)raw; /* signed mA */
 		current.valid_fields |= BATTERY_VALID_AVERAGE_CURRENT;
 	} else {
-		LOG_WRN("BQ34110 average-current read failed: %d", rc);
 		s_gauge_available = false;
 		goto publish_snapshot;
 	}
@@ -138,7 +126,6 @@ static void battery_monitor_read_cycle(void)
 		current.time_to_empty_seconds = (uint32_t)raw * 60U; /* minutes -> s */
 		current.valid_fields |= BATTERY_VALID_TIME_TO_EMPTY;
 	} else {
-		LOG_WRN("BQ34110 time-to-empty read failed: %d", rc);
 		s_gauge_available = false;
 		goto publish_snapshot;
 	}
@@ -152,7 +139,6 @@ static void battery_monitor_read_cycle(void)
 		current.average_power_mw = (int16_t)raw;
 		current.valid_fields |= BATTERY_VALID_AVERAGE_POWER;
 	} else {
-		LOG_WRN("BQ34110 average-power read failed: %d", rc);
 		s_gauge_available = false;
 		goto publish_snapshot;
 	}
@@ -163,7 +149,6 @@ static void battery_monitor_read_cycle(void)
 		current.temperature_celsius = ((int32_t)raw - 2732) / 10;
 		current.valid_fields |= BATTERY_VALID_TEMPERATURE;
 	} else {
-		LOG_WRN("BQ34110 temperature read failed: %d", rc);
 		s_gauge_available = false;
 		goto publish_snapshot;
 	}
@@ -238,20 +223,34 @@ int battery_monitor_init(void)
 	k_work_init_delayable(&s_update_work, battery_monitor_work_handler);
 	s_gauge_available = false;
 	if (!i2c_is_ready_dt(&s_gauge)) {
-		LOG_WRN("Battery gauge unavailable at startup; continuing with N/A telemetry");
 		return 0;
 	}
 	/* Probe the gauge: if the first register read fails, the device is
 	 * not connected. Do not start polling to avoid I2C bus errors. */
 	if (bq34110_read_word(BQ34110_REG_VOLTAGE, &probe) != 0) {
-		LOG_WRN("BQ34110 not responding at 0x%02x; continuing with N/A telemetry",
-			s_gauge.addr);
 		return 0;
 	}
 	s_gauge_available = true;
-	LOG_INF("BQ34110 configured on I2C1 at address 0x%02x", s_gauge.addr);
 	(void)k_work_schedule(&s_update_work, K_NO_WAIT);
 	return 0;
+}
+
+void battery_monitor_log_boot_status(void)
+{
+	if (s_gauge_available) {
+		uint16_t mv = 0;
+		if (bq34110_read_word(BQ34110_REG_VOLTAGE, &mv) == 0) {
+			TRACE("Battery_voltage: %u mV", (unsigned int)mv);
+			return;
+		}
+		struct battery_status st;
+		battery_monitor_get_status(&st);
+		if ((st.valid_fields & BATTERY_VALID_VOLTAGE) != 0U) {
+			TRACE("Battery_voltage: %u mV", (unsigned int)st.voltage_mv);
+			return;
+		}
+	}
+	TRACE("Battery_voltage: N/A (gauge not present)");
 }
 
 void battery_monitor_suspend(void)

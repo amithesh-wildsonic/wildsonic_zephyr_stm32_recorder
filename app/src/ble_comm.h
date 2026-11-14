@@ -224,6 +224,11 @@ void ble_comm_set_test_capture(bool enabled);
  */
 void ble_comm_reset_test_state(void);
 
+/**
+ * @brief Measure unused stack bytes on the BLE communication thread.
+ */
+int ble_comm_get_stack_free(size_t *total_bytes, size_t *unused_bytes);
+
 #ifdef __cplusplus
 }
 #endif

@@ -233,10 +233,19 @@ west build -b nucleo_l476rg C:\Users\amith\Downloads\wildsonic_zephyr_stm32_reco
 - `-p always`: Pristine clean build.
 - `-DSD_BUS=sdmmc`: Selects the high-throughput 4-bit native SDMMC1 storage overlay.
 
-**Production Memory Footprint**:
-- **Flash**: ~181.8 KB (17.35% of 1 MB)
-- **RAM**: ~80.8 KB (82.23% of 96 KB SRAM1, allocating the 64 KB real-time audio block pool)
-- **SRAM1 Aux**: 0 B (Reserved for normal application use)
+**Production & Test Memory Footprint (STM32L476RG)**:
+- **PRODUCTION** (`build/prod`, `WILDSONIC_TEST_OUTPUT=n`): Flash `283,404 B` (27.03%), SRAM0 `93,476 B` used / `4,828 B` free (`SRAM1` 32 KB scratch/audio buffer pool).
+- **TEST** (`build/test`, `-DEXTRA_CONF_FILE=configs/test_profile.conf`): Flash `313,584 B` (29.91%), SRAM0 `93,988 B` used / `4,316 B` free.
+- **Safety & Parity Gate** (`./scripts/check_parity.sh build/prod build/test`): enforces zero `[TEST]`/`[METRIC]`/benchmark strings in `PRODUCTION`, identical devicetree & logic symbols, `CONFIG_MPU_STACK_GUARD=y`, identical thread stack sizes across builds, and `>= 4,096 B` free SRAM0 headroom in both `PRODUCTION` and `TEST`.
+
+**High-Rate / 32-Bit Verdict Model (`OK` / `WARNING` / `IMPOSSIBLE`)**:
+- `OK`: `48000 Hz` / `16-bit` mono and `192000 Hz` / `16-bit` mono (unchanged production pipeline).
+- `WARNING` (staged, applied, and recorded with `[WARNING] ... - will run`): high sample rates (`384000`, `512000`, `768000 Hz`), `32-bit` PCM, `EXPERIMENTAL` modes, timer rate error (`ppm`), reduced auto-oversampling, DSP fallback (`DC_ONLY`), 85–98% ADC duty, or storage overload (`PSRAM`-buffered or immediate overload). On runtime overload, the capture loop drops the newest blocks cleanly without blocking or aborting, coalesces contiguous gap markers (`.gaps`), finalizes and verifies the WAV container (`WAV_VERIFIED`), reports truthful `lost`/`gaps` counts (omitting `ZERO_LOSS_VERIFIED`), and continues scheduled sessions.
+- `IMPOSSIBLE` (`[BLOCKED] ... Value unchanged:`): `TIM6` divider out of `[1..65536]`, `1x` oversampling ADC duty `> 98%`, unimplemented bit depth (`BTPS != 16, 32`) or channel count (`NUMCH != 1, 2`), or invalid buffer/RIFF limits.
+- **Console Staging**: Parameter changes stage in RAM first and only write flash on `APPLY` or `ARBT` when modified (`TIMEZONE`, audio, and schedule settings persist across `ARBT` reboots). `STATS` reports live `Stacks free (B)` across all 8 threads in both `PRODUCTION` and `TEST`.
+- **Verified Hardware Capture Matrix (Nucleo-L476RG)**:
+  - Zero-loss (`lost 0, gaps 0, sd_err 0`): `48000/16` (5s), `192000/16`, `192000/32` (5s), `384000/16` (5s, both `TEST` and `PRODUCTION`).
+  - Fault-free overload (`WAV_VERIFIED`, truthful `lost`/`gaps`, scheduler continues): `512000/16` (10s), `384000/32` (6s), `512000/32` (5s, both `TEST` and `PRODUCTION`), `768000/16` (5s).
 
 ---
 
@@ -344,6 +353,10 @@ Interactive console ready. Type 'help' for commands, 'config' for guided setup.
 | `psram <on\|off\|status\|burst <B>>` | `on`, `off`, `status`, `burst <B>` | Configure PSRAM circular buffer and transaction burst sizes. |
 | `monitor [sec]` | `1` to `3600` | Run live 1 Hz microphone diagnostic meter (min/max/span/RMS/dBFS). |
 | `default` | None | Reset all settings to factory defaults. |
+| `SAMF <Hz>` | `8000`–`512000` | Stage/set sampling rate (`RATECHECK`-validated before hardware changes). |
+| `BTPS <16\|32>` | `16`, `32` | Stage/set PCM sample width (`24`-bit is rejected before staging). |
+| `RATECHECK [Hz] [bits] [dur]` | Optional | Run feasibility check (ADC/OVS, DSP CPU%, SD vs PSRAM duration limits). |
+| `APPLY` / `ARBT` | None | Commit pending config to flash (`APPLY`) and safely reboot (`ARBT`). |
 
 ### 6.2 Standard Recording Workflow
 
@@ -387,21 +400,24 @@ Interactive console ready. Type 'help' for commands, 'config' for guided setup.
 
 ## 7. Recording Configuration
 
-### 7.1 Supported Sampling Frequencies
-The STM32L476RG hardware timer (TIM6 TRGO) triggers ADC1 conversions with zero jitter:
+### 7.1 Supported Sampling Frequencies & Verified Hardware Matrix
+The STM32L476RG hardware timer (`TIM6` TRGO at $72\,\text{MHz}$ APB1 timer clock) triggers ADC1 conversions with zero jitter, and every configuration is checked against `rate_config_check_ex()` (`RATECHECK`) before programming any timer, ADC, or DMA registers:
 
-| Nominal Rate | Actual Hardware Rate | TIM6 Period Divider (from 80 MHz clock) | Deviation | Acoustic Application |
-|---|---|---|---|---|
-| **16,000 Hz** | 16,000.0 Hz | 5000 | 0.0 Hz (0.00%) | Speech and low-frequency wildlife calls |
-| **32,000 Hz** | 32,000.0 Hz | 2500 | 0.0 Hz (0.00%) | General bioacoustics |
-| **44,100 Hz** | 44,101.4 Hz | 1814 | $+1.4\,\text{Hz}$ ($+0.003\%$) | Standard CD audio rate |
-| **48,000 Hz** | 48,000.0 Hz | 1666 | $-1.9\,\text{Hz}$ ($-0.004\%$) | Professional acoustic monitoring |
-| **96,000 Hz** | 96,000.0 Hz | 833 | $+3.8\,\text{Hz}$ ($+0.004\%$) | Extended frequency bandwidth |
-| **192,000 Hz**| 192,000.0 Hz | 416 | $-307\,\text{Hz}$ ($-0.16\%$) | Full-bandwidth ultrasound & throughput testing |
+| Profile (Nominal / Bits) | Actual Rate (TIM6 div) | OVS (ENOB) | DSP Mode | Stream Rate | Status / Max Duration | Hardware Verified (`lost=0`) |
+|---|---|---|---|---|---|---|
+| **48,000 Hz / 16-bit** | 48,000 Hz (1500) | 8x (15-bit) | `FULL` | $94\,\text{KB/s}$ | `SUPPORTED` (SD $1189\,\text{KB/s}$, up to $44738\,\text{s}$) | Verified (PROD & TEST, $5\,\text{s}$) |
+| **192,000 Hz / 16-bit** | 192,000 Hz (375) | 8x (15-bit) | `FULL` | $375\,\text{KB/s}$ | `SUPPORTED` (SD $598\,\text{KB/s}$ tier, up to $11184\,\text{s}$) | Verified (PROD & TEST, $5\,\text{s}$) |
+| **384,000 Hz / 16-bit** | 382,978 Hz (188) | 4x (14-bit) | `DC_ONLY` | $748\,\text{KB/s}$ | `LIMITED` (PSRAM-buffered, max $20\,\text{s}$) | Verified (PROD & TEST, $5\,\text{s}$) |
+| **512,000 Hz / 16-bit** | 510,638 Hz (141) | 2x (13-bit) | `DC_ONLY` | $997\,\text{KB/s}$ | `LIMITED` (PSRAM-buffered, max $7\,\text{s}$) | Verified (TEST, $5\,\text{s}$) |
+| **192,000 Hz / 32-bit** | 192,000 Hz (375) | 8x (15-bit) | `FULL` | $750\,\text{KB/s}$ | `LIMITED` (PSRAM-buffered, max $20\,\text{s}$) | Verified (PROD & TEST, $5\,\text{s}$) |
+| **384,000 Hz / 32-bit** | 382,978 Hz (188) | 4x (14-bit) | `DC_ONLY` | $1496\,\text{KB/s}$ | `LIMITED` (PSRAM-buffered, max $3\,\text{s}$) | Verified (TEST, $2\,\text{s}$) |
+| **Any rate / 24-bit** | — | — | — | — | `REJECTED` before hardware access (`supported: 16, 32`) | Verified rejected (PROD & TEST) |
+| **384,000+ Hz without PSRAM** | — | — | — | — | `REJECTED` (`buffer pool 42 ms < 300 ms minimum`) | Verified rejected (TEST) |
 
 ### 7.2 PCM Audio Formats
-- **16-bit Signed Integer PCM** (Format Tag 1, Mono): Standard 2 bytes per sample. Baseline production profile producing $384\,\text{kB/s}$ throughput at 192 kHz.
-- **32-bit Signed Integer PCM** (Format Tag 1, Mono): 4 bytes per sample container for high-throughput stress testing ($768\,\text{kB/s}$ at 192 kHz).
+- **16-bit Signed Integer PCM** (`wFormatTag = 1`, `wBitsPerSample = 16`, `nBlockAlign = 2 * channels`): Standard 2 bytes per sample.
+- **32-bit Signed Integer PCM** (`wFormatTag = 1`, `wBitsPerSample = 32`, `nBlockAlign = 4 * channels`): 4 bytes per sample, expanded from 16-bit oversampled ADC data (`int16_t << 16`) with 32-bit saturating digital gain (`dsp_process_i32`) and RIFF 4 GiB header bounds enforced in `RATECHECK`.
+- **Sample-Rate Timing Fidelity**: `wav_fill_header()` and accounting write the exact hardware `actual_rate` (e.g., `382978 Hz` for nominal `384000 Hz`) while preserving nominal `settings.sample_rate`.
 
 ### 7.3 DSP Filtering Pipeline
 The real-time DSP pipeline executes in a high-priority cooperative thread using Direct Form II Transposed biquad filters:

@@ -178,7 +178,7 @@ def test_sd_write_error_during_finalization():
     """Verify that if fs_write or fs_truncate fails during WAV finalization, error is preserved and logged."""
     code = RECORDER_C.read_text(encoding="utf-8")
     assert "if (finalize_ret != 0 && err == 0) {" in code
-    assert "LOG_ERR(\"WAV finalize/sync/close failed: %d\", finalize_ret);" in code
+    assert 'TRACE("WAV finalize/sync/close failed: %d", finalize_ret);' in code
     assert "err = finalize_ret;" in code
 
 

@@ -183,8 +183,16 @@ enum recorder_mode {
   REC_MODE_FILTERED,
 };
 
-/* Initialise audio input + mount the SD card. */
-int recorder_init(void);
+/* Split initialization for ordered boot sequence:
+ * 1. recorder_init_storage(): threads, queues, SD card mount
+ * 2. recorder_init_psram():   PSRAM staging ring setup
+ * 3. recorder_init_audio():   single-shot ADC/DMA init at final sample rate
+ */
+int recorder_init_storage(void);
+void recorder_init_psram(void);
+int recorder_init_audio(uint32_t sample_rate_hz);
+void recorder_log_sd_boot_status(void);
+void recorder_log_last_file(void);
 
 /* Remount the SD filesystem after the SDMMC driver has reported an
  * unrecoverable controller/card error. Only valid while recording is idle. */
@@ -245,6 +253,19 @@ int recorder_scan_last_file(char *out_folder, size_t folder_len, char *out_file,
 
 /* Low-power sleep transition between sessions, with measured wakeup recovery */
 int recorder_sleep(uint32_t seconds, uint32_t *wake_recovery_us);
+
+/* Per-batch SD timing log mode (TEST/DEV builds print according to mode;
+ * measurements are always collected in all builds). */
+enum recorder_batchlog_mode {
+  BATCHLOG_LIVE = 0,
+  BATCHLOG_END,
+  BATCHLOG_OFF,
+};
+
+void recorder_set_batchlog_mode(enum recorder_batchlog_mode mode);
+enum recorder_batchlog_mode recorder_get_batchlog_mode(void);
+void recorder_print_last_stats(void);
+void recorder_print_stack_free_stats(void);
 
 typedef enum {
   SHUTDOWN_STAGE_NONE = 0,

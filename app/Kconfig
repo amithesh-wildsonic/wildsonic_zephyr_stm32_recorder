@@ -338,14 +338,17 @@ config WILDSONIC_PROFILE_PRODUCTION
 
 config WILDSONIC_PROFILE_TEST
 	bool "TEST build profile"
+	select WILDSONIC_TEST_OUTPUT
 	select WILDSONIC_TEST_MARKERS
 	select WILDSONIC_TEST_BUILD
+	select WILDSONIC_BENCHMARKS
 	help
 	  Test build profile: test markers enabled for automated host test suites
 	  and per-batch SD timing reports enabled, matching production code paths.
 
 config WILDSONIC_PROFILE_DEV
 	bool "DEV build profile"
+	select WILDSONIC_TEST_OUTPUT
 	select WILDSONIC_TEST_MARKERS
 	select WILDSONIC_VERBOSE_LOGS
 	select WILDSONIC_BENCHMARKS
@@ -353,6 +356,14 @@ config WILDSONIC_PROFILE_DEV
 	  Development profile: verbose logs, thread analyzer, and benchmarks enabled.
 
 endchoice
+
+config WILDSONIC_TEST_OUTPUT
+	bool "Emit TEST console output (TRACE_TEST, per-batch stats, test markers)"
+	default n
+	help
+	  Enables TRACE_TEST() output, [TEST] markers, [METRIC] JSON, per-batch
+	  SD timing prints, and test-only console commands. Must be disabled in
+	  PRODUCTION builds.
 
 config WILDSONIC_TEST_MARKERS
 	bool "Emit [TEST] and test harness markers"
@@ -393,10 +404,9 @@ config WILDSONIC_VERBOSE_LOGS
 config WILDSONIC_TEST_BUILD
 	bool "Mark firmware as a test build"
 	default n
-	select WILDSONIC_VERBOSE_LOGS
 	help
-	  Explicitly labels the image as test-only and enables engineering
-	  diagnostics. Production configurations must leave this disabled.
+	  Explicitly labels the image as test-only. Production configurations must
+	  leave this disabled.
 
 config WILDSONIC_SD_FAULT_INJECT
 	bool "Enable SD Fault Injection test hooks"

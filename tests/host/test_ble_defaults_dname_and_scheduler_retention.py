@@ -42,8 +42,8 @@ def test_ble_comm_initial_unlocked_connectable_state():
 
     assert 'AT+ADTY0\\r\\n' in init_fn, "ble_comm_init must configure AT+ADTY0 at boot"
     assert 'OK+Set:0' in init_fn, "ble_comm_init must expect OK+Set:0"
-    assert '[BLE] Access: UNLOCKED (initial boot state)' in init_fn, \
-        "ble_comm_init must log initial unlocked boot state"
+    assert 's_current_adty = 0;' in init_fn, \
+        "ble_comm_init must record unlocked s_current_adty = 0 state"
 
     # Must NOT automatically start a pairing window timeout at boot
     assert "s_pairing_window_active = false;" in init_fn, \

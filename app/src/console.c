@@ -30,19 +30,23 @@
 #include "psram_is66wvs.h"
 #include "audio_format.h"
 #include "ble_comm.h"
+#include "wildsonic_trace.h"
+#include "retained_reboot.h"
+#include "system_assert.h"
 
 #ifndef WILDSONIC_GIT_COMMIT
 #define WILDSONIC_GIT_COMMIT "unknown"
 #endif
 #include "dsp.h"
+#include "rate_check.h"
+#if defined(CONFIG_WILDSONIC_BENCHMARKS)
 #include "sd_benchmark.h"
+#endif
 #include "solar_calculator.h"
 
 #include <zephyr/kernel.h>
 #include <zephyr/sys/reboot.h>
 #include <zephyr/fs/fs.h>
-#include <zephyr/logging/log.h>
-#include <zephyr/logging/log_ctrl.h>
 #include <zephyr/drivers/uart.h>
 #include <zephyr/sys/ring_buffer.h>
 #if defined(CONFIG_SOC_SERIES_STM32L4X)
@@ -55,12 +59,6 @@
 #include <string.h>
 #include <strings.h>
 #include <math.h>
-
-#if defined(CONFIG_WILDSONIC_VERBOSE_LOGS)
-LOG_MODULE_REGISTER(ws_console, LOG_LEVEL_INF);
-#else
-LOG_MODULE_REGISTER(ws_console, LOG_LEVEL_WRN);
-#endif
 
 #define CANONICAL_CMD_COUNT 59
 
@@ -241,27 +239,18 @@ static bool s_from_ble = false;
 
 static int console_commit_and_ack_config(const char *cmd_name, const char *val_str, bool recording_active)
 {
-	int save_rc = config_store_save_pending();
-	if (save_rc != 0) {
-		LOG_ERR("Failed to persist pending configuration to flash (%d)", save_rc);
-		printk("[ERROR] Flash save failed (%d). Pending configuration not saved.\n", save_rc);
-		if (s_current_out_resp && s_current_out_resp_size > 0) {
-			snprintf(s_current_out_resp, s_current_out_resp_size, "[ERROR] Flash save failed (%d)", save_rc);
-		}
-		config_store_rollback_pending();
-		return save_rc;
-	}
+	config_store_stage_pending();
 
 	if (recording_active) {
-		printk("\nOK: Value staged for next session (active session unaffected)\n");
+		TRACE_RAW("\nOK: Value staged for next session (active session unaffected)\n");
 	}
-	printk("[ACK] Command %s received and validated. Saved to persistent flash (seq %u, pending gen %u).\n",
-	       cmd_name, config_store_get_sequence_number(), config_store_get_pending_generation());
-	printk("[PENDING] Configuration pending application after reboot.\n");
+	TRACE_RAW("[ACK] Command %s received and validated. Staged in RAM (pending gen %u).\n",
+	          cmd_name, config_store_get_pending_generation());
+	TRACE_RAW("[PENDING] Send APPLY or ARBT to save to flash.\n");
 
 	if (s_current_out_resp && s_current_out_resp_size > 0) {
 		snprintf(s_current_out_resp, s_current_out_resp_size,
-		         "[ACK] %s %s: Saved to flash (Pending reboot application)",
+		         "[ACK] %s %s: Staged in RAM (send APPLY/ARBT to save)",
 		         cmd_name, val_str ? val_str : "");
 	}
 	return 0;
@@ -328,12 +317,17 @@ enum console_cmd_id {
 	CMD_I2C,
 	CMD_RTC_RESET,
 	CMD_TEST_ALARM,
-	CMD_PSRAM,
 	CMD_CONFIG_WIZARD,
 	CMD_GET_STATUS,
 	CMD_GET_DEV_INFO,
 	CMD_GET_CONFIG,
 	CMD_STOP_RECORDING,
+	CMD_STATS,
+	CMD_RATECHECK,
+#if defined(CONFIG_WILDSONIC_TEST_OUTPUT)
+	CMD_PSRAM,
+	CMD_BATCHLOG,
+#endif
 #if defined(CONFIG_WILDSONIC_SD_FAULT_INJECT)
 	CMD_FAULT,
 #endif
@@ -401,12 +395,17 @@ static const char *console_cmd_lookup_table[] = {
 	"I2C",
 	"RTCRST",
 	"TEST_ALARM",
-	"PSRAM",
 	"CONFIG",
 	"GET_STATUS",
 	"GET_DEV_INFO",
 	"GET_CONFIG",
 	"STOP_RECORDING",
+	"STATS",
+	"RATECHECK",
+#if defined(CONFIG_WILDSONIC_TEST_OUTPUT)
+	"PSRAM",
+	"BATCHLOG",
+#endif
 #if defined(CONFIG_WILDSONIC_SD_FAULT_INJECT)
 	"FAULT",
 #endif
@@ -473,12 +472,17 @@ static const char *console_cmd_description_table[] = {
 	"I2C debugging scan, read/write command",
 	"Reset RTC time to 2025-01-01 00:00:00 UTC",
 	"Configure custom/default alarm sequence (GPIO 1.7 + RTC)",
-	"Configure PSRAM circular staging buffer (on, off, status, burst, mode)",
-	"Run guided interactive configuration wizard",
+	"Show active configuration / run guided wizard",
 	"Get current system, scheduler, and recording status",
 	"Get hardware platform and firmware device information",
 	"Get current device audio, storage, and schedule configuration",
 	"Safely stop active recording, drain buffers, and close file",
+	"Print last recording session accounting statistics",
+	"Check feasibility of sample rate, bits, and duration: RATECHECK <rate> <bits> [dur_s]",
+#if defined(CONFIG_WILDSONIC_TEST_OUTPUT)
+	"Configure PSRAM circular staging buffer (on, off, status, burst, mode)",
+	"Set batch log output mode: live | end | off",
+#endif
 #if defined(CONFIG_WILDSONIC_SD_FAULT_INJECT)
 	"SD storage fault injection and resilience testing",
 #endif
@@ -505,50 +509,56 @@ static void console_printf_time(const char *prefix, time_t epoch_utc, int tz_off
 	uint32_t tz_hr = (uint32_t)(abs_tz / 3600);
 	uint32_t tz_min = (uint32_t)((abs_tz % 3600) / 60);
 
-	printk("%s%04u-%02u-%02u %02u:%02u:%02u.000 %c%02u:%02u%s",
-	       prefix,
-	       cal.year, cal.month, cal.day,
-	       cal.hour, cal.min, cal.sec,
-	       tz_sign, tz_hr, tz_min,
-	       suffix);
+	TRACE_RAW("%s%04u-%02u-%02u %02u:%02u:%02u.000 %c%02u:%02u%s",
+	          prefix,
+	          cal.year, cal.month, cal.day,
+	          cal.hour, cal.min, cal.sec,
+	          tz_sign, tz_hr, tz_min,
+	          suffix);
 }
 
 /* Print command names */
 static void display_console_commands(void)
 {
-	printk("\nList of commands\n");
+	TRACE_RAW("\nList of commands\n");
 	for (size_t i = 0; i < CANONICAL_CMD_COUNT; i++) {
-		printk(" %s \n", console_cmd_lookup_table[i]);
+		TRACE_RAW(" %s \n", console_cmd_lookup_table[i]);
 	}
-#if defined(CONFIG_WILDSONIC_VERBOSE_LOGS)
-	printk(" %s \n", console_cmd_lookup_table[CMD_PSRAM]);
-	printk(" %s \n", console_cmd_lookup_table[CMD_CONFIG_WIZARD]);
+	TRACE_RAW(" %s \n", console_cmd_lookup_table[CMD_CONFIG_WIZARD]);
+	TRACE_RAW(" %s \n", console_cmd_lookup_table[CMD_STATS]);
+	TRACE_RAW(" %s \n", console_cmd_lookup_table[CMD_RATECHECK]);
+#if defined(CONFIG_WILDSONIC_TEST_OUTPUT)
+	TRACE_RAW(" %s \n", console_cmd_lookup_table[CMD_PSRAM]);
+	TRACE_RAW(" %s \n", console_cmd_lookup_table[CMD_BATCHLOG]);
 #endif
-	printk("\n");
+	TRACE_RAW("\n");
 }
 
 /* Print HELP: command : description */
 static void display_console_help(void)
 {
-	printk("\nList of commands\n");
+	TRACE_RAW("\nList of commands\n");
 	for (size_t i = 0; i < CANONICAL_CMD_COUNT; i++) {
-		printk(" %s : %s\n", console_cmd_lookup_table[i], console_cmd_description_table[i]);
+		TRACE_RAW(" %s : %s\n", console_cmd_lookup_table[i], console_cmd_description_table[i]);
 	}
-#if defined(CONFIG_WILDSONIC_VERBOSE_LOGS)
-	printk("\nEngineering Extensions (TEST build only):\n");
-	printk(" %s : %s\n", console_cmd_lookup_table[CMD_PSRAM], console_cmd_description_table[CMD_PSRAM]);
-	printk(" %s : %s\n", console_cmd_lookup_table[CMD_CONFIG_WIZARD], console_cmd_description_table[CMD_CONFIG_WIZARD]);
+	TRACE_RAW(" %s : %s\n", console_cmd_lookup_table[CMD_CONFIG_WIZARD], console_cmd_description_table[CMD_CONFIG_WIZARD]);
+	TRACE_RAW(" %s : %s\n", console_cmd_lookup_table[CMD_STATS], console_cmd_description_table[CMD_STATS]);
+	TRACE_RAW(" %s : %s\n", console_cmd_lookup_table[CMD_RATECHECK], console_cmd_description_table[CMD_RATECHECK]);
+#if defined(CONFIG_WILDSONIC_TEST_OUTPUT)
+	TRACE_RAW("\nEngineering Extensions (TEST build only):\n");
+	TRACE_RAW(" %s : %s\n", console_cmd_lookup_table[CMD_PSRAM], console_cmd_description_table[CMD_PSRAM]);
+	TRACE_RAW(" %s : %s\n", console_cmd_lookup_table[CMD_BATCHLOG], console_cmd_description_table[CMD_BATCHLOG]);
 #if defined(CONFIG_WILDSONIC_SD_FAULT_INJECT)
-	printk(" %s : %s\n", console_cmd_lookup_table[CMD_FAULT], console_cmd_description_table[CMD_FAULT]);
+	TRACE_RAW(" %s : %s\n", console_cmd_lookup_table[CMD_FAULT], console_cmd_description_table[CMD_FAULT]);
 #endif
 #endif
-	printk("\n");
+	TRACE_RAW("\n");
 }
 
 /* Explicit deferred hardware notice */
 static int report_deferred_hardware(const char *cmd_name)
 {
-	printk("\n[DEFERRED] Command '%s' requires hardware not populated on STM32L476RG.\n", cmd_name);
+	TRACE_RAW("\n[DEFERRED] Command '%s' requires hardware not populated on STM32L476RG.\n", cmd_name);
 	return -ENOTSUP;
 }
 
@@ -634,21 +644,175 @@ __maybe_unused static int parse_strict_i32(const char *str, size_t len, int32_t 
 	return 0;
 }
 
+static void console_fill_rate_check_params(rate_check_params_t *p,
+                                           uint32_t rate_hz,
+                                           uint16_t bits,
+                                           uint16_t channels,
+                                           uint32_t duration_s,
+                                           uint32_t lpf_hz)
+{
+	struct app_settings *settings = main_get_settings();
+	rate_check_init_params(p);
+	p->nominal_rate_hz = rate_hz;
+	p->bits = bits;
+	p->channels = channels;
+	p->duration_s = duration_s;
+	p->psram_enabled = recorder_is_psram_staging_enabled() &&
+	                   psram_is_present() && psram_is_quad_mode();
+	if (settings && !settings->dsp_enabled) {
+		p->dsp_cfg.mode = RATE_DSP_BYPASS_ALL;
+	} else {
+		p->dsp_cfg.mode = RATE_DSP_AUTO;
+	}
+	p->dsp_cfg.hpf_hz = g_cfg.lower_cutoff_frequency;
+	p->dsp_cfg.lpf_hz = lpf_hz;
+	p->dsp_cfg.notch_enabled = settings ? (settings->dsp_enabled && settings->notch_enabled) : false;
+}
+
+static void console_print_audio_warning(uint32_t rate_hz,
+                                        uint16_t bits,
+                                        uint16_t channels,
+                                        uint32_t duration_s,
+                                        const rate_check_result_t *res)
+{
+	const rate_check_margins_t *m = &res->margins;
+	TRACE_RAW("\n[WARNING] %u Hz, %u-bit, %uch, dur %u s%s - will run\n",
+	          rate_hz, bits, channels, duration_s,
+	          m->experimental ? " [EXPERIMENTAL]" : "");
+	if (res->actual_rate > 0) {
+		TRACE_RAW("  Actual rate : %u Hz (TIM6 div %u, %d ppm)\n",
+		          res->actual_rate, m->tim_divider, m->rate_err_ppm);
+	}
+	if (m->warn_storage) {
+		if (m->max_duration_s > 0U && duration_s > m->max_duration_s) {
+			TRACE_RAW("  Storage     : stream %u KB/s vs SD %u KB/s, expect overload after about %u s\n",
+			          m->stream_kbps, m->sd_sustained_kbps, m->max_duration_s);
+		} else if (m->max_duration_s > 0U) {
+			TRACE_RAW("  Storage     : stream %u KB/s vs SD %u KB/s, PSRAM buffer ~%u s\n",
+			          m->stream_kbps, m->sd_sustained_kbps, m->max_duration_s);
+		} else {
+			TRACE_RAW("  Storage     : stream %u KB/s vs SD %u KB/s, immediate overload\n",
+			          m->stream_kbps, m->sd_sustained_kbps);
+		}
+	} else if (res->reason[0] != '\0') {
+		TRACE_RAW("  Note        : %s\n", res->reason);
+	}
+}
+
+static void console_print_rate_check_details(uint32_t rate_hz,
+                                             uint16_t bits,
+                                             uint16_t channels,
+                                             uint32_t duration_s,
+                                             const rate_check_result_t *res)
+{
+	const rate_check_margins_t *m = &res->margins;
+	TRACE_RAW("\n[%s] %u Hz, %u-bit, %uch, dur %u s%s%s\n",
+	          rate_status_to_str(res->status), rate_hz, bits, channels, duration_s,
+	          m->experimental ? " [EXPERIMENTAL]" : "",
+	          (res->status == RATE_STATUS_WARNING) ? " - will run" : "");
+	if (res->actual_rate > 0) {
+		TRACE_RAW("  Actual rate : %u Hz (TIM6 div %u, %d ppm)\n",
+		          res->actual_rate, m->tim_divider, m->rate_err_ppm);
+	}
+	if (m->ovs_selected > 0) {
+		TRACE_RAW("  ADC / OVS   : %ux (eff %u-bit ENOB), conv %u/%u ns (%u%% duty)\n",
+		          m->ovs_selected, m->adc_effective_bits,
+		          m->adc_conv_ns, m->sample_period_ns, m->adc_budget_pct);
+	}
+	if (m->block_samples > 0) {
+		TRACE_RAW("  DSP / Block : %s (%u ns/smp, %u%% CPU), block %u/%u us (%u smp)\n",
+		          rate_dsp_mode_to_str(m->effective_dsp_mode),
+		          m->dsp_ns_per_sample, m->dsp_cpu_pct,
+		          m->dsp_block_us, m->block_deadline_us, m->block_samples);
+	}
+	if (m->stream_kbps > 0) {
+		TRACE_RAW("  Storage     : stream %u KB/s vs SD %u KB/s (margin %d%%), pool %u ms, max %u s\n",
+		          m->stream_kbps, m->sd_sustained_kbps, m->sd_margin_pct,
+		          m->pool_ms, m->max_duration_s);
+	}
+	if (res->reason[0] != '\0') {
+		TRACE_RAW("  Reason      : %s\n", res->reason);
+	}
+}
+
+static bool console_check_audio_config(uint32_t rate_hz,
+                                       uint16_t bits,
+                                       uint16_t channels,
+                                       uint32_t duration_s,
+                                       uint32_t lpf_hz,
+                                       rate_check_result_t *res_out)
+{
+	rate_check_params_t p;
+	rate_check_result_t local_res;
+	rate_check_result_t *res = res_out ? res_out : &local_res;
+	console_fill_rate_check_params(&p, rate_hz, bits, channels, duration_s, lpf_hz);
+	rate_config_check_ex(&p, res);
+	if (res->status == RATE_STATUS_IMPOSSIBLE) {
+		if (s_current_out_resp && s_current_out_resp_size > 0) {
+			snprintf(s_current_out_resp, s_current_out_resp_size, "BLOCKED: %s", res->reason);
+		}
+		return false;
+	}
+	return true;
+}
+
+static void handle_ratecheck(const char *p_args, size_t args_length)
+{
+	uint32_t rate_hz = g_cfg.sampling_rate;
+	uint32_t bits = g_cfg.audio_sampling_width ? g_cfg.audio_sampling_width : 16U;
+	uint32_t dur_s = g_cfg.recording_length;
+	uint32_t ch = g_cfg.num_audio_channels ? g_cfg.num_audio_channels : 1U;
+
+	if (p_args && args_length > 0) {
+		char argbuf[64];
+		size_t n = (args_length < sizeof(argbuf) - 1U) ? args_length : (sizeof(argbuf) - 1U);
+		memcpy(argbuf, p_args, n);
+		argbuf[n] = '\0';
+		unsigned long r = 0, b = bits, d = dur_s, c = ch;
+		int parsed = sscanf(argbuf, "%lu %lu %lu %lu", &r, &b, &d, &c);
+		if (parsed < 2) {
+			TRACE_RAW("\nUsage: RATECHECK <rate_hz> <bits> [duration_s] [channels]\n");
+			s_last_cmd_status = -EINVAL;
+			return;
+		}
+		rate_hz = (uint32_t)r;
+		bits = (uint32_t)b;
+		dur_s = (parsed >= 3) ? (uint32_t)d : g_cfg.recording_length;
+		ch = (parsed >= 4) ? (uint32_t)c : ch;
+	}
+
+	uint32_t lpf_hz = dsp_validate_lpf_cutoff(rate_hz, g_cfg.upper_cutoff_frequency);
+	rate_check_params_t p;
+	rate_check_result_t res;
+	console_fill_rate_check_params(&p, rate_hz, (uint16_t)bits, (uint16_t)ch, dur_s, lpf_hz);
+	rate_config_check_ex(&p, &res);
+	console_print_rate_check_details(rate_hz, (uint16_t)bits, (uint16_t)ch, dur_s, &res);
+	TRACE_RAW("  Verdict     : %s\n", rate_status_to_str(res.status));
+	if (s_current_out_resp && s_current_out_resp_size > 0) {
+		snprintf(s_current_out_resp, s_current_out_resp_size, "%s %uHz %ub max=%us%s%s",
+		         rate_status_to_str(res.status),
+		         res.actual_rate ? res.actual_rate : rate_hz,
+		         (unsigned)bits, res.margins.max_duration_s,
+		         res.reason[0] ? ": " : "", res.reason);
+	}
+	s_last_cmd_status = (res.status == RATE_STATUS_IMPOSSIBLE) ? -ERANGE : 0;
+}
+
 /* SAMF handler */
 static void handle_samf(const char *p_args, size_t args_length)
 {
 	struct app_settings *settings = main_get_settings();
 
 	if (args_length == 0) {
-		printk("\nValue is set to %u\n", g_cfg.sampling_rate);
+		TRACE_RAW("\nValue is set to %u\n", g_cfg.sampling_rate);
 		s_last_cmd_status = 0;
 		return;
 	}
 
 	uint32_t raw_val = 0;
 	if (parse_strict_u32(p_args, args_length, &raw_val) != 0) {
-		printk("\nInvalid value %.*s\n", (int)args_length, p_args);
-		printk("\nValue is set to %u\n", g_cfg.sampling_rate);
+		TRACE_RAW("\n[BLOCKED] Invalid value %.*s. Value unchanged: %u\n",
+		          (int)args_length, p_args, g_cfg.sampling_rate);
 		s_last_cmd_status = -EINVAL;
 		return;
 	}
@@ -660,17 +824,22 @@ static void handle_samf(const char *p_args, size_t args_length)
 	else if (val == 48) val = 48000;
 	else if (val == 96) val = 96000;
 	else if (val == 192) val = 192000;
-#if defined(CONFIG_WILDSONIC_VERBOSE_LOGS)
 	else if (val == 384) val = 384000;
 	else if (val == 512) val = 512000;
-#endif
+	else if (val == 768) val = 768000;
 
-	uint32_t act = 0, div = 0;
-	int err = 0;
-	if (!audio_in_is_rate_supported(val, &act, &div, &err)) {
-		printk("\nInvalid value %.*s\n", (int)args_length, p_args);
-		printk("\nValue is set to %u\n", g_cfg.sampling_rate);
-		s_last_cmd_status = -EINVAL;
+	uint16_t cur_bits = (uint16_t)(g_cfg.audio_sampling_width ? g_cfg.audio_sampling_width : 16U);
+	uint16_t cur_ch = (uint16_t)(g_cfg.num_audio_channels ? g_cfg.num_audio_channels : 1U);
+	uint32_t cand_lpf = g_cfg.upper_cutoff_frequency;
+	if (cand_lpf == (g_cfg.sampling_rate / 2U) || cand_lpf >= ((val * 49U) / 100U)) {
+		cand_lpf = dsp_validate_lpf_cutoff(val, (val * 45U) / 100U);
+	}
+	rate_check_result_t rc_res;
+	if (!console_check_audio_config(val, cur_bits, cur_ch, g_cfg.recording_length,
+	                                cand_lpf, &rc_res)) {
+		TRACE_RAW("\n[BLOCKED] %s. Value unchanged: %u\n",
+		          rc_res.reason, g_cfg.sampling_rate);
+		s_last_cmd_status = -ERANGE;
 		return;
 	}
 
@@ -678,14 +847,14 @@ static void handle_samf(const char *p_args, size_t args_length)
 	if (!recorder_is_active()) {
 		int rc = audio_in_set_rate(val);
 		if (rc != 0) {
-			printk("\nUnsupported sample rate: %u Hz (error %d)\n", val, rc);
-			printk("\nValue is set to %u\n", g_cfg.sampling_rate);
+			TRACE_RAW("\n[BLOCKED] Unsupported sample rate %u Hz (err %d). Value unchanged: %u\n",
+			          val, rc, g_cfg.sampling_rate);
 			s_last_cmd_status = rc;
 			return;
 		}
 		g_cfg.sampling_rate = val;
 		if (settings) {
-			settings->sample_rate = audio_in_rate();
+			settings->sample_rate = val;
 		}
 		main_apply_dsp_settings();
 	} else {
@@ -693,24 +862,12 @@ static void handle_samf(const char *p_args, size_t args_length)
 		g_cfg.sampling_rate = val;
 	}
 
-#if defined(CONFIG_WILDSONIC_VERBOSE_LOGS)
-	if (val == 384000 || val == 512000) {
-		uint32_t bytes_per_sec = val * (g_cfg.num_audio_channels ? g_cfg.num_audio_channels : 1) *
-		                         (g_cfg.audio_sampling_width ? (g_cfg.audio_sampling_width / 8) : 2);
-		printk("\n================================================================================\n");
-		printk("WARNING: Experimental audio sampling rate configured: %u Hz\n", val);
-		printk("  Not validated for production use (STM32L476 hardware baseline validated <= 192 kHz)\n");
-		printk("  Target production platform: STM32U585\n");
-		printk("  Effective TIM6 trigger rate: %u Hz (divider %u, clock error %d Hz)\n",
-		       act, div, err);
-		printk("  Adaptive oversampling ratio: %ux\n", audio_in_get_ovs_ratio());
-		printk("  Estimated streaming throughput: %u bytes/sec (%u KB/s)\n",
-		       bytes_per_sec, bytes_per_sec / 1000);
-		printk("================================================================================\n");
+	if (rc_res.status == RATE_STATUS_WARNING) {
+		console_print_audio_warning(val, cur_bits, cur_ch, g_cfg.recording_length, &rc_res);
+		TRACE_RAW("  Value set to %u\n", val);
+	} else {
+		TRACE_RAW("\nValue is set to %u\n", val);
 	}
-#endif
-
-	printk("\nValue is set to %u\n", val);
 	if (g_cfg.upper_cutoff_frequency == (old_rate / 2) ||
 	    g_cfg.upper_cutoff_frequency >= ((val * 49) / 100)) {
 		uint32_t safe_cutoff = dsp_validate_lpf_cutoff(val, (val * 45) / 100);
@@ -721,9 +878,9 @@ static void handle_samf(const char *p_args, size_t args_length)
 		if (!recorder_is_active()) {
 			main_apply_dsp_settings();
 		}
-		printk("\nUpper cutoff frequency adjusted to %u\n", g_cfg.upper_cutoff_frequency);
+		TRACE_RAW("\nUpper cutoff frequency adjusted to %u\n", g_cfg.upper_cutoff_frequency);
 	}
-	printk("\nSend APPLY command and reboot for changes to take effect\n");
+	TRACE_RAW("\nSend APPLY command and reboot for changes to take effect\n");
 	char val_str[16];
 	snprintf(val_str, sizeof(val_str), "%u", val);
 	s_last_cmd_status = console_commit_and_ack_config("SAMF", val_str, recorder_is_active());
@@ -735,59 +892,59 @@ static void handle_btps(const char *p_args, size_t args_length)
 	struct app_settings *settings = main_get_settings();
 
 	if (args_length == 0) {
-		printk("\nValue is set to %u\n", g_cfg.audio_sampling_width);
+		TRACE_RAW("\nValue is set to %u\n", g_cfg.audio_sampling_width);
 		s_last_cmd_status = 0;
 		return;
 	}
 
 	uint32_t val = 0;
 	if (parse_strict_u32(p_args, args_length, &val) != 0) {
-		printk("\nInvalid value %.*s\n", (int)args_length, p_args);
-		printk("\nValue is set to %u\n", g_cfg.audio_sampling_width);
+		TRACE_RAW("\n[BLOCKED] Invalid value %.*s. Value unchanged: %u\n",
+		          (int)args_length, p_args, g_cfg.audio_sampling_width);
 		s_last_cmd_status = -EINVAL;
 		return;
 	}
 
-	if (val == 32) {
-		g_cfg.audio_sampling_width = 32;
-		if (settings) {
-			settings->sample_bits = 32;
-		}
-#if defined(CONFIG_WILDSONIC_VERBOSE_LOGS)
-		uint32_t bytes_per_sec = g_cfg.sampling_rate * (g_cfg.num_audio_channels ? g_cfg.num_audio_channels : 1) * 4;
-		printk("\n================================================================================\n");
-		printk("WARNING: Experimental 32-bit PCM storage format configured\n");
-		printk("  Not validated for production use (native STM32L476 ADC is 12-bit SAR)\n");
-		printk("  Container mode: 12-bit ADC / 16-bit DSP scaled to 32-bit (int16_t << 16)\n");
-		printk("  Target production platform: STM32U585 (2.5 Msps 14-bit ADC / 24-bit I2S)\n");
-		printk("  Estimated streaming throughput: %u bytes/sec (%u KB/s)\n",
-		       bytes_per_sec, bytes_per_sec / 1000);
-		printk("================================================================================\n");
-#endif
-		printk("\nValue is set to 32\n");
-		printk("\nSend APPLY command and reboot for changes to take effect\n");
-		s_last_cmd_status = console_commit_and_ack_config("BTPS", "32", recorder_is_active());
-		return;
-	}
 	if (val == 24) {
-		printk("\n[DEFERRED] Bits per sample %d requires future hardware (STM32U585/external I2S codec).\n", (int)val);
-		printk("\nValue is set to %u\n", g_cfg.audio_sampling_width);
+		TRACE_RAW("\n[DEFERRED] Bits per sample %d requires future hardware (STM32U585/external I2S codec).\n", (int)val);
+		TRACE_RAW("[BLOCKED] Bit depth 24-bit not implemented. Value unchanged: %u\n",
+		          g_cfg.audio_sampling_width);
 		s_last_cmd_status = -ENOTSUP;
 		return;
 	}
-	if (val != 16) {
-		printk("\nInvalid value %.*s\n", (int)args_length, p_args);
-		printk("\nValue is set to %u\n", g_cfg.audio_sampling_width);
+	if (val != 16 && val != 32) {
+		TRACE_RAW("\n[BLOCKED] Bit depth %u unsupported (supported: 16, 32). Value unchanged: %u\n",
+		          val, g_cfg.audio_sampling_width);
 		s_last_cmd_status = -EINVAL;
 		return;
 	}
-	g_cfg.audio_sampling_width = 16;
-	if (settings) {
-		settings->sample_bits = 16;
+
+	uint16_t cur_ch = (uint16_t)(g_cfg.num_audio_channels ? g_cfg.num_audio_channels : 1U);
+	rate_check_result_t rc_res;
+	if (!console_check_audio_config(g_cfg.sampling_rate, (uint16_t)val, cur_ch,
+	                                g_cfg.recording_length,
+	                                g_cfg.upper_cutoff_frequency, &rc_res)) {
+		TRACE_RAW("\n[BLOCKED] %s. Value unchanged: %u\n",
+		          rc_res.reason, g_cfg.audio_sampling_width);
+		s_last_cmd_status = -ERANGE;
+		return;
 	}
-	printk("\nValue is set to 16\n");
-	printk("\nSend APPLY command and reboot for changes to take effect\n");
-	s_last_cmd_status = console_commit_and_ack_config("BTPS", "16", recorder_is_active());
+
+	g_cfg.audio_sampling_width = val;
+	if (settings && !recorder_is_active()) {
+		settings->sample_bits = (uint16_t)val;
+	}
+	if (rc_res.status == RATE_STATUS_WARNING) {
+		console_print_audio_warning(g_cfg.sampling_rate, (uint16_t)val, cur_ch,
+		                            g_cfg.recording_length, &rc_res);
+		TRACE_RAW("  Value set to %u\n", val);
+	} else {
+		TRACE_RAW("\nValue is set to %u\n", val);
+	}
+	TRACE_RAW("\nSend APPLY command and reboot for changes to take effect\n");
+	char bstr[8];
+	snprintf(bstr, sizeof(bstr), "%u", val);
+	s_last_cmd_status = console_commit_and_ack_config("BTPS", bstr, recorder_is_active());
 }
 
 /* NUMCH handler */
@@ -796,56 +953,48 @@ static void handle_numch(const char *p_args, size_t args_length)
 	struct app_settings *settings = main_get_settings();
 
 	if (args_length == 0) {
-		printk("\nValue is set to %u\n", g_cfg.num_audio_channels);
+		TRACE_RAW("\nValue is set to %u\n", g_cfg.num_audio_channels);
 		s_last_cmd_status = 0;
 		return;
 	}
 
 	uint32_t val = 0;
-	if (parse_strict_u32(p_args, args_length, &val) != 0) {
-		printk("\nInvalid value %.*s\n", (int)args_length, p_args);
-		printk("\nValue is set to %u\n", g_cfg.num_audio_channels);
+	if (parse_strict_u32(p_args, args_length, &val) != 0 || (val != 1 && val != 2)) {
+		TRACE_RAW("\n[BLOCKED] Invalid channel count %.*s (supported: 1, 2). Value unchanged: %u\n",
+		          (int)args_length, p_args, g_cfg.num_audio_channels);
 		s_last_cmd_status = -EINVAL;
 		return;
 	}
 
-	if (val == 2) {
-		g_cfg.num_audio_channels = 2;
-		if (settings) {
-			settings->channels = 2;
-		}
-#if defined(CONFIG_WILDSONIC_VERBOSE_LOGS)
-		uint32_t bytes_per_sec = g_cfg.sampling_rate * 2 * (g_cfg.audio_sampling_width ? (g_cfg.audio_sampling_width / 8) : 2);
-		printk("\n================================================================================\n");
-		printk("WARNING: Experimental stereo channel emulation configured (2 channels)\n");
-		printk("  Not validated for production use (single analog microphone on PA0/ADC1_IN5)\n");
-		printk("  Emulation mode: Mono duplicated to stereo (or synthetic dual-tone)\n");
-		printk("  Target production platform: STM32U585 (dual simultaneous ADCs / stereo I2S)\n");
-		printk("  Estimated streaming throughput: %u bytes/sec (%u KB/s)\n",
-		       bytes_per_sec, bytes_per_sec / 1000);
-		printk("================================================================================\n");
-#endif
-		printk("\nValue is set to 2\n");
-		printk("\nSend APPLY command and reboot for changes to take effect\n");
-		s_last_cmd_status = console_commit_and_ack_config("NUMCH", "2", recorder_is_active());
+	uint16_t cur_bits = (uint16_t)(g_cfg.audio_sampling_width ? g_cfg.audio_sampling_width : 16U);
+	rate_check_result_t rc_res;
+	if (!console_check_audio_config(g_cfg.sampling_rate, cur_bits, (uint16_t)val,
+	                                g_cfg.recording_length,
+	                                g_cfg.upper_cutoff_frequency, &rc_res)) {
+		TRACE_RAW("\n[BLOCKED] %s. Value unchanged: %u\n",
+		          rc_res.reason, g_cfg.num_audio_channels);
+		s_last_cmd_status = -ERANGE;
 		return;
 	}
-	if (val != 1) {
-		printk("\nInvalid value %.*s\n", (int)args_length, p_args);
-		printk("\nValue is set to %u\n", g_cfg.num_audio_channels);
-		s_last_cmd_status = -EINVAL;
-		return;
+
+	g_cfg.num_audio_channels = val;
+	if (settings && !recorder_is_active()) {
+		settings->channels = (uint16_t)val;
 	}
-	g_cfg.num_audio_channels = 1;
-	if (settings) {
-		settings->channels = 1;
+	if (rc_res.status == RATE_STATUS_WARNING) {
+		console_print_audio_warning(g_cfg.sampling_rate, cur_bits, (uint16_t)val,
+		                            g_cfg.recording_length, &rc_res);
+		TRACE_RAW("  Value set to %u\n", val);
+	} else {
+		TRACE_RAW("\nValue is set to %u\n", val);
 	}
-	printk("\nValue is set to 1\n");
-	printk("\nSend APPLY command and reboot for changes to take effect\n");
-	s_last_cmd_status = console_commit_and_ack_config("NUMCH", "1", recorder_is_active());
+	TRACE_RAW("\nSend APPLY command and reboot for changes to take effect\n");
+	char cstr[8];
+	snprintf(cstr, sizeof(cstr), "%u", val);
+	s_last_cmd_status = console_commit_and_ack_config("NUMCH", cstr, recorder_is_active());
 }
 
-#if defined(CONFIG_WILDSONIC_VERBOSE_LOGS)
+#if defined(CONFIG_WILDSONIC_TEST_OUTPUT)
 static void handle_source(const char *p_args, size_t args_length)
 {
 	struct app_settings *settings = main_get_settings();
@@ -853,23 +1002,23 @@ static void handle_source(const char *p_args, size_t args_length)
 		enum audio_capture_source cur = audio_in_get_capture_source();
 		const char *s = (cur == AUDIO_SRC_PHYSICAL_MIC) ? "MIC" :
 		                (cur == AUDIO_SRC_STEREO_DUPLICATE) ? "STEREO_DUP" : "SYNTH";
-		printk("\nCapture source is %s\n", s);
+		TRACE_RAW("\nCapture source is %s\n", s);
 		return;
 	}
 	if (strncasecmp(p_args, "MIC", 3) == 0) {
 		audio_in_set_capture_source(AUDIO_SRC_PHYSICAL_MIC);
 		if (settings) settings->capture_source = AUDIO_SRC_PHYSICAL_MIC;
-		printk("\nCapture source set to MIC (physical analog microphone)\n");
+		TRACE_RAW("\nCapture source set to MIC (physical analog microphone)\n");
 	} else if (strncasecmp(p_args, "STEREO_DUP", 10) == 0 || strncasecmp(p_args, "DUP", 3) == 0) {
 		audio_in_set_capture_source(AUDIO_SRC_STEREO_DUPLICATE);
 		if (settings) settings->capture_source = AUDIO_SRC_STEREO_DUPLICATE;
-		printk("\nCapture source set to STEREO_DUP (mono ADC duplicated to stereo)\n");
+		TRACE_RAW("\nCapture source set to STEREO_DUP (mono ADC duplicated to stereo)\n");
 	} else if (strncasecmp(p_args, "SYNTH", 5) == 0) {
 		audio_in_set_capture_source(AUDIO_SRC_SYNTHETIC);
 		if (settings) settings->capture_source = AUDIO_SRC_SYNTHETIC;
-		printk("\nCapture source set to SYNTH (synthetic deterministic tone)\n");
+		TRACE_RAW("\nCapture source set to SYNTH (synthetic deterministic tone)\n");
 	} else {
-		printk("\nInvalid source '%s'. Valid: MIC, STEREO_DUP, SYNTH\n", p_args);
+		TRACE_RAW("\nInvalid source '%s'. Valid: MIC, STEREO_DUP, SYNTH\n", p_args);
 	}
 }
 #endif
@@ -878,9 +1027,9 @@ static void handle_source(const char *p_args, size_t args_length)
 static void handle_audio(const char *p_args, size_t args_length)
 {
 	if (args_length == 0) {
-		printk("\nNumber of channels set to %u\n", g_cfg.num_audio_channels);
-		printk("Sampling frequency set to %u\n", g_cfg.sampling_rate);
-		printk("Bits per sample set to %u\n", g_cfg.audio_sampling_width);
+		TRACE_RAW("\nNumber of channels set to %u\n", g_cfg.num_audio_channels);
+		TRACE_RAW("Sampling frequency set to %u\n", g_cfg.sampling_rate);
+		TRACE_RAW("Bits per sample set to %u\n", g_cfg.audio_sampling_width);
 		s_last_cmd_status = 0;
 		return;
 	}
@@ -897,12 +1046,22 @@ static void handle_audio(const char *p_args, size_t args_length)
 		uint32_t new_samf = (uint32_t)atoi(samf_str);
 		uint32_t new_btps = (uint32_t)atoi(btps_str);
 
-		uint32_t act = 0, div = 0;
-		int err = 0;
-		bool valid_combo = (new_numch == 1 || new_numch == 2) &&
-		                   (new_btps == 16 || new_btps == 32) &&
-		                   audio_in_is_rate_supported(new_samf, &act, &div, &err);
-		if (valid_combo) {
+		uint32_t cand_lpf = g_cfg.upper_cutoff_frequency;
+		if (cand_lpf == (g_cfg.sampling_rate / 2U) || cand_lpf >= ((new_samf * 49U) / 100U)) {
+			cand_lpf = dsp_validate_lpf_cutoff(new_samf, (new_samf * 45U) / 100U);
+		}
+		rate_check_result_t audio_rc;
+		if ((new_numch == 1 || new_numch == 2) &&
+		    (new_btps == 16 || new_btps == 32)) {
+			if (!console_check_audio_config(new_samf, (uint16_t)new_btps, (uint16_t)new_numch,
+			                                g_cfg.recording_length, cand_lpf, &audio_rc)) {
+				TRACE_RAW("\n[BLOCKED] %s. Value unchanged.\n", audio_rc.reason);
+				TRACE_RAW("\nNumber of channels set to %u\n", g_cfg.num_audio_channels);
+				TRACE_RAW("Sampling frequency set to %u\n", g_cfg.sampling_rate);
+				TRACE_RAW("Bits per sample set to %u\n", g_cfg.audio_sampling_width);
+				s_last_cmd_status = -ERANGE;
+				return;
+			}
 			uint32_t old_samf = g_cfg.sampling_rate;
 			g_cfg.num_audio_channels = new_numch;
 			g_cfg.sampling_rate = new_samf;
@@ -918,6 +1077,11 @@ static void handle_audio(const char *p_args, size_t args_length)
 				main_apply_dsp_settings();
 			}
 
+			if (audio_rc.status == RATE_STATUS_WARNING) {
+				console_print_audio_warning(new_samf, (uint16_t)new_btps, (uint16_t)new_numch,
+				                            g_cfg.recording_length, &audio_rc);
+			}
+
 			if ((old_samf != new_samf && g_cfg.upper_cutoff_frequency == (old_samf / 2)) ||
 			    g_cfg.upper_cutoff_frequency >= ((new_samf * 49) / 100)) {
 				uint32_t safe_cutoff = dsp_validate_lpf_cutoff(new_samf, (new_samf * 45) / 100);
@@ -928,22 +1092,23 @@ static void handle_audio(const char *p_args, size_t args_length)
 				if (!recorder_is_active()) {
 					main_apply_dsp_settings();
 				}
-				printk("\nUpper cutoff frequency adjusted to %u\n", g_cfg.upper_cutoff_frequency);
+				TRACE_RAW("\nUpper cutoff frequency adjusted to %u\n", g_cfg.upper_cutoff_frequency);
 			}
 
-			printk("\nNumber of channels set to %u\n", g_cfg.num_audio_channels);
-			printk("Sampling frequency set to %u\n", g_cfg.sampling_rate);
-			printk("Bits per sample set to %u\n", g_cfg.audio_sampling_width);
-			printk("\nSend APPLY command and reboot for changes to take effect\n");
+			TRACE_RAW("\nNumber of channels set to %u\n", g_cfg.num_audio_channels);
+			TRACE_RAW("Sampling frequency set to %u\n", g_cfg.sampling_rate);
+			TRACE_RAW("Bits per sample set to %u\n", g_cfg.audio_sampling_width);
+			config_store_stage_pending();
+			TRACE_RAW("\nSend APPLY command and reboot for changes to take effect\n");
 			s_last_cmd_status = 0;
 			return;
 		}
 	}
 
-	printk("\nInvalid values\n");
-	printk("\nNumber of channels set to %u\n", g_cfg.num_audio_channels);
-	printk("Sampling frequency set to %u\n", g_cfg.sampling_rate);
-	printk("Bits per sample set to %u\n", g_cfg.audio_sampling_width);
+	TRACE_RAW("\nInvalid values\n");
+	TRACE_RAW("\nNumber of channels set to %u\n", g_cfg.num_audio_channels);
+	TRACE_RAW("Sampling frequency set to %u\n", g_cfg.sampling_rate);
+	TRACE_RAW("Bits per sample set to %u\n", g_cfg.audio_sampling_width);
 	s_last_cmd_status = -EINVAL;
 }
 
@@ -953,32 +1118,50 @@ static void handle_rect(const char *p_args, size_t args_length)
 	struct app_settings *settings = main_get_settings();
 
 	if (args_length == 0) {
-		printk("\nValue is set to %u\n", g_cfg.recording_length);
+		TRACE_RAW("\nValue is set to %u\n", g_cfg.recording_length);
 		s_last_cmd_status = 0;
 		return;
 	}
 
 	uint32_t val = 0;
 	if (parse_strict_u32(p_args, args_length, &val) != 0 || val == 0 || val > 86400) {
-		printk("\nInvalid value %.*s\n", (int)args_length, p_args);
-		printk("\nValue is set to %u\n", g_cfg.recording_length);
+		TRACE_RAW("\nInvalid value %.*s\n", (int)args_length, p_args);
+		TRACE_RAW("\nValue is set to %u\n", g_cfg.recording_length);
 		s_last_cmd_status = -EINVAL;
 		return;
 	}
 
-	g_cfg.recording_length = val;
-	if (settings) {
-		settings->record_seconds = val;
+	uint16_t cur_bits = (uint16_t)(g_cfg.audio_sampling_width ? g_cfg.audio_sampling_width : 16U);
+	uint16_t cur_ch = (uint16_t)(g_cfg.num_audio_channels ? g_cfg.num_audio_channels : 1U);
+	rate_check_result_t rc_res;
+	if (!console_check_audio_config(g_cfg.sampling_rate, cur_bits, cur_ch, val,
+	                                g_cfg.upper_cutoff_frequency, &rc_res)) {
+		TRACE_RAW("\n[BLOCKED] %s. Value unchanged: %u\n",
+		          rc_res.reason, g_cfg.recording_length);
+		s_last_cmd_status = -ERANGE;
+		return;
 	}
 
-	struct schedule_config scfg;
-	scheduler_get_config(&scfg);
-	scfg.record_length = val;
-	scheduler_set_config(&scfg);
-	main_scheduler_resume();
+	g_cfg.recording_length = val;
+	if (settings && !recorder_is_active() &&
+	    settings->sample_rate == g_cfg.sampling_rate &&
+	    settings->sample_bits == (uint16_t)g_cfg.audio_sampling_width) {
+		settings->record_seconds = val;
 
-	printk("\nValue is set to %u\n", g_cfg.recording_length);
-	printk("\nSend APPLY command and reboot for changes to take effect\n");
+		struct schedule_config scfg;
+		scheduler_get_config(&scfg);
+		scfg.record_length = val;
+		scheduler_set_config(&scfg);
+		main_scheduler_resume();
+	}
+
+	if (rc_res.status == RATE_STATUS_WARNING) {
+		console_print_audio_warning(g_cfg.sampling_rate, cur_bits, cur_ch, val, &rc_res);
+		TRACE_RAW("  Value set to %u\n", g_cfg.recording_length);
+	} else {
+		TRACE_RAW("\nValue is set to %u\n", g_cfg.recording_length);
+	}
+	TRACE_RAW("\nSend APPLY command and reboot for changes to take effect\n");
 	char rect_str[16];
 	snprintf(rect_str, sizeof(rect_str), "%u", g_cfg.recording_length);
 	s_last_cmd_status = console_commit_and_ack_config("RECT", rect_str, recorder_is_active());
@@ -994,22 +1177,22 @@ static void handle_sleep(const char *p_args, size_t args_length)
 	struct app_settings *settings = main_get_settings();
 
 	if (args_length == 0) {
-		printk("\nValue is set to %u\n", g_cfg.sleep_pause_interval);
+		TRACE_RAW("\nValue is set to %u\n", g_cfg.sleep_pause_interval);
 		s_last_cmd_status = 0;
 		return;
 	}
 
 	if (p_args[0] == '-') {
-		printk("\nInvalid value: negative values are not allowed\n");
-		printk("\nValue is set to %u\n", g_cfg.sleep_pause_interval);
+		TRACE_RAW("\nInvalid value: negative values are not allowed\n");
+		TRACE_RAW("\nValue is set to %u\n", g_cfg.sleep_pause_interval);
 		s_last_cmd_status = -EINVAL;
 		return;
 	}
 
 	uint32_t val = 0;
 	if (parse_strict_u32(p_args, args_length, &val) != 0 || val > 86400) {
-		printk("\nInvalid value %.*s\n", (int)args_length, p_args);
-		printk("\nValue is set to %u\n", g_cfg.sleep_pause_interval);
+		TRACE_RAW("\nInvalid value %.*s\n", (int)args_length, p_args);
+		TRACE_RAW("\nValue is set to %u\n", g_cfg.sleep_pause_interval);
 		s_last_cmd_status = -EINVAL;
 		return;
 	}
@@ -1025,8 +1208,8 @@ static void handle_sleep(const char *p_args, size_t args_length)
 	scheduler_set_config(&scfg);
 	main_scheduler_resume();
 
-	printk("\nValue is set to %u\n", g_cfg.sleep_pause_interval);
-	printk("\nSend APPLY command and reboot for changes to take effect\n");
+	TRACE_RAW("\nValue is set to %u\n", g_cfg.sleep_pause_interval);
+	TRACE_RAW("\nSend APPLY command and reboot for changes to take effect\n");
 	char sleep_str[16];
 	snprintf(sleep_str, sizeof(sleep_str), "%u", g_cfg.sleep_pause_interval);
 	s_last_cmd_status = console_commit_and_ack_config("SLEEP", sleep_str, recorder_is_active());
@@ -1064,7 +1247,7 @@ static void handle_datetime(const char *p_args, size_t args_length)
 		int32_t tz_off = scfg.time_zone_offset;
 		if (tokens == 1 && (tz_token[0] == '+' || tz_token[0] == '-' || isdigit((unsigned char)tz_token[0]))) {
 			if (scheduler_parse_timezone(tz_token, &tz_off) != 0) {
-				printk("\nInvalid time zone %s\n", tz_token);
+				TRACE_RAW("\nInvalid time zone %s\n", tz_token);
 				s_last_cmd_status = -EINVAL;
 				return;
 			}
@@ -1080,7 +1263,7 @@ static void handle_datetime(const char *p_args, size_t args_length)
 
 		int set_res = rtc_calendar_set(&new_utc);
 		if (set_res != 0) {
-			printk("\n[ERROR] Failed to set RTC hardware calendar (%d)\n", set_res);
+			TRACE_RAW("\n[ERROR] Failed to set RTC hardware calendar (%d)\n", set_res);
 			s_last_cmd_status = set_res;
 			return;
 		}
@@ -1091,12 +1274,12 @@ static void handle_datetime(const char *p_args, size_t args_length)
 		console_printf_time("\nCurrent time UTC time is ", utc_epoch, 0, "\n");
 		console_printf_time("\nCurrent time Local is ", utc_epoch, scfg.time_zone_offset, "\n");
 		main_scheduler_resume();
-		printk("\nSend APPLY command and reboot for changes to take effect\n");
+		TRACE_RAW("\nSend APPLY command and reboot for changes to take effect\n");
 		s_last_cmd_status = 0;
 		return;
 	}
 
-	printk("\nInvalid date time %.*s\nUTC Time Format should be YYYY-MM-DD HH:MM:SS\n", (int)args_length, p_args);
+	TRACE_RAW("\nInvalid date time %.*s\nUTC Time Format should be YYYY-MM-DD HH:MM:SS\n", (int)args_length, p_args);
 	s_last_cmd_status = -EINVAL;
 }
 
@@ -1111,7 +1294,7 @@ static void handle_timezone(const char *p_args, size_t args_length)
 		int32_t abs_off = (scfg.time_zone_offset < 0) ? -scfg.time_zone_offset : scfg.time_zone_offset;
 		uint32_t tz_hr = (uint32_t)(abs_off / 3600);
 		uint32_t tz_min = (uint32_t)((abs_off % 3600) / 60);
-		printk("\nTime zone is set to %c%02u:%02u\n", sign, tz_hr, tz_min);
+		TRACE_RAW("\nTime zone is set to %c%02u:%02u\n", sign, tz_hr, tz_min);
 		s_last_cmd_status = 0;
 		return;
 	}
@@ -1122,13 +1305,13 @@ static void handle_timezone(const char *p_args, size_t args_length)
 		g_cfg.time_zone_offset = offset;
 		scheduler_set_config(&scfg);
 		main_scheduler_resume();
-		printk("\nTime zone set to %.*s\n", (int)args_length, p_args);
-		printk("\nSend APPLY command and reboot for changes to take effect\n");
+		TRACE_RAW("\nTime zone set to %.*s\n", (int)args_length, p_args);
+		TRACE_RAW("\nSend APPLY command and reboot for changes to take effect\n");
 		s_last_cmd_status = console_commit_and_ack_config("TIMEZONE", p_args, recorder_is_active());
 		return;
 	}
 
-	printk("\nInvalid time zone argument %.*s\n", (int)args_length, p_args);
+	TRACE_RAW("\nInvalid time zone argument %.*s\n", (int)args_length, p_args);
 	s_last_cmd_status = -EINVAL;
 }
 
@@ -1139,9 +1322,9 @@ static void handle_daterange(const char *p_args, size_t args_length)
 	scheduler_get_config(&scfg);
 
 	if (args_length == 0) {
-		printk("\nBegin end date set to %04u/%02u/%02u-%04u/%02u/%02u\n",
-		       scfg.start_date.year, scfg.start_date.month, scfg.start_date.day,
-		       scfg.end_date.year, scfg.end_date.month, scfg.end_date.day);
+		TRACE_RAW("\nBegin end date set to %04u/%02u/%02u-%04u/%02u/%02u\n",
+		          scfg.start_date.year, scfg.start_date.month, scfg.start_date.day,
+		          scfg.end_date.year, scfg.end_date.month, scfg.end_date.day);
 		s_last_cmd_status = 0;
 		return;
 	}
@@ -1152,18 +1335,18 @@ static void handle_daterange(const char *p_args, size_t args_length)
 		scfg.end_date = en;
 		scheduler_set_config(&scfg);
 		main_scheduler_resume();
-		printk("\nBegin end date set to %04u/%02u/%02u-%04u/%02u/%02u\n",
-		       scfg.start_date.year, scfg.start_date.month, scfg.start_date.day,
-		       scfg.end_date.year, scfg.end_date.month, scfg.end_date.day);
-		printk("\nSend APPLY command and reboot for changes to take effect\n");
+		TRACE_RAW("\nBegin end date set to %04u/%02u/%02u-%04u/%02u/%02u\n",
+		          scfg.start_date.year, scfg.start_date.month, scfg.start_date.day,
+		          scfg.end_date.year, scfg.end_date.month, scfg.end_date.day);
+		TRACE_RAW("\nSend APPLY command and reboot for changes to take effect\n");
 		s_last_cmd_status = console_commit_and_ack_config("DATERANGE", p_args, recorder_is_active());
 		return;
 	}
 
-	printk("\nInvalid begin end date %.*s\n", (int)args_length, p_args);
-	printk("\nBegin end date set to %04u/%02u/%02u-%04u/%02u/%02u\n",
-	       scfg.start_date.year, scfg.start_date.month, scfg.start_date.day,
-	       scfg.end_date.year, scfg.end_date.month, scfg.end_date.day);
+	TRACE_RAW("\nInvalid begin end date %.*s\n", (int)args_length, p_args);
+	TRACE_RAW("\nBegin end date set to %04u/%02u/%02u-%04u/%02u/%02u\n",
+	          scfg.start_date.year, scfg.start_date.month, scfg.start_date.day,
+	          scfg.end_date.year, scfg.end_date.month, scfg.end_date.day);
 	s_last_cmd_status = -EINVAL;
 }
 
@@ -1177,19 +1360,19 @@ static void handle_timeofday(const char *p_args, size_t args_length)
 		uint32_t valid_cnt = 0;
 		for (uint32_t i = 0; i < SCHEDULER_MAX_TIME_OF_DAY_RANGES; i++) {
 			if (scheduler_is_valid_tod_range(&scfg.tod_ranges[i])) {
-				printk("\nBegin end time (Index %u) set to %02u:%02u:%02u-%02u:%02u:%02u\n",
-				       i,
-				       scfg.tod_ranges[i].start_second / 3600,
-				       (scfg.tod_ranges[i].start_second / 60) % 60,
-				       scfg.tod_ranges[i].start_second % 60,
-				       scfg.tod_ranges[i].end_second / 3600,
-				       (scfg.tod_ranges[i].end_second / 60) % 60,
-				       scfg.tod_ranges[i].end_second % 60);
+				TRACE_RAW("\nBegin end time (Index %u) set to %02u:%02u:%02u-%02u:%02u:%02u\n",
+				          i,
+				          scfg.tod_ranges[i].start_second / 3600,
+				          (scfg.tod_ranges[i].start_second / 60) % 60,
+				          scfg.tod_ranges[i].start_second % 60,
+				          scfg.tod_ranges[i].end_second / 3600,
+				          (scfg.tod_ranges[i].end_second / 60) % 60,
+				          scfg.tod_ranges[i].end_second % 60);
 				valid_cnt++;
 			}
 		}
 		if (valid_cnt == 0) {
-			printk("\nNo valid time of day ranges set\n");
+			TRACE_RAW("\nNo valid time of day ranges set\n");
 		}
 		s_last_cmd_status = 0;
 		return;
@@ -1210,23 +1393,39 @@ static void handle_timeofday(const char *p_args, size_t args_length)
 
 		for (uint32_t i = 0; i < SCHEDULER_MAX_TIME_OF_DAY_RANGES; i++) {
 			if (scheduler_is_valid_tod_range(&scfg.tod_ranges[i])) {
-				printk("\nBegin end time (Index %u) set to %02u:%02u:%02u-%02u:%02u:%02u\n",
-				       i,
-				       scfg.tod_ranges[i].start_second / 3600,
-				       (scfg.tod_ranges[i].start_second / 60) % 60,
-				       scfg.tod_ranges[i].start_second % 60,
-				       scfg.tod_ranges[i].end_second / 3600,
-				       (scfg.tod_ranges[i].end_second / 60) % 60,
-				       scfg.tod_ranges[i].end_second % 60);
+				TRACE_RAW("\nBegin end time (Index %u) set to %02u:%02u:%02u-%02u:%02u:%02u\n",
+				          i,
+				          scfg.tod_ranges[i].start_second / 3600,
+				          (scfg.tod_ranges[i].start_second / 60) % 60,
+				          scfg.tod_ranges[i].start_second % 60,
+				          scfg.tod_ranges[i].end_second / 3600,
+				          (scfg.tod_ranges[i].end_second / 60) % 60,
+				          scfg.tod_ranges[i].end_second % 60);
 			}
 		}
-		printk("\nSend APPLY command and reboot for changes to take effect\n");
+		TRACE_RAW("\nSend APPLY command and reboot for changes to take effect\n");
 		s_last_cmd_status = console_commit_and_ack_config("TIMEOFDAY", p_args, recorder_is_active());
 		return;
 	}
 
-	printk("\nInvalid begin end time %.*s\n", (int)args_length, p_args);
+	TRACE_RAW("\nInvalid begin end time %.*s\n", (int)args_length, p_args);
 	s_last_cmd_status = -EINVAL;
+}
+
+static void format_days_of_week(uint8_t mask, char *out, size_t out_size)
+{
+	static const char letters[] = "MTWRFSU";
+	size_t idx = 0;
+
+	if (!out || out_size == 0) {
+		return;
+	}
+	for (size_t i = 0; i < 7U && idx + 1U < out_size; i++) {
+		if (mask & (1U << i)) {
+			out[idx++] = letters[i];
+		}
+	}
+	out[idx] = '\0';
 }
 
 /* DAYSOFWEEK handler */
@@ -1234,17 +1433,11 @@ static void handle_daysofweek(const char *p_args, size_t args_length)
 {
 	struct schedule_config scfg;
 	scheduler_get_config(&scfg);
+	char dow[8];
 
 	if (args_length == 0) {
-		printk("\nDays of week set to \"");
-		if (scfg.day_of_week_mask & 0x01) printk("M");
-		if (scfg.day_of_week_mask & 0x02) printk("T");
-		if (scfg.day_of_week_mask & 0x04) printk("W");
-		if (scfg.day_of_week_mask & 0x08) printk("R");
-		if (scfg.day_of_week_mask & 0x10) printk("F");
-		if (scfg.day_of_week_mask & 0x20) printk("S");
-		if (scfg.day_of_week_mask & 0x40) printk("U");
-		printk("\"\n");
+		format_days_of_week(scfg.day_of_week_mask, dow, sizeof(dow));
+		TRACE_RAW("\nDays of week set to \"%s\"\n", dow);
 		s_last_cmd_status = 0;
 		return;
 	}
@@ -1252,7 +1445,7 @@ static void handle_daysofweek(const char *p_args, size_t args_length)
 	if ((args_length == 1 && (p_args[0] == 'X' || p_args[0] == 'x')) ||
 	    (args_length == 2 && p_args[0] == '"' && p_args[1] == '"') ||
 	    (args_length == 3 && p_args[0] == '"' && (p_args[1] == 'X' || p_args[1] == 'x') && p_args[2] == '"')) {
-		printf("\nDays of week: X is set to all days (MTWRFSU)\n");
+		TRACE_RAW("\nDays of week: X is set to all days (MTWRFSU)\n");
 	}
 
 	uint8_t mask = 0;
@@ -1260,21 +1453,14 @@ static void handle_daysofweek(const char *p_args, size_t args_length)
 		scfg.day_of_week_mask = mask;
 		scheduler_set_config(&scfg);
 		main_scheduler_resume();
-		printk("\nDays of week set to \"");
-		if (scfg.day_of_week_mask & 0x01) printk("M");
-		if (scfg.day_of_week_mask & 0x02) printk("T");
-		if (scfg.day_of_week_mask & 0x04) printk("W");
-		if (scfg.day_of_week_mask & 0x08) printk("R");
-		if (scfg.day_of_week_mask & 0x10) printk("F");
-		if (scfg.day_of_week_mask & 0x20) printk("S");
-		if (scfg.day_of_week_mask & 0x40) printk("U");
-		printk("\"\n");
-		printk("\nSend APPLY command and reboot for changes to take effect\n");
+		format_days_of_week(scfg.day_of_week_mask, dow, sizeof(dow));
+		TRACE_RAW("\nDays of week set to \"%s\"\n", dow);
+		TRACE_RAW("\nSend APPLY command and reboot for changes to take effect\n");
 		s_last_cmd_status = console_commit_and_ack_config("DAYSOFWEEK", p_args, recorder_is_active());
 		return;
 	}
 
-	printk("\nInvalid days of week %.*s\n", (int)args_length, p_args);
+	TRACE_RAW("\nInvalid days of week %.*s\n", (int)args_length, p_args);
 	s_last_cmd_status = -EINVAL;
 }
 
@@ -1284,7 +1470,7 @@ static void handle_gain(const char *p_args, size_t args_length)
 	struct app_settings *settings = main_get_settings();
 
 	if (args_length == 0) {
-		printk("\nAudio gain set to 0.1*%d\n", g_cfg.mic_gain_times_ten);
+		TRACE_RAW("\nAudio gain set to 0.1*%d\n", g_cfg.mic_gain_times_ten);
 		s_last_cmd_status = 0;
 		return;
 	}
@@ -1323,16 +1509,16 @@ static void handle_gain(const char *p_args, size_t args_length)
 	errno = 0;
 	double val = strtod(&buf[off], &endptr);
 	if (endptr == &buf[off] || *endptr != '\0' || errno == ERANGE) {
-		printk("\nInvalid audio gain %.*s\n", (int)args_length, p_args);
-		printk("\nAudio gain set to 0.1*%d\n", g_cfg.mic_gain_times_ten);
+		TRACE_RAW("\nInvalid audio gain %.*s\n", (int)args_length, p_args);
+		TRACE_RAW("\nAudio gain set to 0.1*%d\n", g_cfg.mic_gain_times_ten);
 		s_last_cmd_status = -EINVAL;
 		return;
 	}
 
 	int gain_t10 = (int)roundf((float)(sign * val * 10.0));
 	if (gain_t10 < -400 || gain_t10 > 400) {
-		printk("\nInvalid audio gain 0.1*%d\n", gain_t10);
-		printk("\nAudio gain set to 0.1*%d\n", g_cfg.mic_gain_times_ten);
+		TRACE_RAW("\nInvalid audio gain 0.1*%d\n", gain_t10);
+		TRACE_RAW("\nAudio gain set to 0.1*%d\n", g_cfg.mic_gain_times_ten);
 		s_last_cmd_status = -EINVAL;
 		return;
 	}
@@ -1345,8 +1531,8 @@ static void handle_gain(const char *p_args, size_t args_length)
 		main_apply_dsp_settings();
 	}
 
-	printk("\nAudio gain set to 0.1*%d\n", gain_t10);
-	printk("\nSend APPLY command and reboot for changes to take effect\n");
+	TRACE_RAW("\nAudio gain set to 0.1*%d\n", gain_t10);
+	TRACE_RAW("\nSend APPLY command and reboot for changes to take effect\n");
 	char gain_str[16];
 	snprintf(gain_str, sizeof(gain_str), "0.1*%d", gain_t10);
 	s_last_cmd_status = console_commit_and_ack_config("GAIN", gain_str, recorder_is_active());
@@ -1358,15 +1544,15 @@ static void handle_lcutoff(const char *p_args, size_t args_length)
 	struct app_settings *settings = main_get_settings();
 
 	if (args_length == 0) {
-		printk("\nValue is set to %u\n", g_cfg.lower_cutoff_frequency);
+		TRACE_RAW("\nValue is set to %u\n", g_cfg.lower_cutoff_frequency);
 		s_last_cmd_status = 0;
 		return;
 	}
 
 	uint32_t hz = 0;
 	if (parse_strict_u32(p_args, args_length, &hz) != 0 || (hz != 0 && (hz < 10 || hz > 2000))) {
-		printk("\nInvalid value %.*s\n", (int)args_length, p_args);
-		printk("\nValue is set to %u\n", g_cfg.lower_cutoff_frequency);
+		TRACE_RAW("\nInvalid value %.*s\n", (int)args_length, p_args);
+		TRACE_RAW("\nValue is set to %u\n", g_cfg.lower_cutoff_frequency);
 		s_last_cmd_status = -EINVAL;
 		return;
 	}
@@ -1380,8 +1566,8 @@ static void handle_lcutoff(const char *p_args, size_t args_length)
 		main_apply_dsp_settings();
 	}
 
-	printk("\nValue is set to %u\n", hz);
-	printk("\nSend APPLY command and reboot for changes to take effect\n");
+	TRACE_RAW("\nValue is set to %u\n", hz);
+	TRACE_RAW("\nSend APPLY command and reboot for changes to take effect\n");
 	char lcut_str[16];
 	snprintf(lcut_str, sizeof(lcut_str), "%u", hz);
 	s_last_cmd_status = console_commit_and_ack_config("LCUTOFF", lcut_str, recorder_is_active());
@@ -1393,7 +1579,7 @@ static void handle_ucutoff(const char *p_args, size_t args_length)
 	struct app_settings *settings = main_get_settings();
 
 	if (args_length == 0) {
-		printk("\nValue is set to %u\n", g_cfg.upper_cutoff_frequency);
+		TRACE_RAW("\nValue is set to %u\n", g_cfg.upper_cutoff_frequency);
 		s_last_cmd_status = 0;
 		return;
 	}
@@ -1401,8 +1587,8 @@ static void handle_ucutoff(const char *p_args, size_t args_length)
 	uint32_t hz = 0;
 	uint32_t nyquist_bound = (g_cfg.sampling_rate * 49) / 100;
 	if (parse_strict_u32(p_args, args_length, &hz) != 0 || (hz != 0 && (hz < 1000 || hz >= nyquist_bound))) {
-		printk("\nInvalid value %.*s\n", (int)args_length, p_args);
-		printk("\nValue is set to %u\n", g_cfg.upper_cutoff_frequency);
+		TRACE_RAW("\nInvalid value %.*s\n", (int)args_length, p_args);
+		TRACE_RAW("\nValue is set to %u\n", g_cfg.upper_cutoff_frequency);
 		s_last_cmd_status = -EINVAL;
 		return;
 	}
@@ -1416,8 +1602,8 @@ static void handle_ucutoff(const char *p_args, size_t args_length)
 		main_apply_dsp_settings();
 	}
 
-	printk("\nValue is set to %u\n", hz);
-	printk("\nSend APPLY command and reboot for changes to take effect\n");
+	TRACE_RAW("\nValue is set to %u\n", hz);
+	TRACE_RAW("\nSend APPLY command and reboot for changes to take effect\n");
 	char ucut_str[16];
 	snprintf(ucut_str, sizeof(ucut_str), "%u", hz);
 	s_last_cmd_status = console_commit_and_ack_config("UCUTOFF", ucut_str, recorder_is_active());
@@ -1429,7 +1615,7 @@ static void handle_fldr(const char *p_args, size_t args_length)
 	if (args_length == 0) {
 		const char *mode_str = (g_cfg.folder_structure == 0) ? "flat" :
 				       ((g_cfg.folder_structure == 1) ? "daily" : "hourly");
-		printk("\nValue is set to %s\n", mode_str);
+		TRACE_RAW("\nValue is set to %s\n", mode_str);
 		s_last_cmd_status = 0;
 		return;
 	}
@@ -1453,15 +1639,15 @@ static void handle_fldr(const char *p_args, size_t args_length)
 	} else if (strcasecmp(str, "hourly") == 0 || strcasecmp(str, "hour") == 0) {
 		g_cfg.folder_structure = 2;
 	} else {
-		printk("\nInvalid value %s\n", str);
+		TRACE_RAW("\nInvalid value %s\n", str);
 		s_last_cmd_status = -EINVAL;
 		return;
 	}
 
 	const char *mode_str = (g_cfg.folder_structure == 0) ? "flat" :
 			       ((g_cfg.folder_structure == 1) ? "daily" : "hourly");
-	printk("\nValue is set to %s\n", mode_str);
-	printk("\nSend APPLY command and reboot for changes to take effect\n");
+	TRACE_RAW("\nValue is set to %s\n", mode_str);
+	TRACE_RAW("\nSend APPLY command and reboot for changes to take effect\n");
 	s_last_cmd_status = console_commit_and_ack_config("FLDR", mode_str, recorder_is_active());
 }
 
@@ -1474,47 +1660,47 @@ static void handle_stor(void)
 		uint64_t total = (uint64_t)stat.f_blocks * (uint64_t)stat.f_frsize;
 		uint64_t free_b = (uint64_t)stat.f_bfree * (uint64_t)stat.f_frsize;
 		uint64_t written = (total > free_b) ? (total - free_b) : 0;
-		printk("The total number of bytes written: %lld and the available space: %lld\n",
-		       (long long)written, (long long)free_b);
+		TRACE_RAW("The total number of bytes written: %lld and the available space: %lld\n",
+		          (long long)written, (long long)free_b);
 	} else {
-		printk("The total number of bytes written: 0 and the available space: 0\n");
+		TRACE_RAW("The total number of bytes written: 0 and the available space: 0\n");
 	}
 }
 
 /* VERSION handler */
 static void handle_version(void)
 {
-	printk("\nVersion: v1.2.0\n");
-	printk("Git commit: %s\n", WILDSONIC_GIT_COMMIT);
-	printk("Build Date: %s %s\n", __DATE__, __TIME__);
+	TRACE_RAW("\nVersion: v1.2.0\n");
+	TRACE_RAW("Git commit: %s\n", WILDSONIC_GIT_COMMIT);
+	TRACE_RAW("Build Date: %s %s\n", __DATE__, __TIME__);
 }
 
 /* SN handler (max 3 alphanumeric chars per original WildSonic) */
 static int handle_sn(const char *p_args, size_t args_length)
 {
 	if (args_length == 0) {
-		printk("\nValue is set to %s\n", g_cfg.serial_number);
+		TRACE_RAW("\nValue is set to %s\n", g_cfg.serial_number);
 		return 0;
 	}
 
 	if (args_length > 3) {
-		printk("\nInvalid value %s\n", p_args);
-		printk("\nValue is set to %s\n", g_cfg.serial_number);
+		TRACE_RAW("\nInvalid value %s\n", p_args);
+		TRACE_RAW("\nValue is set to %s\n", g_cfg.serial_number);
 		return -EINVAL;
 	}
 
 	for (size_t i = 0; i < args_length; i++) {
 		if (!isalnum((unsigned char)p_args[i])) {
-			printk("\nInvalid value %s\n", p_args);
-			printk("\nValue is set to %s\n", g_cfg.serial_number);
+			TRACE_RAW("\nInvalid value %s\n", p_args);
+			TRACE_RAW("\nValue is set to %s\n", g_cfg.serial_number);
 			return -EINVAL;
 		}
 	}
 
 	strncpy(g_cfg.serial_number, p_args, sizeof(g_cfg.serial_number) - 1);
 	g_cfg.serial_number[sizeof(g_cfg.serial_number) - 1] = '\0';
-	printk("\nValue is set to %s\n", g_cfg.serial_number);
-	printk("\nSend APPLY command and reboot for changes to take effect\n");
+	TRACE_RAW("\nValue is set to %s\n", g_cfg.serial_number);
+	TRACE_RAW("\nSend APPLY command and reboot for changes to take effect\n");
 	ble_comm_notify_name_changed();
 	console_commit_and_ack_config("SN", g_cfg.serial_number, recorder_is_active());
 	return 0;
@@ -1524,28 +1710,28 @@ static int handle_sn(const char *p_args, size_t args_length)
 static int handle_dname(const char *p_args, size_t args_length)
 {
 	if (args_length == 0) {
-		printk("\nValue is set to %s\n", g_cfg.device_name);
+		TRACE_RAW("\nValue is set to %s\n", g_cfg.device_name);
 		return 0;
 	}
 
 	if (args_length > 6) {
-		printk("\nInvalid value %s\n", p_args);
-		printk("\nValue is set to %s\n", g_cfg.device_name);
+		TRACE_RAW("\nInvalid value %s\n", p_args);
+		TRACE_RAW("\nValue is set to %s\n", g_cfg.device_name);
 		return -EINVAL;
 	}
 
 	for (size_t i = 0; i < args_length; i++) {
 		if (!isalnum((unsigned char)p_args[i])) {
-			printk("\nInvalid value %s\n", p_args);
-			printk("\nValue is set to %s\n", g_cfg.device_name);
+			TRACE_RAW("\nInvalid value %s\n", p_args);
+			TRACE_RAW("\nValue is set to %s\n", g_cfg.device_name);
 			return -EINVAL;
 		}
 	}
 
 	strncpy(g_cfg.device_name, p_args, sizeof(g_cfg.device_name) - 1);
 	g_cfg.device_name[sizeof(g_cfg.device_name) - 1] = '\0';
-	printk("\nValue is set to %s\n", g_cfg.device_name);
-	printk("\nSend APPLY command and reboot for changes to take effect\n");
+	TRACE_RAW("\nValue is set to %s\n", g_cfg.device_name);
+	TRACE_RAW("\nSend APPLY command and reboot for changes to take effect\n");
 	ble_comm_notify_name_changed();
 	console_commit_and_ack_config("DNAME", g_cfg.device_name, recorder_is_active());
 	return 0;
@@ -1555,20 +1741,20 @@ static int handle_dname(const char *p_args, size_t args_length)
 static int handle_pw(const char *p_args, size_t args_length)
 {
 	if (args_length == 0) {
-		printk("\nValue is set to %s\n", g_cfg.device_password);
+		TRACE_RAW("\nValue is set to %s\n", g_cfg.device_password);
 		return 0;
 	}
 
 	if (args_length >= sizeof(g_cfg.device_password)) {
-		printk("\nInvalid value %.*s\n", (int)args_length, p_args);
-		printk("\nValue is set to %s\n", g_cfg.device_password);
+		TRACE_RAW("\nInvalid value %.*s\n", (int)args_length, p_args);
+		TRACE_RAW("\nValue is set to %s\n", g_cfg.device_password);
 		return -EINVAL;
 	}
 
 	strncpy(g_cfg.device_password, p_args, sizeof(g_cfg.device_password) - 1);
 	g_cfg.device_password[sizeof(g_cfg.device_password) - 1] = '\0';
-	printk("\nValue is set to %s\n", g_cfg.device_password);
-	printk("\nSend APPLY command and reboot for changes to take effect\n");
+	TRACE_RAW("\nValue is set to %s\n", g_cfg.device_password);
+	TRACE_RAW("\nSend APPLY command and reboot for changes to take effect\n");
 	return console_commit_and_ack_config("PW", g_cfg.device_password, recorder_is_active());
 }
 
@@ -1590,24 +1776,85 @@ void wildsonic_record_assert(const char *file, int line, const char *expr)
 extern uint32_t g_boot_csr;
 
 /* ASSERT handler */
-static void handle_assert(void)
+static void handle_assert(const char *p_args, size_t args_length)
 {
+#if defined(CONFIG_WILDSONIC_TEST_OUTPUT)
+	if (p_args && args_length >= 4 && strncasecmp(p_args, "test", 4) == 0 &&
+	    (args_length == 4 || isspace((unsigned char)p_args[4]))) {
+		SYSTEM_ASSERT(ASSERT_ID_GENERIC_SAFETY_FAULT, false);
+		return;
+	}
+#else
+	ARG_UNUSED(p_args);
+	ARG_UNUSED(args_length);
+#endif
+
+	struct retained_reboot_info rinfo;
+	if (retained_reboot_get(&rinfo) == REBOOT_REASON_ASSERT && rinfo.assert_id != 0U) {
+		TRACE_RAW("ASSERT 0x%08X %s #%u\n",
+		          (unsigned int)rinfo.assert_id,
+		          rinfo.assert_file[0] ? rinfo.assert_file : "unknown",
+		          (unsigned int)rinfo.assert_line);
+		return;
+	}
+
 	if (g_assert_info.asserted) {
-		printk("ASSERT IN FILE %s #%d: %s\n",
-		       g_assert_info.file ? g_assert_info.file : "unknown",
-		       g_assert_info.line,
-		       g_assert_info.expr ? g_assert_info.expr : "condition");
+		TRACE_RAW("ASSERT IN FILE %s #%d: %s\n",
+		          g_assert_info.file ? g_assert_info.file : "unknown",
+		          g_assert_info.line,
+		          g_assert_info.expr ? g_assert_info.expr : "condition");
 	} else if (g_boot_csr & (RCC_CSR_SFTRSTF | RCC_CSR_IWDGRSTF | RCC_CSR_WWDGRSTF | RCC_CSR_LPWRRSTF)) {
-		printk("Assert / Reset Reason: CSR=0x%08X (SFTRST=%d, IWDG=%d, WWDG=%d, LPWR=%d)\n",
-		       (unsigned int)g_boot_csr,
-		       !!(g_boot_csr & RCC_CSR_SFTRSTF),
-		       !!(g_boot_csr & RCC_CSR_IWDGRSTF),
-		       !!(g_boot_csr & RCC_CSR_WWDGRSTF),
-		       !!(g_boot_csr & RCC_CSR_LPWRRSTF));
+		TRACE_RAW("Assert / Reset Reason: CSR=0x%08X (SFTRST=%d, IWDG=%d, WWDG=%d, LPWR=%d)\n",
+		          (unsigned int)g_boot_csr,
+		          !!(g_boot_csr & RCC_CSR_SFTRSTF),
+		          !!(g_boot_csr & RCC_CSR_IWDGRSTF),
+		          !!(g_boot_csr & RCC_CSR_WWDGRSTF),
+		          !!(g_boot_csr & RCC_CSR_LPWRRSTF));
 	} else {
-		printk("There is no assert information \n");
+		TRACE_RAW("There is no assert information \n");
 	}
 }
+
+/* STATS handler */
+static void handle_stats(void)
+{
+	recorder_print_last_stats();
+	recorder_print_stack_free_stats();
+}
+
+#if defined(CONFIG_WILDSONIC_TEST_OUTPUT)
+/* BATCHLOG handler */
+static void handle_batchlog(const char *p_args, size_t args_length)
+{
+	if (!p_args || args_length == 0) {
+		enum recorder_batchlog_mode mode = recorder_get_batchlog_mode();
+		const char *mode_str = (mode == BATCHLOG_LIVE) ? "live" :
+				       (mode == BATCHLOG_END) ? "end" : "off";
+		TRACE_RAW("batchlog is %s\n", mode_str);
+		s_last_cmd_status = 0;
+		return;
+	}
+
+	if (args_length >= 4 && strncasecmp(p_args, "live", 4) == 0 &&
+	    (args_length == 4 || isspace((unsigned char)p_args[4]))) {
+		recorder_set_batchlog_mode(BATCHLOG_LIVE);
+		TRACE_RAW("batchlog set to live\n");
+	} else if (args_length >= 3 && strncasecmp(p_args, "end", 3) == 0 &&
+	           (args_length == 3 || isspace((unsigned char)p_args[3]))) {
+		recorder_set_batchlog_mode(BATCHLOG_END);
+		TRACE_RAW("batchlog set to end\n");
+	} else if (args_length >= 3 && strncasecmp(p_args, "off", 3) == 0 &&
+	           (args_length == 3 || isspace((unsigned char)p_args[3]))) {
+		recorder_set_batchlog_mode(BATCHLOG_OFF);
+		TRACE_RAW("batchlog set to off\n");
+	} else {
+		TRACE_RAW("Usage: batchlog [live|end|off]\n");
+		s_last_cmd_status = -EINVAL;
+		return;
+	}
+	s_last_cmd_status = 0;
+}
+#endif /* CONFIG_WILDSONIC_TEST_OUTPUT */
 
 /* ==============================================================================
  * Location and Solar Scheduling Command Handlers
@@ -1620,13 +1867,13 @@ static void print_current_location(void)
 
 	if (scfg.latitude_e7 == SCHEDULER_INVALID_LOCATION_COORDINATE ||
 	    scfg.longitude_e7 == SCHEDULER_INVALID_LOCATION_COORDINATE) {
-		printk("Current_Location: Not set\n");
+		TRACE_RAW("Current_Location: Not set\n");
 		return;
 	}
 
-	printk("Current_Location: %.7f, %.7f\n",
-	       (double)scfg.latitude_e7 / (double)SCHEDULER_LOCATION_COORDINATE_SCALE,
-	       (double)scfg.longitude_e7 / (double)SCHEDULER_LOCATION_COORDINATE_SCALE);
+	TRACE_RAW("Current_Location: %.7f, %.7f\n",
+	          (double)scfg.latitude_e7 / (double)SCHEDULER_LOCATION_COORDINATE_SCALE,
+	          (double)scfg.longitude_e7 / (double)SCHEDULER_LOCATION_COORDINATE_SCALE);
 }
 
 static bool parse_location_coordinates(const char *p_args, size_t args_length,
@@ -1699,23 +1946,23 @@ static void handle_loc(const char *p_args, size_t args_length)
 		g_cfg.location_lon_e7 = SCHEDULER_INVALID_LOCATION_COORDINATE;
 		scheduler_set_config(&scfg);
 		g_cfg.save_config_flag = true;
-		printk("\nLocation cleared\n");
+		TRACE_RAW("\nLocation cleared\n");
 		print_current_location();
-		printk("\nSend APPLY command and reboot for changes to take effect\n");
+		TRACE_RAW("\nSend APPLY command and reboot for changes to take effect\n");
 		s_last_cmd_status = 0;
 		return;
 	}
 
 	double lat = 0.0, lon = 0.0;
 	if (!parse_location_coordinates(p_args, args_length, &lat, &lon)) {
-		printk("\nInvalid location. Use: LOC <latitude> <longitude>\n");
+		TRACE_RAW("\nInvalid location. Use: LOC <latitude> <longitude>\n");
 		print_current_location();
 		s_last_cmd_status = -EINVAL;
 		return;
 	}
 
 	if (lat < -90.0 || lat > 90.0 || lon < -180.0 || lon > 180.0) {
-		printk("\nInvalid location range. Latitude [-90,90], Longitude [-180,180]\n");
+		TRACE_RAW("\nInvalid location range. Latitude [-90,90], Longitude [-180,180]\n");
 		print_current_location();
 		s_last_cmd_status = -ERANGE;
 		return;
@@ -1737,8 +1984,8 @@ static void handle_loc(const char *p_args, size_t args_length)
 	scheduler_set_config(&scfg);
 	g_cfg.save_config_flag = true;
 
-	printk("\nLocation set to %.7f, %.7f\n", lat, lon);
-	printk("\nSend APPLY command and reboot for changes to take effect\n");
+	TRACE_RAW("\nLocation set to %.7f, %.7f\n", lat, lon);
+	TRACE_RAW("\nSend APPLY command and reboot for changes to take effect\n");
 	s_last_cmd_status = 0;
 }
 
@@ -1749,7 +1996,7 @@ static void handle_sun(const char *p_args, size_t args_length)
 
 	if (scfg.latitude_e7 == SCHEDULER_INVALID_LOCATION_COORDINATE ||
 	    scfg.longitude_e7 == SCHEDULER_INVALID_LOCATION_COORDINATE) {
-		printk("\nLocation is not set. Use: LOC <latitude> <longitude>\n");
+		TRACE_RAW("\nLocation is not set. Use: LOC <latitude> <longitude>\n");
 		s_last_cmd_status = -EINVAL;
 		return;
 	}
@@ -1759,7 +2006,7 @@ static void handle_sun(const char *p_args, size_t args_length)
 	if (!p_args || args_length == 0) {
 		struct rtc_calendar_time cur_cal;
 		if (rtc_calendar_get(&cur_cal) != 0 || !rtc_calendar_is_valid()) {
-			printk("\nRTC is not set. Use: SUN [YYYY/MM/DD]\n");
+			TRACE_RAW("\nRTC is not set. Use: SUN [YYYY/MM/DD]\n");
 			s_last_cmd_status = -EINVAL;
 			return;
 		}
@@ -1773,7 +2020,7 @@ static void handle_sun(const char *p_args, size_t args_length)
 	} else {
 		char date_buf[32];
 		if (args_length >= sizeof(date_buf)) {
-			printk("\nInvalid date. Use: SUN [YYYY/MM/DD]\n");
+			TRACE_RAW("\nInvalid date. Use: SUN [YYYY/MM/DD]\n");
 			s_last_cmd_status = -EINVAL;
 			return;
 		}
@@ -1782,7 +2029,7 @@ static void handle_sun(const char *p_args, size_t args_length)
 
 		if (sscanf(date_buf, "%d/%d/%d", &year, &month, &day) != 3 ||
 		    year < 1970 || year > 2099 || month < 1 || month > 12 || day < 1 || day > 31) {
-			printk("\nInvalid date. Use: SUN [YYYY/MM/DD]\n");
+			TRACE_RAW("\nInvalid date. Use: SUN [YYYY/MM/DD]\n");
 			s_last_cmd_status = -EINVAL;
 			return;
 		}
@@ -1795,17 +2042,17 @@ static void handle_sun(const char *p_args, size_t args_length)
 	uint32_t sunrise_sec = 0, sunset_sec = 0;
 	if (!solar_compute_sunrise_sunset_seconds(julian_date, lat, lon, scfg.time_zone_offset,
 	                                         &sunrise_sec, &sunset_sec)) {
-		printk("\nSunrise/sunset is not available for this date and location\n");
+		TRACE_RAW("\nSunrise/sunset is not available for this date and location\n");
 		s_last_cmd_status = -EDOM;
 		return;
 	}
 
-	printk("\nSun date: %04d/%02d/%02d\n", year, month, day);
-	printk("Julian date: %.2f\n", julian_date);
-	printk("Sunrise time: %02u:%02u:%02u\n",
-	       sunrise_sec / 3600, (sunrise_sec / 60) % 60, sunrise_sec % 60);
-	printk("Sunset time: %02u:%02u:%02u\n",
-	       sunset_sec / 3600, (sunset_sec / 60) % 60, sunset_sec % 60);
+	TRACE_RAW("\nSun date: %04d/%02d/%02d\n", year, month, day);
+	TRACE_RAW("Julian date: %.2f\n", julian_date);
+	TRACE_RAW("Sunrise time: %02u:%02u:%02u\n",
+	          sunrise_sec / 3600, (sunrise_sec / 60) % 60, sunrise_sec % 60);
+	TRACE_RAW("Sunset time: %02u:%02u:%02u\n",
+	          sunset_sec / 3600, (sunset_sec / 60) % 60, sunset_sec % 60);
 	s_last_cmd_status = 0;
 }
 
@@ -1817,22 +2064,22 @@ static void handle_sunmode(const char *p_args, size_t args_length)
 	if (args_length == 0 || !p_args) {
 		switch (scfg.sun_recording_mode) {
 		case SUN_MODE_SUNRISE:
-			printk("\nSun recording mode: Sunrise\n");
+			TRACE_RAW("\nSun recording mode: Sunrise\n");
 			break;
 		case SUN_MODE_SUNSET:
-			printk("\nSun recording mode: Sunset\n");
+			TRACE_RAW("\nSun recording mode: Sunset\n");
 			break;
 		case SUN_MODE_SUNRISE_AND_SUNSET:
-			printk("\nSun recording mode: Sunrise and Sunset\n");
+			TRACE_RAW("\nSun recording mode: Sunrise and Sunset\n");
 			break;
 		case SUN_MODE_SUNRISE_TO_SUNSET:
-			printk("\nSun recording mode: Sunrise to Sunset\n");
+			TRACE_RAW("\nSun recording mode: Sunrise to Sunset\n");
 			break;
 		case SUN_MODE_SUNSET_TO_SUNRISE:
-			printk("\nSun recording mode: Sunset to Sunrise\n");
+			TRACE_RAW("\nSun recording mode: Sunset to Sunrise\n");
 			break;
 		default:
-			printk("\nSun recording mode: Disabled\n");
+			TRACE_RAW("\nSun recording mode: Disabled\n");
 			break;
 		}
 		s_last_cmd_status = 0;
@@ -1873,15 +2120,15 @@ static void handle_sunmode(const char *p_args, size_t args_length)
 			scheduler_set_config(&scfg);
 			g_cfg.save_config_flag = true;
 
-			printk("\nSun recording mode set to: %s\n", sun_mode_table[i].label);
-			printk("\nSend APPLY command and reboot for changes to take effect\n");
+			TRACE_RAW("\nSun recording mode set to: %s\n", sun_mode_table[i].label);
+			TRACE_RAW("\nSend APPLY command and reboot for changes to take effect\n");
 			s_last_cmd_status = 0;
 			return;
 		}
 	}
 
-	printk("\nInvalid sun recording mode: %.*s\n", (int)args_length, p_args);
-	printk("Valid modes: Sunrise, Sunset, Sunrise and Sunset, Sunrise to Sunset, Sunset to Sunrise, Disabled\n");
+	TRACE_RAW("\nInvalid sun recording mode: %.*s\n", (int)args_length, p_args);
+	TRACE_RAW("Valid modes: Sunrise, Sunset, Sunrise and Sunset, Sunrise to Sunset, Sunset to Sunrise, Disabled\n");
 	s_last_cmd_status = -EINVAL;
 }
 
@@ -1891,15 +2138,15 @@ static void handle_sunrisebef(const char *p_args, size_t args_length)
 	scheduler_get_config(&scfg);
 
 	if (args_length == 0 || !p_args) {
-		printk("\nValue is set to %u\n", scfg.sunrise_interval_before);
+		TRACE_RAW("\nValue is set to %u\n", scfg.sunrise_interval_before);
 		s_last_cmd_status = 0;
 		return;
 	}
 
 	uint32_t val = 0;
 	if (parse_strict_u32(p_args, args_length, &val) != 0) {
-		printk("\nInvalid value %.*s\n", (int)args_length, p_args);
-		printk("\nValue is set to %u\n", scfg.sunrise_interval_before);
+		TRACE_RAW("\nInvalid value %.*s\n", (int)args_length, p_args);
+		TRACE_RAW("\nValue is set to %u\n", scfg.sunrise_interval_before);
 		s_last_cmd_status = -EINVAL;
 		return;
 	}
@@ -1908,8 +2155,8 @@ static void handle_sunrisebef(const char *p_args, size_t args_length)
 	g_cfg.sunrise_interval_before = val;
 	scheduler_set_config(&scfg);
 	g_cfg.save_config_flag = true;
-	printk("\nValue is set to %u\n", val);
-	printk("\nSend APPLY command and reboot for changes to take effect\n");
+	TRACE_RAW("\nValue is set to %u\n", val);
+	TRACE_RAW("\nSend APPLY command and reboot for changes to take effect\n");
 	s_last_cmd_status = 0;
 }
 
@@ -1919,15 +2166,15 @@ static void handle_sunriseaft(const char *p_args, size_t args_length)
 	scheduler_get_config(&scfg);
 
 	if (args_length == 0 || !p_args) {
-		printk("\nValue is set to %u\n", scfg.sunrise_interval_after);
+		TRACE_RAW("\nValue is set to %u\n", scfg.sunrise_interval_after);
 		s_last_cmd_status = 0;
 		return;
 	}
 
 	uint32_t val = 0;
 	if (parse_strict_u32(p_args, args_length, &val) != 0) {
-		printk("\nInvalid value %.*s\n", (int)args_length, p_args);
-		printk("\nValue is set to %u\n", scfg.sunrise_interval_after);
+		TRACE_RAW("\nInvalid value %.*s\n", (int)args_length, p_args);
+		TRACE_RAW("\nValue is set to %u\n", scfg.sunrise_interval_after);
 		s_last_cmd_status = -EINVAL;
 		return;
 	}
@@ -1936,8 +2183,8 @@ static void handle_sunriseaft(const char *p_args, size_t args_length)
 	g_cfg.sunrise_interval_after = val;
 	scheduler_set_config(&scfg);
 	g_cfg.save_config_flag = true;
-	printk("\nValue is set to %u\n", val);
-	printk("\nSend APPLY command and reboot for changes to take effect\n");
+	TRACE_RAW("\nValue is set to %u\n", val);
+	TRACE_RAW("\nSend APPLY command and reboot for changes to take effect\n");
 	s_last_cmd_status = 0;
 }
 
@@ -1947,15 +2194,15 @@ static void handle_sunsetbef(const char *p_args, size_t args_length)
 	scheduler_get_config(&scfg);
 
 	if (args_length == 0 || !p_args) {
-		printk("\nValue is set to %u\n", scfg.sunset_interval_before);
+		TRACE_RAW("\nValue is set to %u\n", scfg.sunset_interval_before);
 		s_last_cmd_status = 0;
 		return;
 	}
 
 	uint32_t val = 0;
 	if (parse_strict_u32(p_args, args_length, &val) != 0) {
-		printk("\nInvalid value %.*s\n", (int)args_length, p_args);
-		printk("\nValue is set to %u\n", scfg.sunset_interval_before);
+		TRACE_RAW("\nInvalid value %.*s\n", (int)args_length, p_args);
+		TRACE_RAW("\nValue is set to %u\n", scfg.sunset_interval_before);
 		s_last_cmd_status = -EINVAL;
 		return;
 	}
@@ -1964,8 +2211,8 @@ static void handle_sunsetbef(const char *p_args, size_t args_length)
 	g_cfg.sunset_interval_before = val;
 	scheduler_set_config(&scfg);
 	g_cfg.save_config_flag = true;
-	printk("\nValue is set to %u\n", val);
-	printk("\nSend APPLY command and reboot for changes to take effect\n");
+	TRACE_RAW("\nValue is set to %u\n", val);
+	TRACE_RAW("\nSend APPLY command and reboot for changes to take effect\n");
 	s_last_cmd_status = 0;
 }
 
@@ -1975,15 +2222,15 @@ static void handle_sunsetaft(const char *p_args, size_t args_length)
 	scheduler_get_config(&scfg);
 
 	if (args_length == 0 || !p_args) {
-		printk("\nValue is set to %u\n", scfg.sunset_interval_after);
+		TRACE_RAW("\nValue is set to %u\n", scfg.sunset_interval_after);
 		s_last_cmd_status = 0;
 		return;
 	}
 
 	uint32_t val = 0;
 	if (parse_strict_u32(p_args, args_length, &val) != 0) {
-		printk("\nInvalid value %.*s\n", (int)args_length, p_args);
-		printk("\nValue is set to %u\n", scfg.sunset_interval_after);
+		TRACE_RAW("\nInvalid value %.*s\n", (int)args_length, p_args);
+		TRACE_RAW("\nValue is set to %u\n", scfg.sunset_interval_after);
 		s_last_cmd_status = -EINVAL;
 		return;
 	}
@@ -1992,8 +2239,8 @@ static void handle_sunsetaft(const char *p_args, size_t args_length)
 	g_cfg.sunset_interval_after = val;
 	scheduler_set_config(&scfg);
 	g_cfg.save_config_flag = true;
-	printk("\nValue is set to %u\n", val);
-	printk("\nSend APPLY command and reboot for changes to take effect\n");
+	TRACE_RAW("\nValue is set to %u\n", val);
+	TRACE_RAW("\nSend APPLY command and reboot for changes to take effect\n");
 	s_last_cmd_status = 0;
 }
 
@@ -2003,15 +2250,15 @@ static void handle_sunround(const char *p_args, size_t args_length)
 	scheduler_get_config(&scfg);
 
 	if (args_length == 0 || !p_args) {
-		printk("\nValue is set to %u\n", scfg.sunrise_sunset_rounding);
+		TRACE_RAW("\nValue is set to %u\n", scfg.sunrise_sunset_rounding);
 		s_last_cmd_status = 0;
 		return;
 	}
 
 	uint32_t val = 0;
 	if (parse_strict_u32(p_args, args_length, &val) != 0) {
-		printk("\nInvalid value %.*s\n", (int)args_length, p_args);
-		printk("\nValue is set to %u\n", scfg.sunrise_sunset_rounding);
+		TRACE_RAW("\nInvalid value %.*s\n", (int)args_length, p_args);
+		TRACE_RAW("\nValue is set to %u\n", scfg.sunrise_sunset_rounding);
 		s_last_cmd_status = -EINVAL;
 		return;
 	}
@@ -2020,8 +2267,8 @@ static void handle_sunround(const char *p_args, size_t args_length)
 	g_cfg.sunrise_sunset_rounding = val;
 	scheduler_set_config(&scfg);
 	g_cfg.save_config_flag = true;
-	printk("\nValue is set to %u\n", val);
-	printk("\nSend APPLY command and reboot for changes to take effect\n");
+	TRACE_RAW("\nValue is set to %u\n", val);
+	TRACE_RAW("\nSend APPLY command and reboot for changes to take effect\n");
 	s_last_cmd_status = 0;
 }
 
@@ -2030,38 +2277,41 @@ static void handle_default(void)
 {
 	main_reset_to_defaults();
 	config_store_load_defaults();
-	printk("\nDefault device configurations are set\n");
+	config_store_stage_pending();
+	TRACE_RAW("\nDefault device configurations are set\n");
+	TRACE_RAW("\nSend APPLY command and reboot for changes to take effect\n");
+	s_last_cmd_status = 0;
 }
 
 /* GET_STATUS handler */
 static void handle_get_status(void)
 {
-	printk("\n=== SYSTEM & RECORDING STATUS ===\n");
+	TRACE_RAW("\n=== SYSTEM & RECORDING STATUS ===\n");
 	if (recorder_is_active()) {
-		printk("  Recording State       : ACTIVE\n");
+		TRACE_RAW("  Recording State       : ACTIVE\n");
 		char cur_file[80] = {0};
 		recorder_get_active_file(cur_file, sizeof(cur_file));
 		if (cur_file[0] != '\0') {
-			printk("  Active File           : %s\n", cur_file);
+			TRACE_RAW("  Active File           : %s\n", cur_file);
 		}
 		uint64_t samples_written = 0, expected_samples = 0;
 		recorder_get_active_progress(&samples_written, &expected_samples);
-		printk("  Samples Written       : %llu / %llu\n",
-		       (unsigned long long)samples_written, (unsigned long long)expected_samples);
-		printk("  Active Sample Rate    : %u Hz\n", audio_in_rate());
-		printk("  Active Bit Depth      : %u-bit\n", g_cfg.audio_sampling_width);
-		printk("  Active Channels       : %u (%s)\n",
-		       g_cfg.num_audio_channels,
-		       (g_cfg.num_audio_channels == 2) ? "Duplicated Mono Container" : "Mono");
+		TRACE_RAW("  Samples Written       : %llu / %llu\n",
+		          (unsigned long long)samples_written, (unsigned long long)expected_samples);
+		TRACE_RAW("  Active Sample Rate    : %u Hz\n", audio_in_rate());
+		TRACE_RAW("  Active Bit Depth      : %u-bit\n", g_cfg.audio_sampling_width);
+		TRACE_RAW("  Active Channels       : %u (%s)\n",
+		          g_cfg.num_audio_channels,
+		          (g_cfg.num_audio_channels == 2) ? "Duplicated Mono Container" : "Mono");
 	} else {
-		printk("  Recording State       : IDLE\n");
-		printk("  Scheduler Status      : %s\n",
-		       main_is_scheduler_paused() ? "PAUSED" : "RUNNING");
-		printk("  Configured Rate       : %u Hz\n", g_cfg.sampling_rate);
-		printk("  Configured Bit Depth  : %u-bit\n", g_cfg.audio_sampling_width);
-		printk("  Configured Channels   : %u\n", g_cfg.num_audio_channels);
-		printk("  Configured Record Time: %u seconds\n", g_cfg.recording_length);
-		printk("  Configured Sleep Time : %u seconds\n", g_cfg.sleep_pause_interval);
+		TRACE_RAW("  Recording State       : IDLE\n");
+		TRACE_RAW("  Scheduler Status      : %s\n",
+		          main_is_scheduler_paused() ? "PAUSED" : "RUNNING");
+		TRACE_RAW("  Configured Rate       : %u Hz\n", g_cfg.sampling_rate);
+		TRACE_RAW("  Configured Bit Depth  : %u-bit\n", g_cfg.audio_sampling_width);
+		TRACE_RAW("  Configured Channels   : %u\n", g_cfg.num_audio_channels);
+		TRACE_RAW("  Configured Record Time: %u seconds\n", g_cfg.recording_length);
+		TRACE_RAW("  Configured Sleep Time : %u seconds\n", g_cfg.sleep_pause_interval);
 	}
 
 	if (rtc_calendar_is_valid()) {
@@ -2069,56 +2319,56 @@ static void handle_get_status(void)
 		if (rtc_calendar_get(&cur_cal) == 0) {
 			char rtc_str[32];
 			rtc_calendar_format(&cur_cal, rtc_str, sizeof(rtc_str));
-			printk("  RTC Current Time      : %s UTC\n", rtc_str);
+			TRACE_RAW("  RTC Current Time      : %s UTC\n", rtc_str);
 		}
 	} else {
-		printk("  RTC Current Time      : UNINITIALIZED\n");
+		TRACE_RAW("  RTC Current Time      : UNINITIALIZED\n");
 	}
 
 	int last_sd_err = recorder_get_last_sd_error();
 	if (last_sd_err != 0) {
-		printk("  Last Storage Error    : %d\n", last_sd_err);
+		TRACE_RAW("  Last Storage Error    : %d\n", last_sd_err);
 	}
-	printk("OK\n");
+	TRACE_RAW("OK\n");
 }
 
 /* GET_DEV_INFO handler */
 static void handle_get_dev_info(void)
 {
-	printk("\n=== DEVICE INFORMATION ===\n");
-	printk("  Hardware Platform     : STM32L476RG Nucleo-64 (ARM Cortex-M4F)\n");
-	printk("  Core Clock Frequency  : 72 MHz (PLL HSI)\n");
-	printk("  Audio Acquisition     : 12-bit SAR ADC, TIM6 TRGO DMA\n");
-	printk("  External Memory       : ISSI IS66WVS4M8 4MB Quad-SPI PSRAM @ 18 MHz\n");
-	printk("  Storage Media         : MicroSD Card via SDMMC1 4-bit @ 6 MHz (FatFs /SD:)\n");
-	printk("  SRAM Architecture     : 128 KiB (SRAM1: 96 KiB, SRAM2: 32 KiB)\n");
-	printk("  Flash Memory          : 1024 KiB Dual-Bank\n");
-	printk("  Power Management      : STM32L4 Stop 2 Deep Sleep (Strict RTC Wakeup)\n");
-	printk("  Firmware Version      : 2.1.0-prod (Zephyr RTOS)\n");
-	printk("OK\n");
+	TRACE_RAW("\n=== DEVICE INFORMATION ===\n");
+	TRACE_RAW("  Hardware Platform     : STM32L476RG Nucleo-64 (ARM Cortex-M4F)\n");
+	TRACE_RAW("  Core Clock Frequency  : 72 MHz (PLL HSI)\n");
+	TRACE_RAW("  Audio Acquisition     : 12-bit SAR ADC, TIM6 TRGO DMA\n");
+	TRACE_RAW("  External Memory       : ISSI IS66WVS4M8 4MB Quad-SPI PSRAM @ 18 MHz\n");
+	TRACE_RAW("  Storage Media         : MicroSD Card via SDMMC1 4-bit @ 6 MHz (FatFs /SD:)\n");
+	TRACE_RAW("  SRAM Architecture     : 128 KiB (SRAM1: 96 KiB, SRAM2: 32 KiB)\n");
+	TRACE_RAW("  Flash Memory          : 1024 KiB Dual-Bank\n");
+	TRACE_RAW("  Power Management      : STM32L4 Stop 2 Deep Sleep (Strict RTC Wakeup)\n");
+	TRACE_RAW("  Firmware Version      : 2.1.0-prod (Zephyr RTOS)\n");
+	TRACE_RAW("OK\n");
 }
 
 /* GET_CONFIG handler */
 static void handle_get_config(void)
 {
-	printk("\n=== DEVICE CONFIGURATION ===\n");
-	printk("  Serial Number (SN)    : %s\n", g_cfg.serial_number);
-	printk("  Device Name (DNAME)   : %s\n", g_cfg.device_name);
-	printk("  Sampling Rate (SAMF)  : %u Hz\n", g_cfg.sampling_rate);
-	printk("  Bits Per Sample (BTPS): %u-bit\n", g_cfg.audio_sampling_width);
-	printk("  Channels (NUMCH)      : %u (%s)\n",
-	       g_cfg.num_audio_channels,
-	       (g_cfg.num_audio_channels == 2) ? "Duplicated Mono Container" : "Mono");
-	printk("  Record Time (RECT)    : %u seconds\n", g_cfg.recording_length);
-	printk("  Sleep Interval (SLEEP): %u seconds\n", g_cfg.sleep_pause_interval);
-	printk("  Mic Gain (GAIN)       : %.1f dB\n", (double)((float)g_cfg.mic_gain_times_ten / 10.0f));
-	printk("  Lower Cutoff (LCUTOFF): %u Hz\n", g_cfg.lower_cutoff_frequency);
-	printk("  Upper Cutoff (UCUTOFF): %u Hz\n", g_cfg.upper_cutoff_frequency);
-	printk("  Folder Mode (FLDR)    : %u (%s)\n",
-	       g_cfg.folder_structure,
-	       (g_cfg.folder_structure == 0) ? "Flat" :
-	       (g_cfg.folder_structure == 1) ? "Daily" : "Hourly");
-	printk("OK\n");
+	TRACE_RAW("\n=== DEVICE CONFIGURATION ===\n");
+	TRACE_RAW("  Serial Number (SN)    : %s\n", g_cfg.serial_number);
+	TRACE_RAW("  Device Name (DNAME)   : %s\n", g_cfg.device_name);
+	TRACE_RAW("  Sampling Rate (SAMF)  : %u Hz\n", g_cfg.sampling_rate);
+	TRACE_RAW("  Bits Per Sample (BTPS): %u-bit\n", g_cfg.audio_sampling_width);
+	TRACE_RAW("  Channels (NUMCH)      : %u (%s)\n",
+	          g_cfg.num_audio_channels,
+	          (g_cfg.num_audio_channels == 2) ? "Duplicated Mono Container" : "Mono");
+	TRACE_RAW("  Record Time (RECT)    : %u seconds\n", g_cfg.recording_length);
+	TRACE_RAW("  Sleep Interval (SLEEP): %u seconds\n", g_cfg.sleep_pause_interval);
+	TRACE_RAW("  Mic Gain (GAIN)       : %.1f dB\n", (double)((float)g_cfg.mic_gain_times_ten / 10.0f));
+	TRACE_RAW("  Lower Cutoff (LCUTOFF): %u Hz\n", g_cfg.lower_cutoff_frequency);
+	TRACE_RAW("  Upper Cutoff (UCUTOFF): %u Hz\n", g_cfg.upper_cutoff_frequency);
+	TRACE_RAW("  Folder Mode (FLDR)    : %u (%s)\n",
+	          g_cfg.folder_structure,
+	          (g_cfg.folder_structure == 0) ? "Flat" :
+	          (g_cfg.folder_structure == 1) ? "Daily" : "Hourly");
+	TRACE_RAW("OK\n");
 }
 
 /* STOP_RECORDING handler */
@@ -2126,9 +2376,9 @@ static void handle_stop_recording(void)
 {
 	if (recorder_is_active()) {
 		recorder_request_stop();
-		printk("\nOK: Stop recording requested; finalizing WAV container and closing file.\n");
+		TRACE_RAW("\nOK: Stop recording requested; finalizing WAV container and closing file.\n");
 	} else {
-		printk("\nOK: Recorder is already idle.\n");
+		TRACE_RAW("\nOK: Recorder is already idle.\n");
 	}
 }
 
@@ -2143,46 +2393,46 @@ static void handle_fault(const char *args)
 		sd_fault_inject_status();
 		struct sd_resilient_stats st;
 		sd_resilient_get_stats(&st);
-		printk("\n=== SD RESILIENT STORAGE STATS ===\n");
-		printk("  Health State        : %s\n", sd_resilient_health_str(sd_resilient_get_health()));
-		printk("  Retry OK / Fail     : %u / %u\n", st.retry_ok, st.retry_fail);
-		printk("  Reopen OK / Fail    : %u / %u\n", st.reopen_ok, st.reopen_fail);
-		printk("  Errors (CRC/TO/Oth) : %u (CRC:%u, TO:%u, Other:%u)\n",
-		       st.err_total, st.err_crc, st.err_timeout, st.err_other);
-		printk("  Discards (Blk/Samp) : %u blocks, %llu samples\n",
-		       st.blocks_discarded, (unsigned long long)st.samples_discarded);
-		printk("  Recovery Time       : %llu us\n", (unsigned long long)st.time_in_recovery_us);
-		printk("  Gaps in RAM ring    : %u\n", sd_resilient_get_gap_count());
-		printk("OK\r\n");
+		TRACE_RAW("\n=== SD RESILIENT STORAGE STATS ===\n");
+		TRACE_RAW("  Health State        : %s\n", sd_resilient_health_str(sd_resilient_get_health()));
+		TRACE_RAW("  Retry OK / Fail     : %u / %u\n", st.retry_ok, st.retry_fail);
+		TRACE_RAW("  Reopen OK / Fail    : %u / %u\n", st.reopen_ok, st.reopen_fail);
+		TRACE_RAW("  Errors (CRC/TO/Oth) : %u (CRC:%u, TO:%u, Other:%u)\n",
+		          st.err_total, st.err_crc, st.err_timeout, st.err_other);
+		TRACE_RAW("  Discards (Blk/Samp) : %u blocks, %llu samples\n",
+		          st.blocks_discarded, (unsigned long long)st.samples_discarded);
+		TRACE_RAW("  Recovery Time       : %llu us\n", (unsigned long long)st.time_in_recovery_us);
+		TRACE_RAW("  Gaps in RAM ring    : %u\n", sd_resilient_get_gap_count());
+		TRACE_RAW("OK\r\n");
 		return;
 	}
 
 	if (strcasecmp(subcmd, "f1") == 0) {
 		sd_fault_inject_f1();
-		printk("OK\r\n");
+		TRACE_RAW("OK\r\n");
 	} else if (strcasecmp(subcmd, "f2") == 0) {
 		if (count < 2 || val == 0) {
 			val = 1;
 		}
 		sd_fault_inject_f2(val);
-		printk("OK\r\n");
+		TRACE_RAW("OK\r\n");
 	} else if (strcasecmp(subcmd, "f3") == 0) {
 		sd_fault_inject_f3();
-		printk("OK\r\n");
+		TRACE_RAW("OK\r\n");
 	} else if (strcasecmp(subcmd, "f4") == 0) {
 		sd_fault_inject_f4();
-		printk("OK\r\n");
+		TRACE_RAW("OK\r\n");
 	} else if (strcasecmp(subcmd, "f5") == 0) {
 		if (count < 2 || val == 0) {
 			val = 1;
 		}
 		sd_fault_inject_f5(val);
-		printk("OK\r\n");
+		TRACE_RAW("OK\r\n");
 	} else if (strcasecmp(subcmd, "clear") == 0) {
 		sd_fault_inject_clear();
-		printk("OK\r\n");
+		TRACE_RAW("OK\r\n");
 	} else {
-		printk("\nUnknown fault subcommand: %s (usage: fault f1|f2 <n>|f3|f4|f5 <m>|clear|status)\n", subcmd);
+		TRACE_RAW("\nUnknown fault subcommand: %s (usage: fault f1|f2 <n>|f3|f4|f5 <m>|clear|status)\n", subcmd);
 	}
 }
 #endif
@@ -2191,17 +2441,31 @@ static void handle_fault(const char *args)
 static void handle_apply(void)
 {
 	if (recorder_is_active()) {
-		printk("\nBUSY: Cannot commit to flash while recording is active. Send STOP_RECORDING first.\n");
+		TRACE_RAW("\nBUSY: Cannot commit to flash while recording is active. Send STOP_RECORDING first.\n");
 		if (s_current_out_resp && s_current_out_resp_size > 0) {
 			snprintf(s_current_out_resp, s_current_out_resp_size, "BUSY: Cannot commit to flash while recording is active");
 		}
 		s_last_cmd_status = -EBUSY;
 		return;
 	}
+	uint16_t cur_bits = (uint16_t)(g_cfg.audio_sampling_width ? g_cfg.audio_sampling_width : 16U);
+	uint16_t cur_ch = (uint16_t)(g_cfg.num_audio_channels ? g_cfg.num_audio_channels : 1U);
+	rate_check_result_t rc_res;
+	if (!console_check_audio_config(g_cfg.sampling_rate, cur_bits, cur_ch,
+	                                g_cfg.recording_length,
+	                                g_cfg.upper_cutoff_frequency, &rc_res)) {
+		TRACE_RAW("\n[BLOCKED] %s. Refused APPLY.\n", rc_res.reason);
+		s_last_cmd_status = -ERANGE;
+		return;
+	}
+	if (rc_res.status == RATE_STATUS_WARNING) {
+		console_print_audio_warning(g_cfg.sampling_rate, cur_bits, cur_ch,
+		                            g_cfg.recording_length, &rc_res);
+	}
 	g_cfg.save_config_flag = true;
 	int save_rc = config_store_save();
 	if (save_rc != 0) {
-		LOG_ERR("Failed to persist config to flash (%d)", save_rc);
+		TRACE("Failed to persist config to flash (%d)", save_rc);
 		if (s_current_out_resp && s_current_out_resp_size > 0) {
 			snprintf(s_current_out_resp, s_current_out_resp_size, "[ERROR] Flash save failed (%d)", save_rc);
 		}
@@ -2209,7 +2473,7 @@ static void handle_apply(void)
 		return;
 	}
 	/* Canonical Maxim notification: */
-	printk("\nDevice configuration is applied after reboot.\n");
+	TRACE_RAW("\nDevice configuration is applied after reboot.\n");
 	if (s_current_out_resp && s_current_out_resp_size > 0) {
 		snprintf(s_current_out_resp, s_current_out_resp_size, "Device configuration is applied after reboot.");
 	}
@@ -2222,9 +2486,7 @@ static void handle_apply(void)
 static void handle_rbt(void)
 {
 	if (main_is_reboot_pending()) {
-#if defined(CONFIG_WILDSONIC_VERBOSE_LOGS)
-		printk("\n[ACK] RBT: Reboot already pending. System shutdown in progress.\n");
-#endif
+		TRACE_RAW_TEST("\n[ACK] RBT: Reboot already pending. System shutdown in progress.\n");
 		if (s_current_out_resp && s_current_out_resp_size > 0) {
 			snprintf(s_current_out_resp, s_current_out_resp_size, "[ACK] RBT: Reboot already pending");
 		}
@@ -2238,19 +2500,14 @@ static void handle_rbt(void)
 	main_scheduler_pause();
 	main_set_shutdown_stage(SHUTDOWN_STAGE_SCHEDULER_STOPPED);
 
-	printk("\nRebooting device.\n");
-
-#if defined(CONFIG_WILDSONIC_VERBOSE_LOGS)
-	printk("\n[ACK] RBT: Controlled reboot initiated\n");
-#endif
+	TRACE_RAW("\nRebooting device.\n");
+	TRACE_RAW_TEST("\n[ACK] RBT: Controlled reboot initiated\n");
 	if (s_current_out_resp && s_current_out_resp_size > 0) {
 		snprintf(s_current_out_resp, s_current_out_resp_size, "[ACK] RBT: Controlled reboot initiated");
 	}
 
 	if (recorder_is_active()) {
-#if defined(CONFIG_WILDSONIC_VERBOSE_LOGS)
-		printk("[REBOOT] Stopping active recording safely...\n");
-#endif
+		TRACE_RAW_TEST("[REBOOT] Stopping active recording safely...\n");
 		recorder_set_stop_reason(RECORDER_STOP_SYSTEM_REBOOT);
 		recorder_request_stop();
 		main_set_shutdown_stage(SHUTDOWN_STAGE_ADC_DMA_STOPPED);
@@ -2263,8 +2520,8 @@ static void handle_rbt(void)
 		if (wait_rc != 0) {
 			main_set_reboot_pending(false);
 			main_set_shutdown_stage(SHUTDOWN_STAGE_IDLE);
-			LOG_ERR("RBT: Recorder shutdown timeout (%d); aborting reboot to preserve data", wait_rc);
-			printk("\nError: Failed to finalize recording before reboot.\n");
+			TRACE("RBT: Recorder shutdown timeout (%d); aborting reboot to preserve data", wait_rc);
+			TRACE_RAW("\nError: Failed to finalize recording before reboot.\n");
 			if (s_current_out_resp && s_current_out_resp_size > 0) {
 				snprintf(s_current_out_resp, s_current_out_resp_size, "[ERROR] Storage shutdown timeout (%d)", wait_rc);
 			}
@@ -2283,8 +2540,8 @@ static void handle_rbt(void)
 	if (!recorder_is_shutdown_ready()) {
 		main_set_reboot_pending(false);
 		main_set_shutdown_stage(SHUTDOWN_STAGE_IDLE);
-		LOG_ERR("RBT: Storage resources still active; aborting reboot");
-		printk("[ERROR] Storage resources still active; reboot aborted to prevent corruption.\n");
+		TRACE("RBT: Storage resources still active; aborting reboot");
+		TRACE_RAW("[ERROR] Storage resources still active; reboot aborted to prevent corruption.\n");
 		if (s_current_out_resp && s_current_out_resp_size > 0) {
 			snprintf(s_current_out_resp, s_current_out_resp_size, "[ERROR] Storage resources still active");
 		}
@@ -2295,8 +2552,8 @@ static void handle_rbt(void)
 	int last_err = recorder_get_last_error();
 	int last_sd = recorder_get_last_sd_error();
 	if (last_err != 0 || last_sd != 0) {
-		LOG_WRN("RBT: Proceeding with reboot despite historical storage error (%d)",
-		        last_err != 0 ? last_err : last_sd);
+		TRACE("RBT: Proceeding with reboot despite historical storage error (%d)",
+		      last_err != 0 ? last_err : last_sd);
 	}
 
 	led_indicator_set(LED_IND_OFF);
@@ -2306,9 +2563,9 @@ static void handle_rbt(void)
 		g_cfg.save_config_flag = false;
 	}
 	main_set_shutdown_stage(SHUTDOWN_STAGE_REBOOT_READY);
-	while (log_process()) {
-		k_sleep(K_MSEC(2));
-	}
+	retained_reboot_set_reason(REBOOT_REASON_USER_RBT);
+	wildsonic_trace_set_async(false);
+	wildsonic_trace_flush();
 	k_sleep(K_MSEC(50));
 	main_set_shutdown_stage(SHUTDOWN_STAGE_SYSTEM_RESET);
 #if defined(CONFIG_REBOOT)
@@ -2321,9 +2578,7 @@ static void handle_rbt(void)
 static void handle_arbt(void)
 {
 	if (main_is_reboot_pending()) {
-#if defined(CONFIG_WILDSONIC_VERBOSE_LOGS)
-		printk("\n[ACK] ARBT: Reboot already pending. System shutdown in progress.\n");
-#endif
+		TRACE_RAW_TEST("\n[ACK] ARBT: Reboot already pending. System shutdown in progress.\n");
 		if (s_current_out_resp && s_current_out_resp_size > 0) {
 			snprintf(s_current_out_resp, s_current_out_resp_size, "[ACK] ARBT: Reboot already pending");
 		}
@@ -2337,21 +2592,15 @@ static void handle_arbt(void)
 	main_scheduler_pause();
 	main_set_shutdown_stage(SHUTDOWN_STAGE_SCHEDULER_STOPPED);
 
-	printk("\nRebooting device.\n");
-
-#if defined(CONFIG_WILDSONIC_VERBOSE_LOGS)
-	/* Immediate acknowledgment to console */
-	printk("\n[ACK] ARBT: Applying configuration and initiating orderly shutdown...\n");
-#endif
+	TRACE_RAW("\nRebooting device.\n");
+	TRACE_RAW_TEST("\n[ACK] ARBT: Applying configuration and initiating orderly shutdown...\n");
 	if (s_current_out_resp && s_current_out_resp_size > 0) {
 		snprintf(s_current_out_resp, s_current_out_resp_size, "[ACK] ARBT: Controlled reboot initiated");
 	}
 
 	/* If recording is active, request orderly stop and wait for clean drain */
 	if (recorder_is_active()) {
-#if defined(CONFIG_WILDSONIC_VERBOSE_LOGS)
-		printk("[REBOOT] Stopping active recording safely...\n");
-#endif
+		TRACE_RAW_TEST("[REBOOT] Stopping active recording safely...\n");
 		recorder_set_stop_reason(RECORDER_STOP_APPLY_REBOOT);
 		recorder_request_stop();
 		main_set_shutdown_stage(SHUTDOWN_STAGE_ADC_DMA_STOPPED);
@@ -2364,8 +2613,8 @@ static void handle_arbt(void)
 		if (wait_rc != 0) {
 			main_set_reboot_pending(false);
 			main_set_shutdown_stage(SHUTDOWN_STAGE_IDLE);
-			LOG_ERR("ARBT: Recorder shutdown timeout (%d); aborting reboot to preserve storage", wait_rc);
-			printk("[ERROR] Storage shutdown timed out (%d); aborting reboot to prevent corruption.\n", wait_rc);
+			TRACE("ARBT: Recorder shutdown timeout (%d); aborting reboot to preserve storage", wait_rc);
+			TRACE_RAW("[ERROR] Storage shutdown timed out (%d); aborting reboot to prevent corruption.\n", wait_rc);
 			if (s_current_out_resp && s_current_out_resp_size > 0) {
 				snprintf(s_current_out_resp, s_current_out_resp_size, "[ERROR] Storage shutdown timeout (%d)", wait_rc);
 			}
@@ -2384,8 +2633,8 @@ static void handle_arbt(void)
 	if (!recorder_is_shutdown_ready()) {
 		main_set_reboot_pending(false);
 		main_set_shutdown_stage(SHUTDOWN_STAGE_IDLE);
-		LOG_ERR("ARBT: Storage resources still active; aborting reboot");
-		printk("[ERROR] Storage resources still active; reboot aborted to prevent corruption.\n");
+		TRACE("ARBT: Storage resources still active; aborting reboot");
+		TRACE_RAW("[ERROR] Storage resources still active; reboot aborted to prevent corruption.\n");
 		if (s_current_out_resp && s_current_out_resp_size > 0) {
 			snprintf(s_current_out_resp, s_current_out_resp_size, "[ERROR] Storage resources still active");
 		}
@@ -2396,8 +2645,8 @@ static void handle_arbt(void)
 	int last_err = recorder_get_last_error();
 	int last_sd = recorder_get_last_sd_error();
 	if (last_err != 0 || last_sd != 0) {
-		LOG_WRN("ARBT: Proceeding with reboot despite historical storage error (%d)",
-		        last_err != 0 ? last_err : last_sd);
+		TRACE("ARBT: Proceeding with reboot despite historical storage error (%d)",
+		      last_err != 0 ? last_err : last_sd);
 	}
 
 	/* Save configuration exactly ONCE */
@@ -2407,24 +2656,22 @@ static void handle_arbt(void)
 	if (save_rc != 0) {
 		main_set_reboot_pending(false);
 		main_set_shutdown_stage(SHUTDOWN_STAGE_IDLE);
-		LOG_ERR("ARBT: Failed to save configuration to flash (%d)", save_rc);
-		printk("[ERROR] Flash save failed (%d). Reboot aborted.\n", save_rc);
+		TRACE("ARBT: Failed to save configuration to flash (%d)", save_rc);
+		TRACE_RAW("[ERROR] Flash save failed (%d). Reboot aborted.\n", save_rc);
 		if (s_current_out_resp && s_current_out_resp_size > 0) {
 			snprintf(s_current_out_resp, s_current_out_resp_size, "[ERROR] Flash save failed (%d)", save_rc);
 		}
 		s_last_cmd_status = save_rc;
 		return;
 	}
-#if defined(CONFIG_WILDSONIC_VERBOSE_LOGS)
-	printk("[ACK] Configuration committed to persistent flash (1 save operation).\n");
-	printk("\nAll buffers flushed and WAV container closed cleanly. Rebooting device.\n");
-#endif
+	TRACE_RAW_TEST("[ACK] Configuration committed to persistent flash (1 save operation).\n");
+	TRACE_RAW_TEST("\nAll buffers flushed and WAV container closed cleanly. Rebooting device.\n");
 
 	main_set_shutdown_stage(SHUTDOWN_STAGE_REBOOT_READY);
 	led_indicator_set(LED_IND_OFF);
-	while (log_process()) {
-		k_sleep(K_MSEC(2));
-	}
+	retained_reboot_set_reason(REBOOT_REASON_USER_ARBT);
+	wildsonic_trace_set_async(false);
+	wildsonic_trace_flush();
 	k_sleep(K_MSEC(50));
 	main_set_shutdown_stage(SHUTDOWN_STAGE_SYSTEM_RESET);
 #if defined(CONFIG_REBOOT)
@@ -2438,10 +2685,10 @@ static void handle_sdfmt(const char *p_args, size_t args_length)
 {
 	if (args_length > 0 && atoi(p_args) == 0) {
 		g_cfg.format_sd_card_flag = false;
-		printk("\nSD card format won't happen during reboot\n");
+		TRACE_RAW("\nSD card format won't happen during reboot\n");
 	} else {
 		g_cfg.format_sd_card_flag = true;
-		printk("\nSD card format will happen during reboot\n");
+		TRACE_RAW("\nSD card format will happen during reboot\n");
 	}
 }
 
@@ -2519,13 +2766,15 @@ static int console_process_line_internal(char *cmd_line, bool from_ble, char *ou
 		}
 		return 0;
 	}
-#if defined(CONFIG_WILDSONIC_VERBOSE_LOGS)
+#if defined(CONFIG_WILDSONIC_TEST_OUTPUT)
 	if (strncasecmp(p, "SOURCE", 6) == 0 && (p[6] == ' ' || p[6] == '\0' || p[6] == '=')) {
 		const char *arg = p + 6;
 		while (*arg == ' ' || *arg == '=') arg++;
 		handle_source(arg, strlen(arg));
 		return 0;
 	}
+#endif
+#if defined(CONFIG_WILDSONIC_BENCHMARKS)
 	if (strcasecmp(p, "SDBENCH") == 0 || strcasecmp(p, "SD_BENCH") == 0) {
 		sd_benchmark_run_matrix();
 		return 0;
@@ -2666,7 +2915,7 @@ static int console_process_line_internal(char *cmd_line, bool from_ble, char *ou
 		report_deferred_hardware("SMSFREQ");
 		break;
 	case CMD_ASSERT:
-		handle_assert();
+		handle_assert(p_args, args_len);
 		break;
 	case CMD_BATTERY_STATUS:
 		report_deferred_hardware("BATT");
@@ -2740,20 +2989,24 @@ static int console_process_line_internal(char *cmd_line, bool from_ble, char *ou
 	case CMD_TEST_ALARM:
 		report_deferred_hardware("TEST_ALARM");
 		break;
-#if defined(CONFIG_WILDSONIC_VERBOSE_LOGS)
+	case CMD_CONFIG_WIZARD:
+		main_run_guided_config();
+		break;
+	case CMD_STATS:
+		handle_stats();
+		break;
+	case CMD_RATECHECK:
+		handle_ratecheck(p_args, args_len);
+		break;
+#if defined(CONFIG_WILDSONIC_TEST_OUTPUT)
 	case CMD_PSRAM: {
 		char arg1[32] = {0}, arg2[32] = {0};
 		int matched = sscanf(p_args, "%31s %31s", arg1, arg2);
 		main_psram_command(matched + 1, arg1, arg2);
 		break;
 	}
-	case CMD_CONFIG_WIZARD:
-		main_run_guided_config();
-		break;
-#else
-	case CMD_PSRAM:
-	case CMD_CONFIG_WIZARD:
-		printk("\nUnknown or BAD command : %s\n", console_cmd_lookup_table[cmd_id]);
+	case CMD_BATCHLOG:
+		handle_batchlog(p_args, args_len);
 		break;
 #endif
 	case CMD_GET_STATUS:
@@ -2784,7 +3037,7 @@ static int console_process_line_internal(char *cmd_line, bool from_ble, char *ou
 
 	default:
 		if (!from_ble) {
-			printk("\nUnknown or BAD command : %s\n", p);
+			TRACE_RAW("\nUnknown or BAD command : %s\n", p);
 			display_console_commands();
 		}
 		return -EINVAL;
@@ -2845,31 +3098,33 @@ void console_sync_staged_to_active(void)
 	struct app_settings *settings = main_get_settings();
 
 	if (!recorder_is_active()) {
-		uint32_t act_rate = 0, div = 0;
-		int err_hz = 0;
-		if (!audio_in_is_rate_supported(g_cfg.sampling_rate, &act_rate, &div, &err_hz)) {
-			LOG_WRN("Staged sample rate %u Hz unsupported, falling back to %u Hz",
-			        g_cfg.sampling_rate, CONFIG_AUDIO_SAMPLE_RATE);
+		rate_check_params_t rcp;
+		rate_check_result_t rc_res;
+		console_fill_rate_check_params(&rcp, g_cfg.sampling_rate,
+		                               (uint16_t)(g_cfg.audio_sampling_width ? g_cfg.audio_sampling_width : 16U),
+		                               (uint16_t)(g_cfg.num_audio_channels ? g_cfg.num_audio_channels : 1U),
+		                               g_cfg.recording_length,
+		                               g_cfg.upper_cutoff_frequency);
+		rate_config_check_ex(&rcp, &rc_res);
+		if (rc_res.status == RATE_STATUS_IMPOSSIBLE) {
+			TRACE("Staged config invalid (%s); reverting to %u Hz/16-bit",
+			      rc_res.reason, (uint32_t)CONFIG_AUDIO_SAMPLE_RATE);
 			g_cfg.sampling_rate = CONFIG_AUDIO_SAMPLE_RATE;
+			g_cfg.audio_sampling_width = 16U;
+			g_cfg.num_audio_channels = 1U;
 		}
-		int rc = audio_in_set_rate(g_cfg.sampling_rate);
-		if (rc == 0) {
-			if (settings) {
-				settings->sample_rate = audio_in_rate();
-			}
-		} else {
-			LOG_WRN("Failed to set audio rate %u: %d, keeping %u",
-			        g_cfg.sampling_rate, rc, audio_in_rate());
-			g_cfg.sampling_rate = audio_in_rate();
-			if (settings) {
-				settings->sample_rate = audio_in_rate();
+		if (audio_in_rate() != 0U) {
+			int rc = audio_in_set_rate(g_cfg.sampling_rate);
+			if (rc != 0) {
+				TRACE("Failed to set audio rate %u: %d, reverting to %u",
+				      g_cfg.sampling_rate, rc, CONFIG_AUDIO_SAMPLE_RATE);
+				g_cfg.sampling_rate = CONFIG_AUDIO_SAMPLE_RATE;
 			}
 		}
-	} else if (settings) {
-		settings->sample_rate = audio_in_rate();
 	}
 
 	if (settings) {
+		settings->sample_rate = g_cfg.sampling_rate;
 		settings->sample_bits = (uint16_t)g_cfg.audio_sampling_width;
 		settings->channels = (uint16_t)g_cfg.num_audio_channels;
 		settings->record_seconds = g_cfg.recording_length;
@@ -2881,7 +3136,7 @@ void console_sync_staged_to_active(void)
 		settings->lpf_enabled = (g_cfg.upper_cutoff_frequency > 0);
 	}
 
-	if (!recorder_is_active()) {
+	if (!recorder_is_active() && audio_in_rate() != 0U) {
 		main_apply_dsp_settings();
 	}
 }

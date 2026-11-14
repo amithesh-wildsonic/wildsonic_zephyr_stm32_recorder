@@ -239,7 +239,7 @@ def test_default_adty0_and_no_auto_adty2_at_startup():
     assert re.search(r"static\s+uint8_t\s+s_current_adty\s*=\s*0;", c_src)
     assert 'AT+ADTY0\\r\\n' in c_src
     assert 'OK+Set:0' in c_src
-    assert '[BLE] Access: UNLOCKED (initial boot state)' in c_src
+    assert 's_current_adty = 0;' in c_src
 
 
 def test_correct_ws0_transparent_mode_configuration():

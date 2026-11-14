@@ -2,6 +2,7 @@
 #include "rtc_calendar.h"
 #include "rtc_sleep.h"
 #include "scheduler.h"
+#include "wildsonic_trace.h"
 #include <stdio.h>
 #include <string.h>
 #include <errno.h>
@@ -9,18 +10,11 @@
 #if defined(CONFIG_SOC_SERIES_STM32L4X)
 
 #include <zephyr/kernel.h>
-#include <zephyr/logging/log.h>
 #include <zephyr/fs/fs.h>
 #include <soc.h>
 #include <stm32_ll_pwr.h>
 #include <stm32_ll_rcc.h>
 #include <stm32_ll_rtc.h>
-
-#if defined(CONFIG_WILDSONIC_VERBOSE_LOGS)
-LOG_MODULE_REGISTER(rtc_calendar, LOG_LEVEL_INF);
-#else
-LOG_MODULE_REGISTER(rtc_calendar, LOG_LEVEL_WRN);
-#endif
 
 #endif /* CONFIG_SOC_SERIES_STM32L4X */
 
@@ -200,7 +194,7 @@ int rtc_calendar_get(struct rtc_calendar_time *t)
 
 void rtc_calendar_log_snapshot(const char *phase, int64_t target_utc)
 {
-#if defined(CONFIG_WILDSONIC_VERBOSE_LOGS)
+#if defined(CONFIG_WILDSONIC_TEST_OUTPUT)
 	uint32_t tr = RTC->TR;
 	uint32_t dr = RTC->DR;
 	uint32_t ss = RTC->SSR & 0xFFFFU;
@@ -222,11 +216,11 @@ void rtc_calendar_log_snapshot(const char *phase, int64_t target_utc)
 	}
 	int64_t remaining = (target_utc > 0 && cur_utc > 0) ? (target_utc - cur_utc) : 0;
 
-	printk("[TEST] RTC SNAPSHOT [%s]: TR=0x%08X DR=0x%08X SSR=%u PRER=0x%08X CLKSRC=0x%02X LSE=%d LSI=%d WUTR=%u WUTE=%d UTC=%s REMAINING=%lld s\n",
-	       phase ? phase : "INFO",
-	       (unsigned int)tr, (unsigned int)dr, (unsigned int)ss, (unsigned int)prer,
-	       (unsigned int)clksrc, (int)lse_rdy, (int)lsi_rdy,
-	       (unsigned int)wutr, (int)wute, time_str, (long long)remaining);
+	TRACE_RAW_TEST("[TEST] RTC SNAPSHOT [%s]: TR=0x%08X DR=0x%08X SSR=%u PRER=0x%08X CLKSRC=0x%02X LSE=%d LSI=%d WUTR=%u WUTE=%d UTC=%s REMAINING=%lld s\n",
+	               phase ? phase : "INFO",
+	               (unsigned int)tr, (unsigned int)dr, (unsigned int)ss, (unsigned int)prer,
+	               (unsigned int)clksrc, (int)lse_rdy, (int)lsi_rdy,
+	               (unsigned int)wutr, (int)wute, time_str, (long long)remaining);
 #else
 	ARG_UNUSED(phase);
 	ARG_UNUSED(target_utc);
@@ -267,7 +261,7 @@ int rtc_calendar_set(const struct rtc_calendar_time *t)
 	}
 	if (timeout == 0) {
 		LL_RTC_EnableWriteProtection(RTC);
-		LOG_ERR("Timeout waiting for RTC INIT mode");
+		TRACE("RTC INIT timeout");
 		return -ETIMEDOUT;
 	}
 
@@ -305,7 +299,7 @@ int rtc_calendar_set(const struct rtc_calendar_time *t)
 		k_busy_wait(10);
 	}
 	if (rsf_to == 0) {
-		LOG_WRN("Timeout waiting for RTC RSF synchronization");
+		TRACE("RTC RSF sync timeout");
 	}
 
 	/* Re-enable write protection */
@@ -315,20 +309,18 @@ int rtc_calendar_set(const struct rtc_calendar_time *t)
 	struct rtc_calendar_time readback;
 	int read_rc = rtc_calendar_get(&readback);
 	if (read_rc != 0 || !readback.valid) {
-		LOG_ERR("RTC calendar readback verification failed (%d)", read_rc);
+		TRACE("RTC readback verify failed (%d)", read_rc);
 		return (read_rc != 0) ? read_rc : -EIO;
 	}
 	if (readback.year != t->year || readback.month != t->month || readback.day != t->day ||
 	    readback.hour != t->hour || readback.min != t->min ||
 	    (readback.sec != t->sec && readback.sec != ((t->sec + 1) % 60))) {
-		LOG_ERR("RTC readback mismatch: expected %04u-%02u-%02u %02u:%02u:%02u, got %04u-%02u-%02u %02u:%02u:%02u",
-		        t->year, t->month, t->day, t->hour, t->min, t->sec,
-		        readback.year, readback.month, readback.day, readback.hour, readback.min, readback.sec);
+		TRACE("RTC readback mismatch (%04u-%02u-%02u %02u:%02u:%02u)",
+		      readback.year, readback.month, readback.day,
+		      readback.hour, readback.min, readback.sec);
 		return -EIO;
 	}
 
-	LOG_INF("RTC calendar updated and verified: %04u-%02u-%02u %02u:%02u:%02u (weekday %u)",
-	        t->year, t->month, t->day, t->hour, t->min, t->sec, weekday);
 	return 0;
 }
 
@@ -341,22 +333,11 @@ int rtc_calendar_init(void)
 	}
 	int rc = rtc_sleep_init();
 	if (rc != 0) {
-		LOG_ERR("rtc_calendar_init failed: rtc_sleep_init returned %d", rc);
+		TRACE("RTC sleep init failed (%d)", rc);
 		return rc;
 	}
 	s_calendar_initialized = true;
 	LL_PWR_EnableBkUpAccess();
-	if (LL_RCC_IsEnabledRTC() && LL_RTC_IsActiveFlag_INITS(RTC)) {
-		struct rtc_calendar_time cur;
-		if (rtc_calendar_get(&cur) == 0 && rtc_calendar_validate(&cur) == 0) {
-			LOG_INF("RTC calendar online: %04u-%02u-%02u %02u:%02u:%02u.%03u",
-			        cur.year, cur.month, cur.day, cur.hour, cur.min, cur.sec, cur.subsec);
-		} else {
-			LOG_WRN("RTC calendar INITS set but the field validation failed; calendar treated as invalid");
-		}
-	} else {
-		LOG_INF("RTC calendar online: uninitialized / unset");
-	}
 	return 0;
 }
 
@@ -444,4 +425,31 @@ int rtc_calendar_generate_filename(char *name, size_t len, const struct rtc_cale
 	}
 
 	return -ENOSPC;
+}
+
+void rtc_calendar_log_boot_times(int32_t tz_offset_sec)
+{
+	struct rtc_calendar_time cur_cal;
+	if (!rtc_calendar_is_valid() || rtc_calendar_get(&cur_cal) != 0) {
+		TRACE("RTC Time UTC: UNSET");
+		TRACE("RTC Time Local: UNSET");
+		return;
+	}
+
+	char tz_sign = (tz_offset_sec >= 0) ? '+' : '-';
+	int32_t abs_tz = (tz_offset_sec >= 0) ? tz_offset_sec : -tz_offset_sec;
+	int tz_h = (int)(abs_tz / 3600);
+	int tz_m = (int)((abs_tz % 3600) / 60);
+
+	TRACE("RTC Time UTC: %04u-%02u-%02u %02u:%02u:%02u.%03u",
+	      cur_cal.year, cur_cal.month, cur_cal.day,
+	      cur_cal.hour, cur_cal.min, cur_cal.sec, cur_cal.subsec);
+
+	time_t epoch = scheduler_calendar_to_epoch(&cur_cal) + (time_t)tz_offset_sec;
+	struct rtc_calendar_time loc_cal;
+	scheduler_epoch_to_calendar(epoch, &loc_cal);
+	TRACE("RTC Time Local: %04u-%02u-%02u %02u:%02u:%02u.%03u %c%02d:%02d",
+	      loc_cal.year, loc_cal.month, loc_cal.day,
+	      loc_cal.hour, loc_cal.min, loc_cal.sec, cur_cal.subsec,
+	      tz_sign, tz_h, tz_m);
 }

@@ -160,29 +160,29 @@ def test_console_source_command_handlers_and_aliases():
     assert "AUDIO_SRC_STEREO_DUPLICATE" in src
     assert "AUDIO_SRC_SYNTHETIC" in src
 
-    # Warning banners
-    assert "WARNING: Experimental audio sampling rate configured" in src
-    assert "WARNING: Experimental 32-bit PCM storage format configured" in src
-    assert "WARNING: Experimental stereo channel emulation configured" in src
-    assert "Target production platform: STM32U585" in src
+    # Unified warning helper and [WARNING] format
+    assert "console_print_audio_warning(" in src
+    assert "[WARNING] %u Hz, %u-bit, %uch, dur %u s" in src
+    assert "will run" in src
 
 
 def test_production_build_excludes_experimental_settings():
-    """Verify that under PRODUCTION (CONFIG_WILDSONIC_VERBOSE_LOGS not defined), experimental features are gated."""
+    """Verify PROD/TEST parity: rate/format logic is identical and 24-bit remains impossible."""
     src_console = (APP_SRC / "console.c").read_text(encoding="utf-8")
     src_audio_in = (APP_SRC / "audio_in_stm32l4.c").read_text(encoding="utf-8")
 
-    # Console handlers must gate experimental paths under CONFIG_WILDSONIC_VERBOSE_LOGS
-    assert "#if defined(CONFIG_WILDSONIC_VERBOSE_LOGS)" in src_console
-    assert "[DEFERRED] Bits per sample 24" in src_console or "[DEFERRED] Bits per sample" in src_console
+    # Rate and format feasibility logic must NOT be gated by CONFIG_WILDSONIC_VERBOSE_LOGS
+    assert "else if (val == 384) val = 384000;" in src_console
+    assert "[BLOCKED] Bit depth %u unsupported (supported: 16, 32)" in src_console
 
-    # Production supports 192k 32-bit mono and stereo (duplicated mono container)
-    assert "g_cfg.num_audio_channels = 2" in src_console
-    assert "g_cfg.audio_sampling_width = 32" in src_console
+    # Production supports 32-bit mono and stereo (duplicated mono container) uniformly
+    assert "g_cfg.num_audio_channels = val;" in src_console
+    assert "g_cfg.audio_sampling_width = val;" in src_console
 
-    # audio_in_is_rate_supported must restrict 384k and 512k in production
-    assert "#if defined(CONFIG_WILDSONIC_VERBOSE_LOGS)" in src_audio_in
-    assert "rate_hz != 384000 && rate_hz != 512000" in src_audio_in
+    # audio_in_is_rate_supported delegates uniformly via rate_config_check_ex (no VERBOSE_LOGS gate)
+    assert "rate_config_check_ex" in src_audio_in
+    idx = src_audio_in.index("bool audio_in_is_rate_supported")
+    assert "CONFIG_WILDSONIC_VERBOSE_LOGS" not in src_audio_in[idx:]
 
 
 # ==============================================================================
@@ -366,20 +366,22 @@ def test_high_rate_experimental_accounting_matrix():
 
 
 def test_pipeline_failure_preservation_and_partial_wav_finalization():
-    """Verify failed capture preserves its error and attempts a valid partial WAV finalization."""
+    """Verify overload drops continue cleanly, finalize a valid WAV header, and report losses truthfully."""
     src_rec = (APP_SRC / "recorder.c").read_text(encoding="utf-8")
 
-    # Error handling and abort
-    assert "err = -ENOBUFS;" in src_rec
-    assert "PSRAM staging buffer full!" in src_rec
+    # Non-aborting overload drop accounting
+    assert "st.psram_full_events++;" in src_rec
+    assert "PSRAM full (" in src_rec
+    assert "recorder_record_gap(" in src_rec
 
     # The file is finalized from confirmed bytes after writer completion.
     assert "Finalize a valid partial WAV using" in src_rec
     assert "finalize_ret = fs_seek(&f, 0, FS_SEEK_SET);" in src_rec
 
-    # File verification must be skipped if error occurred
+    # WAV verification runs cleanly when bytes were written without fatal error
     assert "if (err == 0 && !recorder_abort_requested && st.bytes_written > 0)" in src_rec
     assert "st.wav_verified = false;" in src_rec
+    assert "[TEST] DATA_LOSS_REPORTED:" in src_rec
 
 
 # ==============================================================================
@@ -407,6 +409,7 @@ def test_source_code_architecture_inspections():
     assert "uint16_t channels;" in src_main_h
     assert "enum audio_capture_source capture_source;" in src_main_h
 
-    # recorder.c verification function
+    # recorder.c verification function & audio_format.c classification
     assert "recorder_verify_file_format(" in src_rec
-    assert "audio_format_is_experimental(st.sample_rate, st.channels, st.sample_bits)" in src_rec
+    src_fmt_c = (APP_SRC / "audio_format.c").read_text(encoding="utf-8")
+    assert "bool audio_format_is_experimental(" in src_fmt_c

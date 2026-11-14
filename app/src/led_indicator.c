@@ -2,15 +2,9 @@
 #include "led_indicator.h"
 
 #if defined(__ZEPHYR__)
+#include "wildsonic_trace.h"
 #include <zephyr/kernel.h>
 #include <zephyr/drivers/gpio.h>
-#include <zephyr/logging/log.h>
-
-#if defined(CONFIG_WILDSONIC_VERBOSE_LOGS)
-LOG_MODULE_REGISTER(led_ind, LOG_LEVEL_INF);
-#else
-LOG_MODULE_REGISTER(led_ind, LOG_LEVEL_WRN);
-#endif
 
 #if DT_NODE_HAS_STATUS(DT_ALIAS(led0), okay)
 static const struct gpio_dt_spec s_led = GPIO_DT_SPEC_GET(DT_ALIAS(led0), gpios);
@@ -31,14 +25,11 @@ static void led_work_handler(struct k_work *work)
 	}
 
 	switch (s_state) {
-	case LED_IND_RECORDING:
-		gpio_pin_toggle_dt(&s_led);
-		k_work_reschedule(&s_led_work, K_MSEC(500));
-		break;
 	case LED_IND_ERROR:
 		gpio_pin_toggle_dt(&s_led);
 		k_work_reschedule(&s_led_work, K_MSEC(100));
 		break;
+	case LED_IND_RECORDING:
 	case LED_IND_OFF:
 	default:
 		gpio_pin_set_dt(&s_led, 0);
@@ -53,13 +44,13 @@ int led_indicator_init(void)
 {
 #if HAS_LED
 	if (!gpio_is_ready_dt(&s_led)) {
-		LOG_WRN("User LED gpio device not ready");
+		TRACE("User LED gpio device not ready");
 		return -ENODEV;
 	}
 
 	int ret = gpio_pin_configure_dt(&s_led, GPIO_OUTPUT_INACTIVE);
 	if (ret != 0) {
-		LOG_ERR("Failed to configure User LED gpio: %d", ret);
+		TRACE("Failed to configure User LED gpio: %d", ret);
 		return ret;
 	}
 
@@ -85,12 +76,10 @@ void led_indicator_set(enum led_indicator_state state)
 
 	switch (state) {
 	case LED_IND_OFF:
+	case LED_IND_RECORDING:
+		/* Production/Test parity: keep LED OFF during capture */
 		k_work_cancel_delayable(&s_led_work);
 		gpio_pin_set_dt(&s_led, 0);
-		break;
-	case LED_IND_RECORDING:
-		gpio_pin_set_dt(&s_led, 1);
-		k_work_reschedule(&s_led_work, K_MSEC(500));
 		break;
 	case LED_IND_ERROR:
 		gpio_pin_set_dt(&s_led, 1);

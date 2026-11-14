@@ -38,6 +38,15 @@ else()
   if(NOT WILDSONIC_GIT_COMMIT)
     set(WILDSONIC_GIT_COMMIT "unknown")
   endif()
+  execute_process(
+    COMMAND git -C ${CMAKE_CURRENT_SOURCE_DIR}/.. rev-parse --abbrev-ref HEAD
+    OUTPUT_VARIABLE WILDSONIC_GIT_BRANCH
+    OUTPUT_STRIP_TRAILING_WHITESPACE
+    ERROR_QUIET
+  )
+  if(NOT WILDSONIC_GIT_BRANCH)
+    set(WILDSONIC_GIT_BRANCH "unknown")
+  endif()
 
   target_sources(app PRIVATE
     src/main.c
@@ -45,6 +54,7 @@ else()
     src/wav.c
     src/audio_in_stm32l4.c
     src/audio_format.c
+    src/rate_check.c
     src/psram_is66wvs.c
     src/psram_staging.c
     src/dsp.c
@@ -65,8 +75,11 @@ else()
     src/system_assert.c
     src/watchdog.c
   )
-  target_compile_definitions(app PRIVATE WILDSONIC_GIT_COMMIT=\"${WILDSONIC_GIT_COMMIT}\")
-  target_sources_ifdef(CONFIG_WILDSONIC_VERBOSE_LOGS app PRIVATE src/psram_benchmark.c)
-  target_sources_ifdef(CONFIG_WILDSONIC_VERBOSE_LOGS app PRIVATE src/sd_benchmark.c)
+  target_compile_definitions(app PRIVATE
+    WILDSONIC_GIT_COMMIT=\"${WILDSONIC_GIT_COMMIT}\"
+    WILDSONIC_GIT_BRANCH=\"${WILDSONIC_GIT_BRANCH}\"
+  )
+  target_sources_ifdef(CONFIG_WILDSONIC_BENCHMARKS app PRIVATE src/psram_benchmark.c)
+  target_sources_ifdef(CONFIG_WILDSONIC_BENCHMARKS app PRIVATE src/sd_benchmark.c)
   zephyr_include_directories(src)
 endif()

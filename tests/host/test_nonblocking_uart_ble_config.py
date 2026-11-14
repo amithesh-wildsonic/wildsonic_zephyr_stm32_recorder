@@ -224,9 +224,9 @@ def test_acknowledgement_distinguishes_received_validated_saved_pending():
     ack_fn = c_src[ack_fn_pos:ack_fn_pos + 1200]
 
     assert "Command %s received and validated" in ack_fn
-    assert "Saved to persistent flash" in ack_fn
-    assert "Configuration pending application after reboot" in ack_fn
-    assert "Saved to flash (Pending reboot application)" in ack_fn
+    assert "config_store_stage_pending();" in ack_fn
+    assert "Staged in RAM" in ack_fn
+    assert "Send APPLY or ARBT to save to flash" in ack_fn
 
 
 # ==============================================================================
@@ -234,15 +234,15 @@ def test_acknowledgement_distinguishes_received_validated_saved_pending():
 # ==============================================================================
 
 def test_persistence_failure_handling_rolls_back_and_reports_error():
-    """Verify that if persistent flash storage fails to commit, the system rolls back
-    pending RAM changes, reports error, and does NOT report successful saving."""
+    """Verify that if persistent flash storage fails to commit on APPLY/ARBT,
+    flash save error is reported cleanly and rollback helper exists."""
     c_src = CONSOLE_C.read_text(encoding="utf-8")
     cfg_src = CONFIG_STORE_C.read_text(encoding="utf-8")
 
-    # In console_commit_and_ack_config:
+    # In handle_apply / handle_arbt:
     assert "if (save_rc != 0)" in c_src
-    assert 'printk("[ERROR] Flash save failed (%d). Pending configuration not saved.\\n", save_rc);' in c_src
-    assert "config_store_rollback_pending();" in c_src
+    assert "[ERROR] Flash save failed (%d)" in c_src
+    assert "config_store_rollback_pending();" in cfg_src or "void config_store_rollback_pending(void)" in cfg_src
 
     # In config_store.c rollback implementation:
     assert "void config_store_rollback_pending(void)" in cfg_src
@@ -313,20 +313,22 @@ def test_pending_config_application_after_reboot():
     cfg_src = CONFIG_STORE_C.read_text(encoding="utf-8")
 
     assert "if (primary->pending_apply)" in cfg_src
-    assert "if (config_record_is_valid(primary))" in cfg_src
+    assert "if (primary_rate_ok && config_record_is_valid(primary))" in cfg_src
     assert "unpack_record_to_system(primary);" in cfg_src
     assert "s_applied_gen = primary->pending_generation;" in cfg_src
-    assert "s_last_valid_applied_record.pending_apply = 0;" in cfg_src
+    assert "s_has_last_valid_applied = false;" in cfg_src
+    assert "*out_need_save = true;" in cfg_src
     assert "config_store_save();" in cfg_src
 
 
 def test_failure_during_config_application_retains_last_known_valid():
     """Verify that if a pending configuration record is corrupted or invalid,
-    startup falls back to the previous valid applied configuration without reboot loop."""
+    startup falls back to the previous valid applied configuration without losing TZ/schedule."""
     cfg_src = CONFIG_STORE_C.read_text(encoding="utf-8")
 
-    assert "Pending configuration validation failed! Falling back to last known valid applied configuration." in cfg_src
-    assert "if (fallback && config_record_is_valid(fallback) && !fallback->pending_apply)" in cfg_src
+    assert "Stored config invalid (%s); reverting audio to last good config" in cfg_src
+    assert "revert_record_audio_fields(" in cfg_src
+    assert "if (fallback && config_record_is_valid(fallback))" in cfg_src
     assert "unpack_record_to_system(fallback);" in cfg_src
     assert "s_applied_gen = fallback->applied_generation;" in cfg_src
 

@@ -19,7 +19,7 @@
 #include <zephyr/drivers/dma/dma_stm32.h>
 #include <zephyr/sys/atomic.h>
 #include <zephyr/spinlock.h>
-#include <zephyr/logging/log.h>
+#include "wildsonic_trace.h"
 #include <math.h>
 #include <stdlib.h>
 #include <string.h>
@@ -30,12 +30,8 @@
 #include <stm32_ll_dma.h>
 #include "audio_in.h"
 #include "audio_format.h"
-
-#if defined(CONFIG_WILDSONIC_VERBOSE_LOGS)
-LOG_MODULE_REGISTER(audio_adc, LOG_LEVEL_INF);
-#else
-LOG_MODULE_REGISTER(audio_adc, LOG_LEVEL_WRN);
-#endif
+#include "rate_check.h"
+#include "system_assert.h"
 
 #define ZU        DT_PATH(zephyr_user)
 #define ADC_NODE  DT_IO_CHANNELS_CTLR(ZU)
@@ -77,14 +73,36 @@ static ADC_TypeDef *const adc = (ADC_TypeDef *)DT_REG_ADDR(ADC_NODE);
 static TIM_TypeDef *const tim = (TIM_TypeDef *)DT_REG_ADDR(TIM_NODE);
 
 static uint16_t dma_buf[2 * MAX_BLOCK] __aligned(4);
+_Static_assert(MAX_BLOCK == RATE_CHECK_DEFAULT_DMA_MAX_SAMPLES,
+	       "DMA MAX_BLOCK mismatch with rate_check geometry");
+_Static_assert((sizeof(dma_buf) % 4U) == 0U, "DMA buffer must be 4-byte aligned");
 static const struct audio_sink *sink;
 static uint32_t actual_rate;
 static uint32_t active_requested_rate = CONFIG_AUDIO_SAMPLE_RATE;
 static uint32_t active_ovs_log2 = CONFIG_AUDIO_OVERSAMPLE_LOG2;
+static uint16_t active_bits = 16U;
+static uint16_t active_channels = 1U;
 static enum audio_capture_source current_capture_source = AUDIO_SRC_PHYSICAL_MIC;
 static uint32_t tim_period;
 static uint32_t active_block_samples = BLOCK;
 static bool initialized = false;
+static uint32_t cached_ahb_hz = 0;
+static uint32_t last_conv_ns = 0;
+static uint32_t last_period_ns = 0;
+static uint32_t last_duty_pct = 0;
+
+static void update_conv_budget(uint32_t eff_rate_hz, uint32_t ovs_log2, uint32_t ahb_hz_val)
+{
+	if (eff_rate_hz == 0U || ahb_hz_val == 0U) {
+		return;
+	}
+	uint64_t conv_ns = ((uint64_t)((1U << ovs_log2) * CYCLES_PER_CONV + 4U) * 1000000000ULL) /
+			   ahb_hz_val;
+	uint64_t period_ns = 1000000000ULL / eff_rate_hz;
+	last_conv_ns = (uint32_t)conv_ns;
+	last_period_ns = (uint32_t)period_ns;
+	last_duty_pct = (period_ns > 0U) ? (uint32_t)((conv_ns * 100U) / period_ns) : 0U;
+}
 
 struct dma_event {
 	uint64_t cycle;
@@ -181,11 +199,9 @@ void audio_in_get_diag(struct audio_diag *diag)
 static bool process_half(const uint16_t *src, void *dst_block,
 			 uint64_t sample_start)
 {
-#if CONFIG_AUDIO_SAMPLE_BITS == 32
-	int32_t *dst = (int32_t *)dst_block;
-#else
-	int16_t *dst = (int16_t *)dst_block;
-#endif
+	const bool is_32bit = (active_bits == 32U);
+	int32_t *dst32 = (int32_t *)dst_block;
+	int16_t *dst16 = (int16_t *)dst_block;
 
 	uint32_t ovs = active_ovs_log2;
 	uint32_t adc_bits = 12U + ovs;
@@ -193,35 +209,32 @@ static bool process_half(const uint16_t *src, void *dst_block,
 	uint32_t max_raw = ((1U << 12) - 1U) * (1U << ovs);
 	bool is_synth = (current_capture_source == AUDIO_SRC_SYNTHETIC);
 
-#if defined(CONFIG_WILDSONIC_VERBOSE_LOGS)
-	/* Track diagnostics only in verbose / test builds */
 	uint16_t local_min = 0xFFFF;
 	uint16_t local_max = 0;
 	uint64_t local_sum = 0;
 	uint64_t local_sum_sq = 0;
 	uint32_t local_clip_l = 0;
 	uint32_t local_clip_h = 0;
-#endif
 
 	for (uint32_t n = 0; n < active_block_samples; n++) {
-#if CONFIG_AUDIO_SAMPLE_BITS == 32
-		/* Expand in reverse so writes never overwrite raw samples not yet read. */
-		uint32_t i = active_block_samples - 1U - n;
-#else
-		uint32_t i = n;
-#endif
+		/* Expand 32-bit in reverse so writes never overwrite unread 16-bit raw samples in dst_block. */
+		uint32_t i = is_32bit ? (active_block_samples - 1U - n) : n;
 		uint16_t raw;
+		int16_t s16;
+
 		if (is_synth) {
 			uint64_t global_sample = sample_start + i;
 			float phase = 2.0f * 3.14159265f * 1000.0f * (float)global_sample / (float)actual_rate;
-			int16_t s16 = (int16_t)(sinf(phase) * 16384.0f);
+			s16 = (int16_t)(sinf(phase) * 16384.0f);
 			raw = (uint16_t)(((int32_t)s16 + 32768) >> lshift);
-			if (raw > max_raw) raw = (uint16_t)max_raw;
+			if (raw > max_raw) {
+				raw = (uint16_t)max_raw;
+			}
 		} else {
 			raw = src[i];
+			s16 = audio_adc_raw_to_pcm16(raw, lshift);
 		}
 
-#if defined(CONFIG_WILDSONIC_VERBOSE_LOGS)
 		if (raw < local_min) local_min = raw;
 		if (raw > local_max) local_max = raw;
 		local_sum += raw;
@@ -233,29 +246,14 @@ static bool process_half(const uint16_t *src, void *dst_block,
 		if (raw >= max_raw) {
 			local_clip_h++;
 		}
-#endif
 
-#if CONFIG_AUDIO_SAMPLE_BITS == 32
-		if (is_synth) {
-			uint64_t global_sample = sample_start + i;
-			float phase = 2.0f * 3.14159265f * 1000.0f * (float)global_sample / (float)actual_rate;
-			int16_t s16 = (int16_t)(sinf(phase) * 16384.0f);
-			dst[i] = audio_pcm16_to_pcm32(s16);
+		if (is_32bit) {
+			dst32[i] = audio_pcm16_to_pcm32(s16);
 		} else {
-			/*
-			 * Convert native ADC code to signed 16-bit PCM and scale to 32-bit container.
-			 * Uses well-defined unsigned conversion without negative shift undefined behavior.
-			 */
-			int16_t s16 = audio_adc_raw_to_pcm16(raw, lshift);
-			dst[i] = audio_pcm16_to_pcm32(s16);
+			dst16[i] = s16;
 		}
-#else
-		int16_t s16 = audio_adc_raw_to_pcm16(raw, lshift);
-		dst[i] = s16;
-#endif
 	}
 
-#if defined(CONFIG_WILDSONIC_VERBOSE_LOGS)
 	/* Update global diagnostics */
 	k_spinlock_key_t key = k_spin_lock(&diag_lock);
 	if (local_min < diag_raw_min) diag_raw_min = local_min;
@@ -267,7 +265,6 @@ static bool process_half(const uint16_t *src, void *dst_block,
 	diag_total_samples += active_block_samples;
 	diag_total_blocks++;
 	k_spin_unlock(&diag_lock, key);
-#endif
 
 	ARG_UNUSED(sample_start);
 
@@ -488,25 +485,64 @@ uint32_t audio_in_get_missed_event_count(void)
 	return (uint32_t)atomic_get(&acquisition_events_missed);
 }
 
+static uint32_t ovs_log2_from_ratio(uint8_t ovs)
+{
+	switch (ovs) {
+	case 16U: return 4U;
+	case 8U:  return 3U;
+	case 4U:  return 2U;
+	case 2U:  return 1U;
+	default:  return 0U;
+	}
+}
+
+static bool compute_hw_clocks(uint32_t *tim_hz_out, uint32_t *ahb_hz_out)
+{
+	uint32_t apb_hz = 0;
+	uint32_t ahb_hz = 0;
+
+	if (clock_control_get_rate(rcc, (clock_control_subsys_t)&tim_pclken, &apb_hz) != 0 || apb_hz == 0) {
+		return false;
+	}
+	if (clock_control_get_rate(rcc, (clock_control_subsys_t)&adc_pclken, &ahb_hz) != 0 || ahb_hz == 0) {
+		return false;
+	}
+	*tim_hz_out = (LL_RCC_GetAPB1Prescaler() == LL_RCC_APB1_DIV_1) ? apb_hz : (apb_hz * 2U);
+	*ahb_hz_out = ahb_hz;
+	return true;
+}
+
 static uint32_t get_target_ovs_log2(uint32_t rate_hz)
 {
-#if defined(CONFIG_WILDSONIC_VERBOSE_LOGS)
-	if (rate_hz >= 500000U) {
-		return 0U; /* 1x (off) for 512k: 41 cycles / 80 MHz = 512.5 ns (26.2% of period) */
-	} else if (rate_hz >= 350000U) {
-		return 1U; /* 2x for 384k: 78 cycles / 80 MHz = 975 ns (37.5% of period) */
+	uint32_t tim_hz = RATE_CHECK_DEFAULT_TIMER_HZ;
+	uint32_t ahb_hz = RATE_CHECK_DEFAULT_ADC_HZ;
+	(void)compute_hw_clocks(&tim_hz, &ahb_hz);
+
+	rate_check_params_t p;
+	rate_check_result_t res;
+	rate_check_init_params(&p);
+	p.nominal_rate_hz = rate_hz;
+	p.bits = active_bits;
+	p.channels = active_channels;
+	p.f_timer_hz = tim_hz;
+	p.f_adc_hz = ahb_hz;
+	p.duration_s = 1U;
+	p.psram_enabled = true;
+	rate_config_check_ex(&p, &res);
+	if (res.status == RATE_STATUS_IMPOSSIBLE) {
+		return CONFIG_AUDIO_OVERSAMPLE_LOG2;
 	}
-#endif
-	return CONFIG_AUDIO_OVERSAMPLE_LOG2; /* default 3 (8x): 300 cycles / 80 MHz = 3.75 us */
+	return ovs_log2_from_ratio(res.margins.ovs_selected);
 }
 
 static uint32_t ovs_ratio_const_for_log2(uint32_t ovs_log2)
 {
 	switch (ovs_log2) {
-	case 1: return LL_ADC_OVS_RATIO_2;
 	case 2: return LL_ADC_OVS_RATIO_4;
 	case 3: return LL_ADC_OVS_RATIO_8;
-	default: return LL_ADC_OVS_RATIO_16;
+	case 4: return LL_ADC_OVS_RATIO_16;
+	case 1:
+	default: return LL_ADC_OVS_RATIO_2;
 	}
 }
 
@@ -545,6 +581,7 @@ int audio_in_init(uint32_t requested_rate_hz, const struct audio_sink *s)
 	clock_control_on(rcc, (clock_control_subsys_t)&tim_pclken);
 	clock_control_get_rate(rcc, (clock_control_subsys_t)&adc_pclken, &ahb_hz);
 	clock_control_get_rate(rcc, (clock_control_subsys_t)&tim_pclken, &apb_hz);
+	cached_ahb_hz = ahb_hz;
 
 	/* ---- sample clock: TIM6 update rate ---- */
 	uint32_t tim_hz = (LL_RCC_GetAPB1Prescaler() == LL_RCC_APB1_DIV_1) ? apb_hz : apb_hz * 2;
@@ -554,22 +591,10 @@ int audio_in_init(uint32_t requested_rate_hz, const struct audio_sink *s)
 	active_requested_rate = requested_rate_hz;
 	active_ovs_log2 = get_target_ovs_log2(requested_rate_hz);
 
-	LOG_INF("timer %u Hz / %u = %u Hz (requested %u)", tim_hz, tim_period, actual_rate,
-		requested_rate_hz);
-	LOG_INF("DMA block size: record=%u (%u us), max samples=%u",
-		BLOCK, (uint32_t)((uint64_t)BLOCK * 1000000ULL / actual_rate),
-		MAX_BLOCK);
-
 	/* ---- timing budget: all oversampled conversions must fit in one period ---- */
-	uint64_t conv_ns = ((uint64_t)((1U << active_ovs_log2) * CYCLES_PER_CONV + 4U) * 1000000000ULL) /
-			   ahb_hz;
-	uint64_t period_ns = 1000000000ULL / actual_rate;
-
-	LOG_INF("ADC: %ux oversampling, %u-bit result, conversion %u ns of %u ns period (%u%%)",
-		1U << active_ovs_log2, 12U + active_ovs_log2, (uint32_t)conv_ns, (uint32_t)period_ns,
-		(uint32_t)(conv_ns * 100 / period_ns));
-	if (conv_ns * 100 > period_ns * 85) {
-		LOG_ERR("oversampling too high for this sample rate (needs > 85%% of period)");
+	update_conv_budget(actual_rate, active_ovs_log2, ahb_hz);
+	if ((uint64_t)last_conv_ns * 100ULL > (uint64_t)last_period_ns * 85ULL) {
+		TRACE("ADC oversampling budget exceeded");
 		return -ERANGE;
 	}
 
@@ -586,7 +611,7 @@ int audio_in_init(uint32_t requested_rate_hz, const struct audio_sink *s)
 		k_busy_wait(1);
 	}
 	if (cal_timeout == 0) {
-		LOG_ERR("ADC calibration timed out");
+		TRACE("ADC calibration timed out");
 		return -ETIMEDOUT;
 	}
 
@@ -638,54 +663,80 @@ int audio_in_set_block_size(uint32_t samples)
 	if (dma_active) {
 		return -EBUSY;
 	}
-	if (samples != BLOCK) {
+	if (samples == 0U || samples > MAX_BLOCK) {
 		return -EINVAL;
 	}
 	active_block_samples = samples;
 	return 0;
 }
 
+int audio_in_set_output_format(uint16_t bits, uint16_t channels)
+{
+	if (dma_active) {
+		return -EBUSY;
+	}
+	if ((bits != 16U && bits != 32U) || (channels != 1U && channels != 2U)) {
+		return -EINVAL;
+	}
+	active_bits = bits;
+	active_channels = channels;
+	uint32_t bpf = (uint32_t)channels * ((uint32_t)bits / 8U);
+	uint32_t blk = RATE_CHECK_DEFAULT_SLAB_BLOCK_BYTES / bpf;
+	if (blk == 0U || blk > MAX_BLOCK) {
+		return -EINVAL;
+	}
+	active_block_samples = blk;
+	return 0;
+}
+
+uint32_t audio_in_get_effective_adc_bits(void)
+{
+	return 12U + active_ovs_log2;
+}
+
+int audio_in_get_stack_free(size_t *total_bytes, size_t *unused_bytes)
+{
+	if (total_bytes) {
+		*total_bytes = ACQUISITION_THREAD_STACK_SIZE;
+	}
+	if (!acquisition_thread_started || !unused_bytes) {
+		return -EAGAIN;
+	}
+#if defined(CONFIG_INIT_STACKS) && defined(CONFIG_THREAD_STACK_INFO)
+	return k_thread_stack_space_get(&acquisition_thread_data, unused_bytes);
+#else
+	*unused_bytes = 0;
+	return -ENOTSUP;
+#endif
+}
+
 bool audio_in_is_rate_supported(uint32_t rate_hz, uint32_t *act_rate, uint32_t *divider, int *error_hz)
 {
-#if defined(CONFIG_WILDSONIC_VERBOSE_LOGS)
-	/* TEST build allows experimental high sample rates 384000 and 512000 */
-	if (rate_hz != 16000 && rate_hz != 32000 && rate_hz != 44100 &&
-	    rate_hz != 48000 && rate_hz != 96000 && rate_hz != 192000 &&
-	    rate_hz != 384000 && rate_hz != 512000) {
-		return false;
-	}
-#else
-	/* Production build: strictly validate production hardware-verified rates */
-	if (rate_hz != 16000 && rate_hz != 32000 && rate_hz != 44100 &&
-	    rate_hz != 48000 && rate_hz != 96000 && rate_hz != 192000) {
-		return false;
-	}
-#endif
-
-	uint32_t apb_hz = 0;
-	if (clock_control_get_rate(rcc, (clock_control_subsys_t)&tim_pclken, &apb_hz) != 0 || apb_hz == 0) {
-		return false;
-	}
-	uint32_t tim_hz = (LL_RCC_GetAPB1Prescaler() == LL_RCC_APB1_DIV_1) ? apb_hz : apb_hz * 2;
-	uint32_t div = (tim_hz + rate_hz / 2) / rate_hz;
-	if (div == 0) return false;
-	uint32_t actual = tim_hz / div;
-
-	/* Verify conversion time budget against period with adaptive oversampling */
+	uint32_t tim_hz = 0;
 	uint32_t ahb_hz = 0;
-	if (clock_control_get_rate(rcc, (clock_control_subsys_t)&adc_pclken, &ahb_hz) != 0 || ahb_hz == 0) {
-		return false;
-	}
-	uint32_t ovs = get_target_ovs_log2(rate_hz);
-	uint64_t conv_ns = ((uint64_t)((1U << ovs) * CYCLES_PER_CONV + 4U) * 1000000000ULL) / ahb_hz;
-	uint64_t period_ns = 1000000000ULL / actual;
-	if (conv_ns * 100 > period_ns * 85) {
+	if (!compute_hw_clocks(&tim_hz, &ahb_hz)) {
 		return false;
 	}
 
-	if (act_rate) *act_rate = actual;
-	if (divider) *divider = div;
-	if (error_hz) *error_hz = (int)actual - (int)rate_hz;
+	rate_check_params_t p;
+	rate_check_result_t res;
+	rate_check_init_params(&p);
+	p.nominal_rate_hz = rate_hz;
+	p.bits = active_bits;
+	p.channels = active_channels;
+	p.f_timer_hz = tim_hz;
+	p.f_adc_hz = ahb_hz;
+	p.duration_s = 1U;
+	p.psram_enabled = true;
+	rate_config_check_ex(&p, &res);
+
+	if (res.status == RATE_STATUS_IMPOSSIBLE) {
+		return false;
+	}
+
+	if (act_rate) *act_rate = res.actual_rate;
+	if (divider) *divider = res.margins.tim_divider;
+	if (error_hz) *error_hz = res.margins.rate_err_hz;
 	return true;
 }
 
@@ -698,7 +749,7 @@ int audio_in_set_rate(uint32_t new_rate_hz)
 	uint32_t actual = 0, div = 0;
 	int err_hz = 0;
 	if (!audio_in_is_rate_supported(new_rate_hz, &actual, &div, &err_hz)) {
-		LOG_ERR("Unsupported sample rate: %u Hz (clock or oversampling budget exceeded)", new_rate_hz);
+		TRACE("Unsupported sample rate: %u Hz", new_rate_hz);
 		return -ERANGE;
 	}
 
@@ -706,6 +757,14 @@ int audio_in_set_rate(uint32_t new_rate_hz)
 	active_ovs_log2 = get_target_ovs_log2(new_rate_hz);
 	tim_period = div;
 	actual_rate = actual;
+	if (cached_ahb_hz == 0U) {
+		clock_control_get_rate(rcc, (clock_control_subsys_t)&adc_pclken, &cached_ahb_hz);
+	}
+	update_conv_budget(actual_rate, active_ovs_log2, cached_ahb_hz);
+
+	if (!initialized) {
+		return 0;
+	}
 
 	LL_TIM_SetAutoReload(tim, tim_period - 1);
 	LL_TIM_SetCounter(tim, 0);
@@ -720,16 +779,18 @@ int audio_in_set_rate(uint32_t new_rate_hz)
 	}
 
 	/* Update DSP pipeline sample rate and biquad coefficients */
+	dsp_set_dc_only_mode(new_rate_hz > 192000U);
 	dsp_init(actual_rate);
 
-	LOG_INF("Audio rate changed: requested %u Hz, actual %u Hz (TIM6 div=%u, error %d Hz, %ux ovs)",
-	        new_rate_hz, actual_rate, tim_period, err_hz, 1U << active_ovs_log2);
 	return 0;
 }
 
 int audio_in_start(void)
 {
 	if (!initialized) {
+		return -EINVAL;
+	}
+	if (active_block_samples == 0U || active_block_samples > MAX_BLOCK) {
 		return -EINVAL;
 	}
 	if (dma_active) {
@@ -805,7 +866,7 @@ int audio_in_start(void)
 
 	int ret = dma_config(dma_dev, DMA_CH, &cfg);
 	if (ret) {
-		LOG_ERR("dma_config failed: %d", ret);
+		TRACE("dma_config failed (%d)", ret);
 		return ret;
 	}
 
@@ -816,7 +877,7 @@ int audio_in_start(void)
 
 	ret = dma_start(dma_dev, DMA_CH);
 	if (ret) {
-		LOG_ERR("dma_start failed: %d", ret);
+		TRACE("dma_start failed (%d)", ret);
 		dma_stop(dma_dev, DMA_CH);
 		return ret;
 	}
@@ -845,17 +906,16 @@ int audio_in_start(void)
 			k_busy_wait(1);
 		}
 		if (en_timeout == 0) {
-			LOG_ERR("ADC enable timed out waiting for ADRDY");
+			TRACE("ADC enable timeout (ADRDY)");
 			/* Channel is enabled, so dma_stop will disable it and release busy flag */
 			dma_stop(dma_dev, DMA_CH);
 			dma_active = false;
 			return -ETIMEDOUT;
 		}
 	}
-#if defined(CONFIG_WILDSONIC_VERBOSE_LOGS)
-	printk("[PHASE 5] ADC/DMA configured (DMA1 Ch1 active, ADC ADRDY confirmed)\n");
-	printk("[PHASE 6] Timer started (TIM6 active, triggering ADC TRGO @ %u Hz)\n", actual_rate);
-#endif
+	TRACE_TEST("ADC/DMA started: TIM6 div %u, %ux ovs, conv %u ns of %u ns (%u%%)",
+	           tim_period, 1U << active_ovs_log2,
+	           last_conv_ns, last_period_ns, last_duty_pct);
 
 	LL_ADC_REG_StartConversion(adc);	/* waiting for timer trigger */
 	LL_TIM_EnableCounter(tim);
@@ -870,9 +930,7 @@ int audio_in_stop(void)
 	LL_TIM_DisableCounter(tim);
 	LL_TIM_SetCounter(tim, 0);
 	LL_TIM_ClearFlag_UPDATE(tim);
-#if defined(CONFIG_WILDSONIC_VERBOSE_LOGS)
-	printk("[TEST] TIM6_STOPPED\n");
-#endif
+	TRACE_RAW_TEST("[TEST] TIM6_STOPPED\n");
 
 	/* 2. Stop ongoing ADC regular conversion with bounded timeout */
 	if (LL_ADC_REG_IsConversionOngoing(adc)) {
@@ -882,13 +940,11 @@ int audio_in_stop(void)
 			k_busy_wait(1);
 		}
 		if (stop_timeout == 0) {
-			LOG_ERR("Timeout stopping ADC conversion");
+			TRACE("Timeout stopping ADC conversion");
 			ret = -ETIMEDOUT;
 		}
 	}
-#if defined(CONFIG_WILDSONIC_VERBOSE_LOGS)
-	printk("[TEST] ADC_STOPPED\n");
-#endif
+	TRACE_RAW_TEST("[TEST] ADC_STOPPED\n");
 
 	/* 3. Bounded wait for in-flight acquisition copy from DMA buffer to complete
 	 *    BEFORE stopping DMA (Phase 1: Do not stop DMA while worker is copying) */
@@ -898,12 +954,10 @@ int audio_in_stop(void)
 		k_sleep(K_MSEC(1));
 	}
 	if (drain_timeout_ms == 0 && ret == 0) {
-		LOG_ERR("Timeout waiting for in-progress acquisition block copy");
+		TRACE("Timeout waiting for DMA worker drain");
 		ret = -ETIMEDOUT;
 	}
-#if defined(CONFIG_WILDSONIC_VERBOSE_LOGS)
-	printk("[TEST] DMA_WORKER_DRAINED\n");
-#endif
+	TRACE_RAW_TEST("[TEST] DMA_WORKER_DRAINED\n");
 
 	/* 4. Stop DMA while hardware stream is still enabled:
 	 *    Zephyr's dma_stm32_stop() checks stm32_dma_is_enabled_stream(),
@@ -914,7 +968,7 @@ int audio_in_stop(void)
 		int dma_rc = dma_stop(dma_dev, DMA_CH);
 		dma_active = false;
 		if (dma_rc != 0 && ret == 0) {
-			LOG_ERR("dma_stop failed: %d", dma_rc);
+			TRACE("dma_stop failed (%d)", dma_rc);
 			ret = dma_rc;
 		}
 	}
@@ -926,9 +980,7 @@ int audio_in_stop(void)
 		atomic_add(&boundary_discarded_samples, active_block_samples);
 		atomic_add(&acquisition_samples_accounted, active_block_samples);
 	}
-#if defined(CONFIG_WILDSONIC_VERBOSE_LOGS)
-	printk("[TEST] DMA_EVENTS_DRAINED\n");
-#endif
+	TRACE_RAW_TEST("[TEST] DMA_EVENTS_DRAINED\n");
 
 	/* 6. Disable ADC with bounded timeout */
 	if (LL_ADC_IsEnabled(adc)) {
@@ -938,7 +990,7 @@ int audio_in_stop(void)
 			k_busy_wait(1);
 		}
 		if (dis_timeout == 0 && ret == 0) {
-			LOG_ERR("Timeout disabling ADC");
+			TRACE("Timeout disabling ADC");
 			ret = -ETIMEDOUT;
 		}
 	}
@@ -959,12 +1011,8 @@ int audio_in_stop(void)
 		size_t stack_size = K_THREAD_STACK_SIZEOF(acquisition_thread_stack);
 		size_t used = stack_size - unused;
 		uint32_t pct = (uint32_t)((used * 100U) / stack_size);
-		LOG_INF("[STACK] Acquisition thread: %u / %u bytes used (%u%%)",
-			(unsigned int)used, (unsigned int)stack_size, (unsigned int)pct);
-		if (pct > 70) {
-			LOG_WRN("[STACK WARNING] Acquisition thread stack usage > 70%% (%u%%)",
-				(unsigned int)pct);
-		}
+		TRACE("Acq stack %u/%u B (%u%%)",
+		      (unsigned int)used, (unsigned int)stack_size, (unsigned int)pct);
 	}
 #endif
 
@@ -1018,4 +1066,13 @@ int audio_in_verify_ready(void)
 		k_busy_wait(20);
 	}
 	return 0;
+}
+
+void audio_in_log_boot_status(void)
+{
+	if (initialized) {
+		TRACE("ADC/DMA Init Done");
+	} else {
+		TRACE("ADC/DMA Init Failed");
+	}
 }

@@ -29,7 +29,7 @@ struct sd_bench_result {
 	bool passed_margin;     /* >= 768 KB/s (2x operating margin) */
 };
 
-#if defined(CONFIG_WILDSONIC_VERBOSE_LOGS)
+#if defined(CONFIG_WILDSONIC_BENCHMARKS)
 /* Execute a single sequential-write benchmark test */
 int sd_benchmark_run_test(enum sd_bench_type type,
                           uint32_t block_bytes,

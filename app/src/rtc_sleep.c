@@ -6,16 +6,10 @@
 #include "psram_is66wvs.h"
 #include "console.h"
 #include "ble_comm.h"
+#include "retained_reboot.h"
+#include "wildsonic_trace.h"
 #include <zephyr/kernel.h>
-#include <zephyr/logging/log.h>
-#include <zephyr/logging/log_ctrl.h>
 #include <zephyr/drivers/timer/system_timer.h>
-
-#if defined(CONFIG_WILDSONIC_VERBOSE_LOGS)
-LOG_MODULE_REGISTER(rtc_sleep, LOG_LEVEL_INF);
-#else
-LOG_MODULE_REGISTER(rtc_sleep, LOG_LEVEL_WRN);
-#endif
 
 #if defined(CONFIG_SOC_SERIES_STM32L4X)
 
@@ -129,27 +123,24 @@ int rtc_sleep_init(void)
 
 		if (LL_RCC_LSE_IsReady()) {
 			LL_RCC_SetRTCClockSource(LL_RCC_RTC_CLKSOURCE_LSE);
-			LOG_INF("RTC clock source configured: LSE (32.768 kHz external crystal)");
 		} else {
-			LOG_WRN("LSE oscillator not ready; attempting LSI fallback (~32 kHz internal RC)");
 			LL_RCC_LSI_Enable();
 			uint32_t lsi_to = 10000;
 			while (!LL_RCC_LSI_IsReady() && --lsi_to) {
 				k_busy_wait(10);
 			}
 			if (!LL_RCC_LSI_IsReady()) {
-				LOG_ERR("LSI oscillator startup timed out; RTC initialization failed");
+				TRACE("LSI startup timeout; RTC init failed");
 				return -ETIMEDOUT;
 			}
 			LL_RCC_SetRTCClockSource(LL_RCC_RTC_CLKSOURCE_LSI);
-			LOG_WRN("RTC clock source configured: LSI (~32 kHz internal RC oscillator; calibration limitations apply)");
 		}
 		LL_RCC_EnableRTC();
 	}
 
 	/* Verify RTC is running */
 	if (!LL_RCC_IsEnabledRTC()) {
-		LOG_ERR("Failed to enable RTC peripheral");
+		TRACE("Failed to enable RTC peripheral");
 		return -EIO;
 	}
 
@@ -165,7 +156,7 @@ int rtc_sleep_init(void)
 		}
 		if (init_to == 0) {
 			LL_RTC_EnableWriteProtection(RTC);
-			LOG_ERR("Timeout waiting for RTC INIT mode in rtc_sleep_init");
+			TRACE("RTC INIT timeout in rtc_sleep_init");
 			return -ETIMEDOUT;
 		}
 		LL_RTC_SetAsynchPrescaler(RTC, 127);
@@ -201,8 +192,6 @@ int rtc_sleep_init(void)
 	LL_PWR_ClearFlag_WU();
 
 	rtc_initialized = true;
-	LOG_INF("RTC Wakeup Timer initialized (EXTI Line 20, IRQ %d; Strict RTC-only wake enforced)",
-	        RTC_WKUP_IRQn);
 	return 0;
 }
 
@@ -240,8 +229,8 @@ int rtc_sleep_arm(uint32_t seconds)
 	}
 	if (to == 0) {
 		rtc_write_protect_enable();
-		LOG_ERR("Timeout waiting for RTC WUTWF (ISR=0x%08X, CR=0x%08X)",
-		        (unsigned int)RTC->ISR, (unsigned int)RTC->CR);
+		TRACE("RTC WUTWF timeout (ISR=0x%08X, CR=0x%08X)",
+		      (unsigned int)RTC->ISR, (unsigned int)RTC->CR);
 		return -ETIMEDOUT;
 	}
 
@@ -266,14 +255,12 @@ int rtc_sleep_arm(uint32_t seconds)
 
 	/* Verify timer is armed */
 	if (!LL_RTC_WAKEUP_IsEnabled(RTC)) {
-		LOG_ERR("Failed to arm RTC Wakeup Timer (CR=0x%08X)", (unsigned int)RTC->CR);
+		TRACE("RTC WUT arm failed (CR=0x%08X)", (unsigned int)RTC->CR);
 		return -EIO;
 	}
 
 	rtc_timer_active = true;
-#if defined(CONFIG_WILDSONIC_VERBOSE_LOGS)
-	printk("[TEST] RTC_WUT_ARMED: duration=%u s\n", seconds);
-#endif
+	TRACE_RAW_TEST("[TEST] RTC_WUT_ARMED: duration=%u s\n", seconds);
 	return 0;
 }
 
@@ -329,15 +316,8 @@ int rtc_sleep_enter_stop2(uint32_t seconds)
 		uint32_t uart_flush_start_ms = k_uptime_get_32();
 		while (!LL_USART_IsActiveFlag_TC(USART2)) {
 			if ((uint32_t)(k_uptime_get_32() - uart_flush_start_ms) >= 1000U) {
-				uint32_t isr = USART2->ISR;
-				uint32_t cr1 = USART2->CR1;
-				uint32_t cr3 = USART2->CR3;
-				uint32_t brr = USART2->BRR;
-				bool tc_flag = (isr & USART_ISR_TC) != 0;
-				bool txe_flag = (isr & USART_ISR_TXE) != 0;
-				LOG_ERR("USART2 transmit-complete timeout; refusing Stop2 entry (ISR=0x%08X, CR1=0x%08X, CR3=0x%08X, BRR=0x%08X, TC=%d, TXE=%d, UE=%d, TE=%d)",
-				        (unsigned int)isr, (unsigned int)cr1, (unsigned int)cr3, (unsigned int)brr,
-				        tc_flag, txe_flag, usart_ue, usart_te);
+				TRACE("USART2 TC timeout before Stop2 (ISR=0x%08X)",
+				      (unsigned int)USART2->ISR);
 				rtc_sleep_disarm();
 				return -ETIMEDOUT;
 			}
@@ -447,13 +427,6 @@ int rtc_sleep_enter_stop2(uint32_t seconds)
 	NVIC_ClearPendingIRQ(RTC_WKUP_IRQn);
 #endif
 
-#if defined(FLASH_OPTR_IWDG_STOP)
-	/* Check if IWDG is configured to freeze in Stop mode */
-	if ((FLASH->OPTR & FLASH_OPTR_IWDG_STOP) == 0) {
-		LOG_WRN("IWDG_STOP option byte is clear: IWDG would continue running in Stop mode");
-	}
-#endif
-
 	/* Suspend SysTick to prevent kernel tick interrupts during Stop 2 */
 	uint32_t saved_systick_ctrl = SysTick->CTRL;
 	SysTick->CTRL &= ~(SysTick_CTRL_ENABLE_Msk | SysTick_CTRL_TICKINT_Msk);
@@ -483,20 +456,19 @@ int rtc_sleep_enter_stop2(uint32_t seconds)
 
 	/* Verify RTC Wakeup Timer is armed before WFI */
 	if (!LL_RTC_WAKEUP_IsEnabled(RTC)) {
-#if defined(CONFIG_WILDSONIC_VERBOSE_LOGS)
-		printk("[TEST] Sleep precondition failed: RTC Wakeup Timer not armed (CR=0x%08X)\n",
-		       (unsigned int)RTC->CR);
-#endif
-		LOG_ERR("Stop 2 aborted: RTC Wakeup Timer is not enabled");
+		TRACE_RAW_TEST("[TEST] Sleep precondition failed: RTC Wakeup Timer not armed (CR=0x%08X)\n",
+		               (unsigned int)RTC->CR);
+		TRACE("Stop 2 aborted: RTC WUT disabled");
+		retained_reboot_set_reason(REBOOT_REASON_SLEEP_FAIL);
 		LL_LPM_EnableSleep();
 		rtc_sleep_disarm();
 		return -EIO;
 	}
 
-#if defined(CONFIG_WILDSONIC_VERBOSE_LOGS)
-	printk("[TEST] STOP2_ENTERED\n");
-#endif
-	while (log_process()) {}
+	TRACE_RAW_TEST("[TEST] STOP2_ENTERED\n");
+	retained_reboot_set_reason(REBOOT_REASON_SLEEP_WAKE_RTC);
+	wildsonic_trace_set_async(false);
+	wildsonic_trace_flush();
 #if defined(CONFIG_SOC_SERIES_STM32L4X)
 	/* Ensure all UART console bits are completely transmitted before clocks freeze in Stop 2
 	 * Uses DWT cycle counter timeout to prevent infinite hang if UART TX is faulted. */
@@ -541,11 +513,7 @@ int rtc_sleep_enter_stop2(uint32_t seconds)
 	bool nvic_rtc_flag = (NVIC_GetPendingIRQ(RTC_WKUP_IRQn) != 0);
 
 	uint32_t exti_pr1_snap = EXTI->PR1;
-	uint32_t exti_pr2_snap = EXTI->PR2;
 	uint32_t pwr_sr1_snap = PWR->SR1;
-	uint32_t nvic_ispr0_snap = NVIC->ISPR[0];
-	uint32_t nvic_ispr1_snap = NVIC->ISPR[1];
-	uint32_t nvic_ispr2_snap = NVIC->ISPR[2];
 
 	/* Clear SLEEPDEEP bit in Cortex-M4 SCR */
 	LL_LPM_EnableSleep();
@@ -559,24 +527,24 @@ int rtc_sleep_enter_stop2(uint32_t seconds)
 		LL_EXTI_ClearFlag_0_31(LL_EXTI_LINE_13);
 		last_wake_source = RTC_WAKE_USER_BUTTON;
 		wake_rc = -EINTR;
-		printk("\n[SERVICE WAKE] Stop 2 interrupted by technician button B1 (PC13).\n");
+		retained_reboot_set_reason(REBOOT_REASON_SLEEP_WAKE_GPIO);
 	} else if (rtc_wut_flag || exti20_flag || nvic_rtc_flag || pre_wake_event || (last_wake_source == RTC_WAKE_TIMER)) {
 		last_wake_source = RTC_WAKE_TIMER;
 		wake_rc = 0;
+		retained_reboot_set_reason(REBOOT_REASON_SLEEP_WAKE_RTC);
 	} else {
-		LOG_WRN("Unexpected wake event: RTC WUT flag not asserted EXTI_PR1=0x%08X, PR2=0x%08X, PWR_SR1=0x%08X, NVIC_ISPR=[0x%08X, 0x%08X, 0x%08X]",
-		        exti_pr1_snap, exti_pr2_snap, pwr_sr1_snap, nvic_ispr0_snap, nvic_ispr1_snap, nvic_ispr2_snap);
 		last_wake_source = RTC_WAKE_NONE;
 		wake_rc = -EIO;
+		retained_reboot_set_reason(REBOOT_REASON_SLEEP_FAIL);
 	}
 
 	/* Re-initialize 72 MHz PLL clock tree via Zephyr clock control BEFORE enabling IRQs
 	 * so that all pending ISRs execute at 72 MHz rather than 4 MHz MSI. */
 	int clk_ret = stm32_clock_control_init(NULL);
-	if (clk_ret != 0 || LL_RCC_GetSysClkSource() != LL_RCC_SYS_CLKSOURCE_STATUS_PLL) {
-		LOG_ERR("Clock restoration failed after Stop 2 (ret=%d, src=0x%02X)",
-		        clk_ret, LL_RCC_GetSysClkSource());
+	bool clk_restore_fail = (clk_ret != 0 || LL_RCC_GetSysClkSource() != LL_RCC_SYS_CLKSOURCE_STATUS_PLL);
+	if (clk_restore_fail) {
 		wake_rc = -EIO;
+		retained_reboot_set_reason(REBOOT_REASON_SLEEP_FAIL);
 	}
 
 	/* Enable interrupts with system clock fully restored to PLL */
@@ -618,23 +586,26 @@ int rtc_sleep_enter_stop2(uint32_t seconds)
 	/* Restore console UART RX interrupts after Stop 2 wakeup */
 	console_async_resume();
 	ble_comm_resume();
-#if defined(CONFIG_WILDSONIC_VERBOSE_LOGS)
+	if (last_wake_source == RTC_WAKE_USER_BUTTON) {
+		TRACE_TEST("Service wake: GPIO PC13");
+	}
 	/* Emit wake milestones cleanly only after system clocks and UART are 100% operational */
-	printk("[TEST] STOP2_EXITED\n");
+	TRACE_RAW_TEST("[TEST] STOP2_EXITED\n");
 	if (last_wake_source == RTC_WAKE_TIMER) {
-		printk("[TEST] RTC_WAKE_ISR\n");
+		TRACE_RAW_TEST("[TEST] RTC_WAKE_ISR\n");
 	}
-	if (clk_ret == 0 && LL_RCC_GetSysClkSource() == LL_RCC_SYS_CLKSOURCE_STATUS_PLL) {
-		printk("[TEST] CLOCKS_RESTORED\n");
+	if (!clk_restore_fail) {
+		TRACE_RAW_TEST("[TEST] CLOCKS_RESTORED\n");
 	}
-	printk("[TEST] UART_RESTORED\n");
-#else
-	/* Keep one useful operational message after clocks and console are restored. */
-	if (wake_rc == 0 && last_wake_source == RTC_WAKE_TIMER) {
-		printk("\nRTC wake received. System clock restored; console and BLE communications resumed.\n");
-		printk("Wake initialization complete; scheduler continuing.\n");
+	TRACE_RAW_TEST("[TEST] UART_RESTORED\n");
+	if (last_wake_source == RTC_WAKE_NONE) {
+		TRACE("Unexpected Stop 2 wake (PR1=0x%08X, SR1=0x%08X)",
+		      exti_pr1_snap, pwr_sr1_snap);
 	}
-#endif
+	if (clk_restore_fail) {
+		TRACE("Stop 2 clock restore failed (%d, src=0x%02X)",
+		      clk_ret, (unsigned int)LL_RCC_GetSysClkSource());
+	}
 
 	/* Disarm RTC Wakeup Timer and clear pending flags */
 	rtc_sleep_disarm();

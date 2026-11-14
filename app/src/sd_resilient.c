@@ -5,7 +5,7 @@
 #include <stdio.h>
 #include <string.h>
 #include <zephyr/kernel.h>
-#include <zephyr/logging/log.h>
+#include "wildsonic_trace.h"
 #include <zephyr/drivers/disk.h>
 #include <zephyr/storage/disk_access.h>
 #include <zephyr/drivers/gpio.h>
@@ -14,12 +14,6 @@
 #if defined(CONFIG_SOC_SERIES_STM32L4X)
 #include <stm32l4xx_ll_bus.h>
 #include <stm32l4xx_hal_rcc.h>
-#endif
-
-#if defined(CONFIG_WILDSONIC_VERBOSE_LOGS)
-LOG_MODULE_REGISTER(sd_resilient, LOG_LEVEL_INF);
-#else
-LOG_MODULE_REGISTER(sd_resilient, LOG_LEVEL_WRN);
 #endif
 
 /* Mutex for serialized single multi-line diagnostic logging */
@@ -82,20 +76,20 @@ int sd_resilient_init(void) {
 
   struct disk_info *hw = disk_access_get_di("SD");
   if (hw == NULL) {
-    LOG_WRN("sd_resilient: raw disk 'SD' not found; resilient hook deferred");
+    TRACE("sd_resilient: raw disk 'SD' not found");
     return -ENODEV;
   }
 
   int ret = disk_access_unregister(hw);
   if (ret != 0) {
-    LOG_ERR("sd_resilient: unregister raw SD failed: %d", ret);
+    TRACE("sd_resilient: unregister raw SD failed: %d", ret);
     return ret;
   }
 
   hw->name = "SD_HW";
   ret = disk_access_register(hw);
   if (ret != 0) {
-    LOG_ERR("sd_resilient: register SD_HW failed: %d", ret);
+    TRACE("sd_resilient: register SD_HW failed: %d", ret);
     return ret;
   }
 
@@ -104,7 +98,7 @@ int sd_resilient_init(void) {
   s_resilient_sd_disk.dev = hw->dev;
   ret = disk_access_register(&s_resilient_sd_disk);
   if (ret != 0) {
-    LOG_ERR("sd_resilient: register resilient SD failed: %d", ret);
+    TRACE("sd_resilient: register resilient SD failed: %d", ret);
     return ret;
   }
 
@@ -114,7 +108,6 @@ int sd_resilient_init(void) {
   (void)disk_access_register(&s_resilient_sdr_disk);
 
   s_initialized = true;
-  LOG_INF("sd_resilient: Layer 1 resilient storage wrapper active (SD & SDR)");
   return 0;
 }
 
@@ -140,7 +133,7 @@ int sd_resilient_hardware_reset(void) {
   int ret = 0;
   int deinit_rc = -1;
 
-  printk("\n[SD_RESET] Initiating hardware card reset sequence...\n");
+  TRACE_TEST("SD hardware reset start");
 
   /* Step 1: Prefer driver's own deinit path (HAL_SD_DeInit) */
   for (int i = 0; i < 8; i++) {
@@ -150,28 +143,26 @@ int sd_resilient_hardware_reset(void) {
     }
   }
   int post_deinit_status = disk_access_status("SD_HW");
-  printk("  [SD_RESET] Step 1 (CTRL_DEINIT): rc=%d, status=%d\n", deinit_rc, post_deinit_status);
+  ARG_UNUSED(post_deinit_status);
+  TRACE_TEST("SD reset step1 DEINIT rc=%d st=%d", deinit_rc, post_deinit_status);
 
   /* Step 2: Optional VDD power cycle via GPIO */
 #if HAS_SD_POWER_GPIO
   if (device_is_ready(s_sd_power_gpio.port)) {
-    printk("  [SD_RESET] Step 2 (VDD power cycle): OFF for 100 ms...\n");
     gpio_pin_configure_dt(&s_sd_power_gpio, GPIO_OUTPUT_INACTIVE);
     k_msleep(100);
     gpio_pin_set_dt(&s_sd_power_gpio, 1);
     k_msleep(10);
-    printk("  [SD_RESET] Step 2 (VDD power cycle): ON, settled 10 ms\n");
+    TRACE_TEST("SD reset step2 VDD cycled");
   } else {
-    printk("  [SD_RESET] Step 2 (VDD power cycle): GPIO not ready\n");
+    TRACE_TEST("SD reset step2 VDD GPIO not ready");
   }
-#else
-  printk("  [SD_RESET] Step 2 (VDD power cycle): None (alias 'sd-power' not configured)\n");
 #endif
 
   /* Step 2b: Fallback RCC reset only if driver deinit failed */
   if (deinit_rc != 0) {
 #if defined(CONFIG_SOC_SERIES_STM32L4X)
-    printk("  [SD_RESET] Step 2b (RCC force-reset): deinit failed (%d), resetting peripheral\n", deinit_rc);
+    TRACE_TEST("SD reset step2b RCC reset (deinit=%d)", deinit_rc);
     __HAL_RCC_SDMMC1_FORCE_RESET();
     __HAL_RCC_SDMMC1_RELEASE_RESET();
     k_msleep(2);
@@ -182,26 +173,33 @@ int sd_resilient_hardware_reset(void) {
 
   /* Step 3: Driver init */
   ret = disk_access_init("SD_HW");
-  printk("  [SD_RESET] Step 3 (disk_access_init): ret=%d\n", ret);
   if (ret != 0) {
-    LOG_WRN("sd_resilient: card re-init failed: %d", ret);
+    TRACE("SD card re-init failed: %d", ret);
     return ret;
   }
 
   /* Step 4: Driver status */
   int status = disk_access_status("SD_HW");
-  printk("  [SD_RESET] Step 4 (disk_access_status): status=%d\n", status);
   if (status != DISK_STATUS_OK) {
-    LOG_WRN("sd_resilient: card status not OK after re-init: %d", status);
+    TRACE("SD card status error after re-init: %d", status);
     return -EIO;
   }
 
-  /* Step 5: Clock and bus state */
-  uint32_t clkcr = 0;
+  /* Step 5: Re-apply configured SDMMC divider and verify clock/bus state */
 #if defined(CONFIG_SOC_SERIES_STM32L4X)
-  clkcr = (uint32_t)SDMMC1->CLKCR;
+#if defined(CONFIG_WILDSONIC_SDMMC_CLK_DIV)
+  uint32_t target_div = CONFIG_WILDSONIC_SDMMC_CLK_DIV;
+  if (target_div <= 255U) {
+    uint32_t clkcr_set = (uint32_t)SDMMC1->CLKCR;
+    if ((clkcr_set & 0xFFU) != target_div) {
+      SDMMC1->CLKCR = (clkcr_set & ~0xFFU) | target_div;
+    }
+  }
 #endif
-  printk("  [SD_RESET] Step 5 (CLKCR after init): 0x%08X\n", (unsigned int)clkcr);
+  uint32_t clkcr = (uint32_t)SDMMC1->CLKCR;
+  ARG_UNUSED(clkcr);
+  TRACE_TEST("SD reset step5 CLKCR=0x%08X", (unsigned int)clkcr);
+#endif
 
   sd_fault_inject_notify_reinit();
   return 0;
@@ -245,7 +243,7 @@ static int resilient_disk_read(struct disk_info *disk, uint8_t *data_buf,
     if (rc == 0) {
       return 0;
     }
-    LOG_WRN("sd_resilient: read attempt %d failed: %d", attempt + 1, rc);
+    TRACE("SD read attempt %d failed: %d", attempt + 1, rc);
     (void)sd_resilient_hardware_reset();
   }
 
@@ -258,13 +256,14 @@ static int resilient_disk_write(struct disk_info *disk, const uint8_t *data_buf,
   uint32_t attempt = 0;
   uint64_t t_start = k_cycle_get_64();
   int rc = 0;
+  bool saw_crc = false;
 
   while (attempt < 3) {
     uint64_t t_now = k_cycle_get_64();
     uint64_t diff = (t_now >= t_start) ? (t_now - t_start) : 0;
     uint32_t elapsed_us = (uint32_t)k_cyc_to_us_floor64(diff);
     if (elapsed_us >= 1500000U && attempt > 0) {
-      LOG_ERR("sd_resilient: Layer 1 write retry budget exhausted (%u us)", elapsed_us);
+      TRACE("SD write retry budget exhausted (%u us)", elapsed_us);
       break;
     }
 
@@ -280,6 +279,9 @@ static int resilient_disk_write(struct disk_info *disk, const uint8_t *data_buf,
         k_spinlock_key_t key = k_spin_lock(&s_stats_lock);
         s_stats.retry_ok++;
         k_spin_unlock(&s_stats_lock, key);
+        TRACE(saw_crc ? "SD write CRC error, retry %u ok, sector %u"
+                      : "SD write error, retry %u ok, sector %u",
+              attempt, start_sector);
         sd_resilient_notify_recovery_needed("Layer 1 retry success");
       }
       return 0;
@@ -294,6 +296,7 @@ static int resilient_disk_write(struct disk_info *disk, const uint8_t *data_buf,
 #if defined(CONFIG_SOC_SERIES_STM32L4X)
     if ((SDMMC1->STA & SDMMC_STA_DCRCFAIL) || rc == -EIO) {
       s_stats.err_crc++;
+      saw_crc = true;
     } else if ((SDMMC1->STA & SDMMC_STA_DTIMEOUT) || rc == -ETIMEDOUT) {
       s_stats.err_timeout++;
     } else {
@@ -301,6 +304,7 @@ static int resilient_disk_write(struct disk_info *disk, const uint8_t *data_buf,
     }
 #else
     s_stats.err_crc++;
+    saw_crc = true;
 #endif
     k_spin_unlock(&s_stats_lock, key);
 
@@ -317,8 +321,7 @@ static int resilient_disk_write(struct disk_info *disk, const uint8_t *data_buf,
     } else if (attempt == 1) {
       int rst_rc = sd_resilient_hardware_reset();
       if (rst_rc != 0) {
-        LOG_WRN("sd_resilient: hardware reset failed during retry attempt %u (%d)",
-                attempt + 1, rst_rc);
+        TRACE("SD reset failed on retry %u (%d)", attempt + 1, rst_rc);
       }
       k_msleep(5);
     }
@@ -360,26 +363,12 @@ void sd_resilient_log_failure_atomic(const char *tag, int err, uint32_t sector,
   clkcr = (uint32_t)SDMMC1->CLKCR;
 #endif
 
-  printk("\n-------------------------------------------------------------------------\n");
-  printk("[STORAGE DIAGNOSTIC] %s (err=%d, attempt=%u)\n", tag, err, attempt);
-  printk("  Target Sector : %u (count: %u sectors = %u bytes)\n",
-         sector, count, count * 512U);
-  printk("  Timing        : Latency=%u us, Uptime=%u ms\n", latency_us, uptime_ms);
-  printk("  Hardware Regs : STA=0x%08X, DCOUNT=%u, DCTRL=0x%08X, CLKCR=0x%08X\n",
-         (unsigned int)sta, (unsigned int)dcount, (unsigned int)dctrl, (unsigned int)clkcr);
-  if (sta & 0x00000002U) {
-    printk("  Flag Detail   : [DATA_CRC_FAIL] CRC check failed on data block\n");
-  }
-  if (sta & 0x00000008U) {
-    printk("  Flag Detail   : [DATA_TIMEOUT] Data timeout reached\n");
-  }
-  if (sta & 0x00000010U) {
-    printk("  Flag Detail   : [TX_UNDERRUN] Transmit FIFO underrun\n");
-  }
-  if (sta & 0x00000020U) {
-    printk("  Flag Detail   : [RX_OVERRUN] Receive FIFO overrun\n");
-  }
-  printk("-------------------------------------------------------------------------\n");
+  TRACE("%s err=%d sec=%u cnt=%u try=%u",
+        tag, err, sector, count, attempt);
+  TRACE_TEST("  lat=%u us, STA=0x%08X DCNT=%u DCTRL=0x%08X CLK=0x%08X",
+             latency_us, (unsigned int)sta, (unsigned int)dcount,
+             (unsigned int)dctrl, (unsigned int)clkcr);
+  ARG_UNUSED(uptime_ms);
 
   k_mutex_unlock(&s_resilient_log_mutex);
 }
@@ -397,8 +386,8 @@ enum storage_health_state sd_resilient_get_health(void) {
 void sd_resilient_set_health(enum storage_health_state state) {
   k_spinlock_key_t key = k_spin_lock(&s_stats_lock);
   if (s_health != state) {
-    LOG_INF("Storage health transition: %s -> %s",
-            sd_resilient_health_str(s_health), sd_resilient_health_str(state));
+    TRACE_TEST("Storage health: %s -> %s",
+               sd_resilient_health_str(s_health), sd_resilient_health_str(state));
     s_health = state;
   }
   k_spin_unlock(&s_stats_lock, key);
@@ -423,7 +412,7 @@ void sd_resilient_notify_clean_block(void) {
   s_stats.consecutive_discards = 0;
   if (s_health == STORAGE_HEALTH_DEGRADED && s_stats.consecutive_clean_blocks >= 100) {
     s_health = STORAGE_HEALTH_HEALTHY;
-    LOG_INF("Storage health recovered: DEGRADED -> HEALTHY (100 clean blocks)");
+    TRACE_TEST("Storage health: DEGRADED -> HEALTHY");
   }
   k_spin_unlock(&s_stats_lock, key);
 }
@@ -433,7 +422,7 @@ void sd_resilient_notify_recovery_needed(const char *reason) {
   s_stats.consecutive_clean_blocks = 0;
   if (s_health == STORAGE_HEALTH_HEALTHY) {
     s_health = STORAGE_HEALTH_DEGRADED;
-    LOG_WRN("Storage health transition: HEALTHY -> DEGRADED (reason: %s)", reason);
+    TRACE_TEST("Storage health: DEGRADED (%s)", reason);
   }
   k_spin_unlock(&s_stats_lock, key);
 }
@@ -492,7 +481,7 @@ void sd_resilient_record_discard(uint32_t block_bytes, uint32_t samples, int err
   s_stats.consecutive_clean_blocks = 0;
   if (s_stats.consecutive_discards >= 16) {
     s_health = STORAGE_HEALTH_FAULT;
-    LOG_ERR("Storage health transition: -> FAULT (consecutive discards >= 16)");
+    TRACE("Storage FAULT: >=16 discards");
   }
   k_spin_unlock(&s_stats_lock, key);
 }
@@ -502,7 +491,7 @@ void sd_resilient_add_recovery_time(uint32_t us) {
   s_stats.time_in_recovery_us += us;
   if (s_stats.time_in_recovery_us > 20000000ULL) { /* > 20 s */
     s_health = STORAGE_HEALTH_FAULT;
-    LOG_ERR("Storage health transition: -> FAULT (cumulative recovery time > 20 s)");
+    TRACE("Storage FAULT: recovery > 20 s");
   }
   k_spin_unlock(&s_stats_lock, key);
 }
@@ -529,10 +518,10 @@ void sd_resilient_add_gap(uint64_t sample_index, uint32_t sample_count, int32_t 
   }
   k_spin_unlock(&s_gap_lock, key);
 
-  LOG_WRN("[STORAGE GAP] Gap recorded: index=%llu count=%u err=%d",
-          (unsigned long long)sample_index, sample_count, err_code);
-  printk("[STORAGE GAP] index=%llu count=%u err=%d\n",
-         (unsigned long long)sample_index, sample_count, err_code);
+  TRACE("Storage gap: idx=%llu cnt=%u err=%d",
+        (unsigned long long)sample_index, sample_count, err_code);
+  TRACE_RAW_TEST("[STORAGE GAP] index=%llu count=%u err=%d\n",
+                 (unsigned long long)sample_index, sample_count, err_code);
 }
 
 uint32_t sd_resilient_get_gap_count(void) {

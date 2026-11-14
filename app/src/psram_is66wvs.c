@@ -1,6 +1,7 @@
 /* SPDX-License-Identifier: Apache-2.0 */
 #include "psram_is66wvs.h"
 #include "recorder.h"
+#include "wildsonic_trace.h"
 #include <stdio.h>
 #include <stm32_ll_bus.h>
 #include <stm32_ll_gpio.h>
@@ -8,13 +9,6 @@
 #include <stm32l4xx_hal_qspi.h>
 #include <string.h>
 #include <zephyr/kernel.h>
-#include <zephyr/logging/log.h>
-
-#if defined(CONFIG_WILDSONIC_VERBOSE_LOGS)
-LOG_MODULE_REGISTER(psram, LOG_LEVEL_INF);
-#else
-LOG_MODULE_REGISTER(psram, LOG_LEVEL_WRN);
-#endif
 
 static QSPI_HandleTypeDef hqspi;
 static bool psram_initialized = false;
@@ -91,14 +85,14 @@ static void psram_invalidate_state(void) {
 static void psram_recover_controller(void) {
   HAL_StatusTypeDef abort_status = HAL_QSPI_Abort(&hqspi);
   if (abort_status != HAL_OK || __HAL_QSPI_GET_FLAG(&hqspi, QSPI_FLAG_BUSY) != RESET) {
-    LOG_ERR("QSPI abort incomplete (status=%d SR=0x%08X); resetting controller",
-            (int)abort_status, (unsigned int)QUADSPI->SR);
+    TRACE("QSPI abort incomplete (st=%d SR=0x%08X); resetting",
+          (int)abort_status, (unsigned int)QUADSPI->SR);
     LL_AHB3_GRP1_ForceReset(LL_AHB3_GRP1_PERIPH_QSPI);
     LL_AHB3_GRP1_ReleaseReset(LL_AHB3_GRP1_PERIPH_QSPI);
     hqspi.State = HAL_QSPI_STATE_RESET;
     hqspi.Lock = HAL_UNLOCKED;
     if (HAL_QSPI_Init(&hqspi) != HAL_OK) {
-      LOG_ERR("QSPI controller reinitialization failed");
+      TRACE("QSPI reinit failed");
     }
   }
   psram_invalidate_state();
@@ -158,13 +152,13 @@ int psram_init(void) {
   hqspi.Instance = QUADSPI;
   uint32_t qspi_hclk_hz = HAL_RCC_GetHCLKFreq();
   if (qspi_hclk_hz == 0U) {
-    LOG_ERR("Cannot determine HCLK for QUADSPI configuration");
+    TRACE("QSPI HCLK unknown");
     return -EIO;
   }
   uint32_t qspi_divider = (qspi_hclk_hz + PSRAM_QSPI_TARGET_HZ - 1U) /
                           PSRAM_QSPI_TARGET_HZ;
   if (qspi_divider == 0U || qspi_divider > 256U) {
-    LOG_ERR("Unsupported HCLK for safe QUADSPI rate: %u Hz", qspi_hclk_hz);
+    TRACE("QSPI HCLK out of range: %u Hz", qspi_hclk_hz);
     return -ERANGE;
   }
   hqspi.Init.ClockPrescaler = qspi_divider - 1U;
@@ -176,7 +170,7 @@ int psram_init(void) {
 
   HAL_StatusTypeDef status = HAL_QSPI_Init(&hqspi);
   if (status != HAL_OK) {
-    LOG_ERR("HAL_QSPI_Init failed: %d", status);
+    TRACE("HAL_QSPI_Init failed: %d", status);
     return -EIO;
   }
 
@@ -197,8 +191,8 @@ int psram_init(void) {
   cmd.Instruction = CMD_RESET_ENABLE;
   status = HAL_QSPI_Command(&hqspi, &cmd, 100);
   if (status != HAL_OK) {
-    LOG_ERR("PSRAM reset-enable command failed: status=%d SR=0x%08X",
-            (int)status, (unsigned int)QUADSPI->SR);
+    TRACE("PSRAM reset-en failed: st=%d SR=0x%08X",
+          (int)status, (unsigned int)QUADSPI->SR);
     psram_recover_controller();
     return -EIO;
   }
@@ -207,16 +201,14 @@ int psram_init(void) {
   cmd.Instruction = CMD_RESET;
   status = HAL_QSPI_Command(&hqspi, &cmd, 100);
   if (status != HAL_OK) {
-    LOG_ERR("PSRAM reset command failed: status=%d SR=0x%08X",
-            (int)status, (unsigned int)QUADSPI->SR);
+    TRACE("PSRAM reset failed: st=%d SR=0x%08X",
+          (int)status, (unsigned int)QUADSPI->SR);
     psram_recover_controller();
     return -EIO;
   }
   k_busy_wait(50); /* Reset recovery delay */
 
   psram_initialized = true;
-  LOG_INF("IS66WVS QUADSPI initialized: HCLK=%u Hz divider=%u bus=%u Hz sshift=%u",
-          HAL_RCC_GetHCLKFreq(), qspi_divider, psram_get_clock_hz(), current_sample_shifting);
   return 0;
 }
 
@@ -251,8 +243,8 @@ int psram_read_id(struct psram_id *id) {
 
   HAL_StatusTypeDef status = HAL_QSPI_Command(&hqspi, &cmd, 100);
   if (status != HAL_OK) {
-    LOG_ERR("QSPI Command 0x9F failed: %d (QSPI state: 0x%02X, err: 0x%08X)",
-            (int)status, hqspi.State, hqspi.ErrorCode);
+    TRACE("QSPI cmd 0x9F failed: %d (st=0x%02X err=0x%08X)",
+          (int)status, hqspi.State, hqspi.ErrorCode);
     psram_recover_controller();
     PSRAM_UNLOCK();
     return -EIO;
@@ -260,8 +252,8 @@ int psram_read_id(struct psram_id *id) {
 
   status = HAL_QSPI_Receive(&hqspi, rx_buf, 100);
   if (status != HAL_OK) {
-    LOG_ERR("QSPI Receive ID failed: %d (QSPI state: 0x%02X, err: 0x%08X)",
-            (int)status, hqspi.State, hqspi.ErrorCode);
+    TRACE("QSPI rx ID failed: %d (st=0x%02X err=0x%08X)",
+          (int)status, hqspi.State, hqspi.ErrorCode);
     psram_recover_controller();
     PSRAM_UNLOCK();
     return -EIO;
@@ -273,9 +265,6 @@ int psram_read_id(struct psram_id *id) {
   id->kgd = rx_buf[1];
   id->density = rx_buf[2];
 
-  LOG_INF("PSRAM ID response: MFID=0x%02X, KGD=0x%02X, Density=0x%02X",
-          id->mfid, id->kgd, id->density);
-
   if (id->mfid == PSRAM_ISSI_MFID && id->kgd == PSRAM_ISSI_KGD_PASS &&
       id->density == PSRAM_ISSI_DENSITY_32M) {
     psram_present = true;
@@ -283,9 +272,104 @@ int psram_read_id(struct psram_id *id) {
   }
 
   psram_present = false;
-  LOG_ERR("Unexpected PSRAM ID; expected 9D/5D/4D, got %02X/%02X/%02X",
-          id->mfid, id->kgd, id->density);
   return -ENODEV;
+}
+
+static HAL_StatusTypeDef psram_qspi_wait_sr(uint32_t mask, uint32_t timeout_ms) {
+  uint32_t sr = QUADSPI->SR;
+  if ((sr & mask) != 0U) {
+    return HAL_OK;
+  }
+  uint32_t tickstart = HAL_GetTick();
+  for (uint32_t spins = 0U;; spins++) {
+    sr = QUADSPI->SR;
+    if ((sr & QUADSPI_SR_TEF) != 0U) {
+      hqspi.ErrorCode |= HAL_QSPI_ERROR_TRANSFER;
+      return HAL_ERROR;
+    }
+    if ((sr & mask) != 0U) {
+      return HAL_OK;
+    }
+    if ((spins & 0x3FFU) == 0x3FFU) {
+      if ((HAL_GetTick() - tickstart) >= timeout_ms) {
+        hqspi.ErrorCode |= HAL_QSPI_ERROR_TIMEOUT;
+        return HAL_TIMEOUT;
+      }
+    }
+  }
+}
+
+static HAL_StatusTypeDef psram_qspi_fast_tx(const uint8_t *buf, uint32_t len, uint32_t timeout_ms) {
+  hqspi.ErrorCode = HAL_QSPI_ERROR_NONE;
+  hqspi.State = HAL_QSPI_STATE_BUSY_INDIRECT_TX;
+  MODIFY_REG(QUADSPI->CCR, QUADSPI_CCR_FMODE, 0x00000000U);
+
+  const uint8_t *p = buf;
+  uint32_t rem = len;
+  while (rem >= 4U) {
+    HAL_StatusTypeDef st = psram_qspi_wait_sr(QUADSPI_SR_FTF, timeout_ms);
+    if (st != HAL_OK) {
+      hqspi.State = HAL_QSPI_STATE_READY;
+      return st;
+    }
+    uint32_t w;
+    memcpy(&w, p, 4U);
+    *(__IO uint32_t *)&QUADSPI->DR = w;
+    p += 4U;
+    rem -= 4U;
+  }
+  while (rem > 0U) {
+    HAL_StatusTypeDef st = psram_qspi_wait_sr(QUADSPI_SR_FTF, timeout_ms);
+    if (st != HAL_OK) {
+      hqspi.State = HAL_QSPI_STATE_READY;
+      return st;
+    }
+    *(__IO uint8_t *)&QUADSPI->DR = *p++;
+    rem--;
+  }
+
+  HAL_StatusTypeDef st = psram_qspi_wait_sr(QUADSPI_SR_TCF, timeout_ms);
+  if (st == HAL_OK) {
+    __HAL_QSPI_CLEAR_FLAG(&hqspi, QSPI_FLAG_TC);
+    st = HAL_QSPI_Abort(&hqspi);
+  }
+  hqspi.State = HAL_QSPI_STATE_READY;
+  return st;
+}
+
+static HAL_StatusTypeDef psram_qspi_fast_rx(uint8_t *buf, uint32_t len, uint32_t timeout_ms) {
+  hqspi.ErrorCode = HAL_QSPI_ERROR_NONE;
+  hqspi.State = HAL_QSPI_STATE_BUSY_INDIRECT_RX;
+  uint32_t addr_reg = READ_REG(QUADSPI->AR);
+  MODIFY_REG(QUADSPI->CCR, QUADSPI_CCR_FMODE, (uint32_t)QUADSPI_CCR_FMODE_0);
+  WRITE_REG(QUADSPI->AR, addr_reg);
+
+  uint8_t *p = buf;
+  uint32_t rem = len;
+  while (rem > 0U) {
+    HAL_StatusTypeDef st = psram_qspi_wait_sr(QUADSPI_SR_FTF | QUADSPI_SR_TCF, timeout_ms);
+    if (st != HAL_OK) {
+      hqspi.State = HAL_QSPI_STATE_READY;
+      return st;
+    }
+    if ((QUADSPI->SR & QUADSPI_SR_FTF) != 0U && rem >= 4U) {
+      uint32_t w = *(__IO uint32_t *)&QUADSPI->DR;
+      memcpy(p, &w, 4U);
+      p += 4U;
+      rem -= 4U;
+    } else {
+      *p++ = *(__IO uint8_t *)&QUADSPI->DR;
+      rem--;
+    }
+  }
+
+  HAL_StatusTypeDef st = psram_qspi_wait_sr(QUADSPI_SR_TCF, timeout_ms);
+  if (st == HAL_OK) {
+    __HAL_QSPI_CLEAR_FLAG(&hqspi, QSPI_FLAG_TC);
+    st = HAL_QSPI_Abort(&hqspi);
+  }
+  hqspi.State = HAL_QSPI_STATE_READY;
+  return st;
 }
 
 int psram_write(uint32_t address, const uint8_t *data, uint32_t length) {
@@ -297,42 +381,43 @@ int psram_write(uint32_t address, const uint8_t *data, uint32_t length) {
   }
   if (address >= PSRAM_IS66WVS_CAPACITY_BYTES ||
       length > PSRAM_IS66WVS_CAPACITY_BYTES - address) {
-    LOG_ERR("PSRAM write bounds violation: addr 0x%06X + len %u exceeds 4MB capacity",
-            address, length);
+    TRACE("PSRAM write OOB: addr 0x%06X len %u", address, length);
     return -EINVAL;
   }
-
-  PSRAM_LOCK();
 
   uint32_t offset = 0;
   int ret = 0;
 
-  bool is_quad = (quad_mode_enabled || quad_test_active || quad_write_override);
-  uint32_t burst_limit = is_quad ? active_burst_size : PSRAM_IS66WVS_SAFE_BURST_BYTES_SPI;
-
-  QSPI_CommandTypeDef cmd = {0};
-  if (is_quad) {
-    cmd.Instruction = CMD_QUAD_WRITE;
-    cmd.InstructionMode = QSPI_INSTRUCTION_1_LINE;
-    cmd.AddressMode = QSPI_ADDRESS_4_LINES;
-    cmd.AddressSize = QSPI_ADDRESS_24_BITS;
-    cmd.AlternateByteMode = QSPI_ALTERNATE_BYTES_NONE;
-    cmd.DataMode = QSPI_DATA_4_LINES;
-    cmd.DummyCycles = 0;
-  } else {
-    cmd.Instruction = CMD_WRITE;
-    cmd.InstructionMode = QSPI_INSTRUCTION_1_LINE;
-    cmd.AddressMode = QSPI_ADDRESS_1_LINE;
-    cmd.AddressSize = QSPI_ADDRESS_24_BITS;
-    cmd.AlternateByteMode = QSPI_ALTERNATE_BYTES_NONE;
-    cmd.DataMode = QSPI_DATA_1_LINE;
-    cmd.DummyCycles = 0;
-  }
-  cmd.DdrMode = QSPI_DDR_MODE_DISABLE;
-  cmd.DdrHoldHalfCycle = QSPI_DDR_HHC_ANALOG_DELAY;
-  cmd.SIOOMode = QSPI_SIOO_INST_EVERY_CMD;
-
   while (offset < length) {
+    /* Hold psram_mutex only per QSPI page burst (~<=0.35 ms) so higher-priority
+     * audio staging writes are never stalled across a 16 KB reader peek. */
+    PSRAM_LOCK();
+
+    bool is_quad = (quad_mode_enabled || quad_test_active || quad_write_override);
+    uint32_t burst_limit = is_quad ? active_burst_size : PSRAM_IS66WVS_SAFE_BURST_BYTES_SPI;
+
+    QSPI_CommandTypeDef cmd = {0};
+    if (is_quad) {
+      cmd.Instruction = CMD_QUAD_WRITE;
+      cmd.InstructionMode = QSPI_INSTRUCTION_1_LINE;
+      cmd.AddressMode = QSPI_ADDRESS_4_LINES;
+      cmd.AddressSize = QSPI_ADDRESS_24_BITS;
+      cmd.AlternateByteMode = QSPI_ALTERNATE_BYTES_NONE;
+      cmd.DataMode = QSPI_DATA_4_LINES;
+      cmd.DummyCycles = 0;
+    } else {
+      cmd.Instruction = CMD_WRITE;
+      cmd.InstructionMode = QSPI_INSTRUCTION_1_LINE;
+      cmd.AddressMode = QSPI_ADDRESS_1_LINE;
+      cmd.AddressSize = QSPI_ADDRESS_24_BITS;
+      cmd.AlternateByteMode = QSPI_ALTERNATE_BYTES_NONE;
+      cmd.DataMode = QSPI_DATA_1_LINE;
+      cmd.DummyCycles = 0;
+    }
+    cmd.DdrMode = QSPI_DDR_MODE_DISABLE;
+    cmd.DdrHoldHalfCycle = QSPI_DDR_HHC_ANALOG_DELAY;
+    cmd.SIOOMode = QSPI_SIOO_INST_EVERY_CMD;
+
     uint32_t current_addr = address + offset;
     uint32_t page_remaining = PSRAM_IS66WVS_PAGE_SIZE -
                               (current_addr & (PSRAM_IS66WVS_PAGE_SIZE - 1));
@@ -352,9 +437,10 @@ int psram_write(uint32_t address, const uint8_t *data, uint32_t length) {
     if (hqspi.State != HAL_QSPI_STATE_READY) {
       if (HAL_QSPI_Abort(&hqspi) != HAL_OK ||
           __HAL_QSPI_GET_FLAG(&hqspi, QSPI_FLAG_BUSY) != RESET) {
-        LOG_ERR("QSPI not idle before write: state=0x%02X SR=0x%08X",
-                hqspi.State, (unsigned int)QUADSPI->SR);
+        TRACE("QSPI busy before write: st=0x%02X SR=0x%08X",
+              hqspi.State, (unsigned int)QUADSPI->SR);
         psram_recover_controller();
+        PSRAM_UNLOCK();
         ret = -EIO;
         break;
       }
@@ -363,21 +449,22 @@ int psram_write(uint32_t address, const uint8_t *data, uint32_t length) {
 
     HAL_StatusTypeDef status = HAL_QSPI_Command(&hqspi, &cmd, 50);
     if (status == HAL_OK) {
-      status = HAL_QSPI_Transmit(&hqspi, (uint8_t *)(data + offset), 50);
+      status = psram_qspi_fast_tx(data + offset, chunk, 50);
     }
 
     if (status != HAL_OK) {
-      LOG_ERR("PSRAM physical write failed: addr=0x%06X, chunk=%u/%u, status=%d, qspi_state=0x%02X, err=0x%08X",
-              current_addr, chunk, length, (int)status, hqspi.State, hqspi.ErrorCode);
+      TRACE("PSRAM write err @0x%06X (%u/%u st=%d)",
+            current_addr, chunk, length, (int)status);
       psram_recover_controller();
+      PSRAM_UNLOCK();
       ret = -EIO;
       break;
     }
 
+    PSRAM_UNLOCK();
     offset += chunk;
   }
 
-  PSRAM_UNLOCK();
   return ret;
 }
 
@@ -390,42 +477,43 @@ int psram_read(uint32_t address, uint8_t *data, uint32_t length) {
   }
   if (address >= PSRAM_IS66WVS_CAPACITY_BYTES ||
       length > PSRAM_IS66WVS_CAPACITY_BYTES - address) {
-    LOG_ERR("PSRAM read bounds violation: addr 0x%06X + len %u exceeds 4MB capacity",
-            address, length);
+    TRACE("PSRAM read OOB: addr 0x%06X len %u", address, length);
     return -EINVAL;
   }
-
-  PSRAM_LOCK();
 
   uint32_t offset = 0;
   int ret = 0;
 
-  bool is_quad = (quad_mode_enabled || quad_test_active || quad_read_override);
-  uint32_t burst_limit = is_quad ? active_burst_size : PSRAM_IS66WVS_SAFE_BURST_BYTES_SPI;
-
-  QSPI_CommandTypeDef cmd = {0};
-  if (is_quad) {
-    cmd.Instruction = CMD_QUAD_FAST_READ;
-    cmd.InstructionMode = QSPI_INSTRUCTION_1_LINE;
-    cmd.AddressMode = QSPI_ADDRESS_4_LINES;
-    cmd.AddressSize = QSPI_ADDRESS_24_BITS;
-    cmd.AlternateByteMode = QSPI_ALTERNATE_BYTES_NONE;
-    cmd.DataMode = QSPI_DATA_4_LINES;
-    cmd.DummyCycles = 6;
-  } else {
-    cmd.Instruction = CMD_READ;
-    cmd.InstructionMode = QSPI_INSTRUCTION_1_LINE;
-    cmd.AddressMode = QSPI_ADDRESS_1_LINE;
-    cmd.AddressSize = QSPI_ADDRESS_24_BITS;
-    cmd.AlternateByteMode = QSPI_ALTERNATE_BYTES_NONE;
-    cmd.DataMode = QSPI_DATA_1_LINE;
-    cmd.DummyCycles = 0;
-  }
-  cmd.DdrMode = QSPI_DDR_MODE_DISABLE;
-  cmd.DdrHoldHalfCycle = QSPI_DDR_HHC_ANALOG_DELAY;
-  cmd.SIOOMode = QSPI_SIOO_INST_EVERY_CMD;
-
   while (offset < length) {
+    /* Hold psram_mutex only per QSPI page burst (~<=0.35 ms) so higher-priority
+     * audio staging writes are never stalled across a 16 KB reader peek. */
+    PSRAM_LOCK();
+
+    bool is_quad = (quad_mode_enabled || quad_test_active || quad_read_override);
+    uint32_t burst_limit = is_quad ? active_burst_size : PSRAM_IS66WVS_SAFE_BURST_BYTES_SPI;
+
+    QSPI_CommandTypeDef cmd = {0};
+    if (is_quad) {
+      cmd.Instruction = CMD_QUAD_FAST_READ;
+      cmd.InstructionMode = QSPI_INSTRUCTION_1_LINE;
+      cmd.AddressMode = QSPI_ADDRESS_4_LINES;
+      cmd.AddressSize = QSPI_ADDRESS_24_BITS;
+      cmd.AlternateByteMode = QSPI_ALTERNATE_BYTES_NONE;
+      cmd.DataMode = QSPI_DATA_4_LINES;
+      cmd.DummyCycles = 6;
+    } else {
+      cmd.Instruction = CMD_READ;
+      cmd.InstructionMode = QSPI_INSTRUCTION_1_LINE;
+      cmd.AddressMode = QSPI_ADDRESS_1_LINE;
+      cmd.AddressSize = QSPI_ADDRESS_24_BITS;
+      cmd.AlternateByteMode = QSPI_ALTERNATE_BYTES_NONE;
+      cmd.DataMode = QSPI_DATA_1_LINE;
+      cmd.DummyCycles = 0;
+    }
+    cmd.DdrMode = QSPI_DDR_MODE_DISABLE;
+    cmd.DdrHoldHalfCycle = QSPI_DDR_HHC_ANALOG_DELAY;
+    cmd.SIOOMode = QSPI_SIOO_INST_EVERY_CMD;
+
     uint32_t current_addr = address + offset;
     uint32_t page_remaining = PSRAM_IS66WVS_PAGE_SIZE -
                               (current_addr & (PSRAM_IS66WVS_PAGE_SIZE - 1));
@@ -445,9 +533,10 @@ int psram_read(uint32_t address, uint8_t *data, uint32_t length) {
     if (hqspi.State != HAL_QSPI_STATE_READY) {
       if (HAL_QSPI_Abort(&hqspi) != HAL_OK ||
           __HAL_QSPI_GET_FLAG(&hqspi, QSPI_FLAG_BUSY) != RESET) {
-        LOG_ERR("QSPI not idle before read: state=0x%02X SR=0x%08X",
-                hqspi.State, (unsigned int)QUADSPI->SR);
+        TRACE("QSPI busy before read: st=0x%02X SR=0x%08X",
+              hqspi.State, (unsigned int)QUADSPI->SR);
         psram_recover_controller();
+        PSRAM_UNLOCK();
         ret = -EIO;
         break;
       }
@@ -456,21 +545,22 @@ int psram_read(uint32_t address, uint8_t *data, uint32_t length) {
 
     HAL_StatusTypeDef status = HAL_QSPI_Command(&hqspi, &cmd, 50);
     if (status == HAL_OK) {
-      status = HAL_QSPI_Receive(&hqspi, data + offset, 50);
+      status = psram_qspi_fast_rx(data + offset, chunk, 50);
     }
 
     if (status != HAL_OK) {
-      LOG_ERR("PSRAM physical read failed: addr=0x%06X, chunk=%u/%u, status=%d, qspi_state=0x%02X, err=0x%08X",
-              current_addr, chunk, length, (int)status, hqspi.State, hqspi.ErrorCode);
+      TRACE("PSRAM read err @0x%06X (%u/%u st=%d)",
+            current_addr, chunk, length, (int)status);
       psram_recover_controller();
+      PSRAM_UNLOCK();
       ret = -EIO;
       break;
     }
 
+    PSRAM_UNLOCK();
     offset += chunk;
   }
 
-  PSRAM_UNLOCK();
   return ret;
 }
 
@@ -648,7 +738,7 @@ int psram_run_self_test(struct psram_test_report *report) {
 
 #if defined(__ZEPHYR__)
   if (recorder_is_active()) {
-    LOG_WRN("Cannot run PSRAM memory test while recording is active");
+    TRACE("PSRAM test rejected: recording active");
     snprintf(report->status_msg, sizeof(report->status_msg),
              "FAIL: Audio recording session active; PSRAM test rejected");
     return -EBUSY;
@@ -680,11 +770,6 @@ int psram_run_self_test(struct psram_test_report *report) {
 
   report->detected = true;
   report->sample_shifting = current_sample_shifting;
-
-  LOG_INF("PSRAM SPI probe config: QSPI=%u Hz 1-1-1 mode dummy=0 burst=%u sshift=%u",
-          psram_get_clock_hz(), PSRAM_IS66WVS_SAFE_BURST_BYTES_SPI, current_sample_shifting);
-  LOG_INF("PSRAM JEDEC: ISSI MFID=0x%02X, KGD=0x%02X (PASS), Density=0x%02X (32Mb/4MB)",
-          report->id.mfid, report->id.kgd, report->id.density);
 
   /* ----------------------------------------------------------------------- */
   /* PHASE 4: TEST A — Dedicated 1-1-1 SPI Mode Integrity Baseline           */
@@ -771,8 +856,6 @@ int psram_run_self_test(struct psram_test_report *report) {
     uint32_t mode_d_errs = 0;
 
     active_burst_size = PSRAM_IS66WVS_SAFE_BURST_BYTES_QUAD;
-    LOG_INF("Quad verify config: QSPI=%u Hz 0x38/0xEB dummy=6 burst=%u sshift=%u",
-            psram_get_clock_hz(), active_burst_size, current_sample_shifting);
 
     for (uint32_t qpass = 1; qpass <= 3; qpass++) {
       for (uint32_t p = 0; p < ARRAY_SIZE(cross_sizes); p++) {
@@ -789,8 +872,8 @@ int psram_run_self_test(struct psram_test_report *report) {
                                      &wret_b, &rret_b);
         if (ret_b != 0) {
           mode_b_errs += (m_b > 0) ? m_b : 1;
-          LOG_ERR("Test B (Quad-W/SPI-R) failed: addr=0x%06X len=%u pass=%u off=+%u exp=0x%02X act=0x%02X diff=0x%02X (wret=%d, rret=%d)",
-                  addr, len, qpass, off_b, exp_b, act_b, diff_b, wret_b, rret_b);
+          TRACE("PSRAM Test B err @0x%06X p=%u (exp %02X act %02X)",
+                addr, qpass, exp_b, act_b);
         }
 
         /* Test C: SPI Write (0x02) + Quad Read (0xEB) */
@@ -803,8 +886,8 @@ int psram_run_self_test(struct psram_test_report *report) {
                                      &wret_c, &rret_c);
         if (ret_c != 0) {
           mode_c_errs += (m_c > 0) ? m_c : 1;
-          LOG_ERR("Test C (SPI-W/Quad-R) failed: addr=0x%06X len=%u pass=%u off=+%u exp=0x%02X act=0x%02X diff=0x%02X (wret=%d, rret=%d)",
-                  addr, len, qpass, off_c, exp_c, act_c, diff_c, wret_c, rret_c);
+          TRACE("PSRAM Test C err @0x%06X p=%u (exp %02X act %02X)",
+                addr, qpass, exp_c, act_c);
         }
 
         /* Test D: Quad Write (0x38) + Quad Read (0xEB) */
@@ -817,8 +900,8 @@ int psram_run_self_test(struct psram_test_report *report) {
                                      &wret_d, &rret_d);
         if (ret_d != 0) {
           mode_d_errs += (m_d > 0) ? m_d : 1;
-          LOG_ERR("Test D (Quad-W/Quad-R) failed: addr=0x%06X len=%u pass=%u off=+%u exp=0x%02X act=0x%02X diff=0x%02X (wret=%d, rret=%d)",
-                  addr, len, qpass, off_d, exp_d, act_d, diff_d, wret_d, rret_d);
+          TRACE("PSRAM Test D err @0x%06X p=%u (exp %02X act %02X)",
+                addr, qpass, exp_d, act_d);
         }
       }
     }
@@ -832,8 +915,6 @@ int psram_run_self_test(struct psram_test_report *report) {
       quad_test_active = false;
       quad_mode_enabled = true;
       report->quad_mode_verified = true;
-      LOG_INF("PSRAM Quad I/O mode (1-4-4, CMD 0x38/0xEB) verified and ENABLED (burst %u bytes)",
-              active_burst_size);
       snprintf(report->status_msg, sizeof(report->status_msg),
                "PASS: IS66WVS4M8 detected (4MB), %u passes verified, Quad I/O active (burst %u B)",
                report->passes_passed, active_burst_size);
@@ -864,8 +945,6 @@ int psram_run_self_test(struct psram_test_report *report) {
       psram_integrity_verified = true;
       report->spi_integrity_verified = true;
       report->integrity_verified = true;
-      LOG_WRN("PSRAM Quad I/O test failed (B:%u C:%u D:%u); falling back to 1-line SPI (burst %u bytes)",
-              mode_b_errs, mode_c_errs, mode_d_errs, active_burst_size);
       snprintf(report->status_msg, sizeof(report->status_msg),
                "PASS: SPI fallback read-back verified; Quad I/O unavailable (Test B:%u C:%u D:%u errs)",
                mode_b_errs, mode_c_errs, mode_d_errs);
@@ -921,7 +1000,7 @@ int psram_sleep(void) {
   HAL_StatusTypeDef status =
       HAL_QSPI_Command(&hqspi, &sCommand, HAL_QSPI_TIMEOUT_DEFAULT_VALUE);
   if (status != HAL_OK) {
-    LOG_ERR("PSRAM DPD command failed: %d", status);
+    TRACE("PSRAM DPD cmd failed: %d", status);
     PSRAM_UNLOCK();
     return -EIO;
   }
@@ -936,8 +1015,17 @@ int psram_sleep(void) {
   LL_GPIO_SetOutputPin(GPIOB, LL_GPIO_PIN_11);
   LL_GPIO_SetPinPull(GPIOB, LL_GPIO_PIN_11, LL_GPIO_PULL_UP);
 
-  LOG_INF("PSRAM entered Deep Power Down (CMD 0xB9, CE# high)");
   return 0;
+}
+
+void psram_log_boot_status(void) {
+  if (psram_present && psram_integrity_verified) {
+    TRACE("PSRAM Init Done (%s, 4 MB)", quad_mode_enabled ? "Quad" : "SPI");
+  } else if (psram_present) {
+    TRACE("PSRAM Init Done (verify failed, disabled)");
+  } else {
+    TRACE("PSRAM Init Done (not present, disabled)");
+  }
 }
 
 int psram_wake(void) {
@@ -965,11 +1053,9 @@ int psram_wake(void) {
   struct psram_id id = {0};
   int ret = psram_read_id(&id);
   if (ret == 0 && id.mfid == PSRAM_ISSI_MFID) {
-    LOG_INF("PSRAM successfully woken from Deep Power Down (MFID 0x%02X)",
-            id.mfid);
     return 0;
   } else {
-    LOG_WRN("PSRAM wake ID check warning (code %d, MFID 0x%02X)", ret, id.mfid);
+    TRACE("PSRAM wake ID check failed (code %d, MFID 0x%02X)", ret, id.mfid);
     return (ret != 0) ? ret : -EIO;
   }
 }

@@ -105,6 +105,7 @@ uint32_t config_store_calc_checksum(const struct wildsonic_persisted_config *cfg
  * @return 0 on success, negative error code on failure.
  */
 int config_store_init(void);
+void config_store_log_boot_status(void);
 
 /**
  * @brief Commit active configuration from RAM to flash using ping-pong slot alternation.
@@ -120,6 +121,18 @@ int config_store_save(void);
  *
  * @return 0 on success, negative error code on failure.
  */
+/**
+ * @brief Stage pending configuration in RAM without writing to flash.
+ *
+ * Marks pending_apply = 1 and increments pending_generation in RAM.
+ */
+void config_store_stage_pending(void);
+
+/**
+ * @brief Check if active/staged RAM config differs from last persisted flash record.
+ */
+bool config_store_has_unsaved_changes(void);
+
 int config_store_save_pending(void);
 
 /**

@@ -198,13 +198,13 @@ def test_sd_error_remains_primary_diagnostic_when_cleanup_also_fails():
 # ==============================================================================
 
 def test_psram_busy_retry_does_not_violate_acquisition_timing():
-    """Requirement 12: PSRAM busy retry does not violate acquisition timing (no 100 ms blocking)."""
+    """Verify PSRAM full drops newest block immediately without blocking recorder thread on wait_free."""
     code = RECORDER_C.read_text(encoding="utf-8")
-    # Verify that the old 100 ms busy-sleep loops (k_sleep(K_MSEC(10)) in a loop of 10) are removed:
+    # Old busy-sleep loops and blocking wait_free inside capture loop are removed:
     assert "for (int retry = 0; retry < 10; retry++)" not in code
-    # Replaced with semaphore signal and non-blocking wait:
+    assert "psram_staging_wait_free(" not in code
     assert "k_sem_give(&sd_writer_sem);" in code
-    assert "psram_staging_wait_free(" in code
+    assert "k_mem_slab_free(&pool, blk);" in code
 
 
 def test_psram_full_retry_does_not_overflow_upstream_queues():
@@ -275,7 +275,7 @@ def test_scheduler_resumes_at_next_eligible_opportunity_after_recovery():
     code = MAIN_C.read_text(encoding="utf-8")
     rec_thread = code.split("static void recorder_thread_fn(")[1].split("static uint32_t s_sleep_attempt_counter")[0]
     assert "s_schedule_cycle++;" in rec_thread
-    assert "recording opportunity skipped, schedule remains active for next window" in rec_thread
+    assert "Session %u failed (%d); skipped" in rec_thread
     assert "atomic_set(&s_schedule_paused, 0);" in rec_thread
 
 
@@ -287,7 +287,7 @@ def test_existing_file_contents_remain_unchanged():
     """Requirement 18: Existing file contents remain unchanged (no format, no truncate mode, recovery does not wipe SD)."""
     code = RECORDER_C.read_text(encoding="utf-8")
     # Files are opened with FS_O_CREATE | FS_O_WRITE, NOT FS_O_TRUNC
-    assert "ret = fs_open(&f, st.file, FS_O_CREATE | FS_O_WRITE);" in code
+    assert "return fs_open(fp, path, FS_O_CREATE | FS_O_WRITE);" in code
     # No formatting as recovery mechanism
     assert "disk_format" not in code
     assert "fs_mkfs" not in code

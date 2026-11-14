@@ -229,9 +229,10 @@ def test_diagnostic_memory_range_isolation():
 
 
 def test_production_build_excludes_benchmark_commands():
-    """Verify that psram bench commands and verbose diagnostics are TEST-only."""
+    """Verify that psram bench commands are TEST/benchmark-only."""
     main_c = (SRC_DIR / "main.c").read_text(encoding="utf-8")
-    assert "#if defined(CONFIG_WILDSONIC_VERBOSE_LOGS)" in main_c
+    assert "#if defined(CONFIG_WILDSONIC_TEST_OUTPUT)" in main_c
+    assert "#if defined(CONFIG_WILDSONIC_BENCHMARKS)" in main_c
     assert 'strcmp(a1, "bench") == 0' in main_c
 
 

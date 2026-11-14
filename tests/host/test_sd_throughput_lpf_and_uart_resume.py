@@ -80,11 +80,12 @@ def test_sd_benchmark_implementation_present():
 # ==============================================================================
 
 def test_psram_staging_overflow_preserves_enobufs():
-    """Verify PSRAM overflow returns -ENOBUFS and marks wav_verified = false."""
+    """Verify PSRAM overflow handles -ENOBUFS without blocking/aborting and reports loss truthfully."""
     rec_c = (APP_SRC / "recorder.c").read_text(encoding="utf-8")
 
     assert "st.psram_full_events++;" in rec_c
-    assert "err = -ENOBUFS;" in rec_c
+    assert "if (p_ret == -ENOBUFS)" in rec_c
+    assert "recorder_record_gap(" in rec_c
     assert "st.wav_verified = false;" in rec_c
 
 
@@ -205,7 +206,7 @@ def test_startup_initializes_dsp_once_after_config_load():
     config_import_idx = main_c.find("config_store_import_sd();")
     assert config_import_idx != -1
 
-    dsp_init_idx = main_c.find("dsp_init(settings.sample_rate);", config_import_idx)
+    dsp_init_idx = main_c.find("dsp_init(", config_import_idx)
     assert dsp_init_idx != -1
 
     # Before config_store_import_sd, there should be NO dsp_init call in main()
@@ -238,7 +239,7 @@ def test_wake_milestone_logging_deferred_until_clock_restoration():
     wfi_idx = sleep_c.find("__WFI();")
     clock_init_idx = sleep_c.find("stm32_clock_control_init", wfi_idx)
     console_resume_idx = sleep_c.find("console_async_resume()", wfi_idx)
-    clocks_restored_print_idx = sleep_c.find('printk("[TEST] CLOCKS_RESTORED\\n");', wfi_idx)
+    clocks_restored_print_idx = sleep_c.find('TRACE_RAW_TEST("[TEST] CLOCKS_RESTORED\\n");', wfi_idx)
 
     assert wfi_idx != -1
     assert clock_init_idx != -1

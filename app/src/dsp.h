@@ -59,6 +59,13 @@ int dsp_init(uint32_t sample_rate_hz);
 /* Configure DSP pipeline parameters */
 int dsp_configure(const struct dsp_config *cfg, uint32_t sample_rate_hz);
 
+/* Measure per-sample DSP cost on target and update rate_config_check calibration table. */
+void dsp_calibrate_cost(void);
+
+/* Enable or disable DC-block-only bypass mode for high-rate operation (> 192 kHz). */
+void dsp_set_dc_only_mode(bool dc_only);
+bool dsp_get_dc_only_mode(void);
+
 /* Validate and clamp LPF cutoff frequency (Hz) against Nyquist boundary (0.49 * fs).
  * Returns safe valid cutoff below Nyquist (e.g. 90000 Hz for 192k, 45000 Hz for 96k, 20000 Hz for 48k),
  * or 0 if disabled. */

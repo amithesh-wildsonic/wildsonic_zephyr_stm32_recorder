@@ -24,9 +24,16 @@ static inline void bkp_unlock(void)
 	}
 }
 
+static uint32_t s_captured_csr = 0;
+
 void retained_reboot_init(void)
 {
 	bkp_unlock();
+}
+
+void retained_reboot_capture_csr(uint32_t csr)
+{
+	s_captured_csr = csr;
 }
 
 void retained_reboot_set_reason(reboot_reason_t reason)
@@ -72,6 +79,18 @@ reboot_reason_t retained_reboot_get(struct retained_reboot_info *out_info)
 		memset(out_info, 0, sizeof(*out_info));
 	}
 
+	uint32_t csr = s_captured_csr ? s_captured_csr : RCC->CSR;
+
+	if ((csr & (RCC_CSR_IWDGRSTF | RCC_CSR_WWDGRSTF)) != 0U) {
+		/* Hardware watchdog reset overrides any pre-populated sleep marker */
+		LL_RTC_BAK_SetRegister(RTC, BKP_REG_MAGIC, 0);
+		res = REBOOT_REASON_WDT;
+		if (out_info) {
+			out_info->reason = res;
+		}
+		return res;
+	}
+
 	if (magic == REBOOT_BKP_MAGIC) {
 		res = (reboot_reason_t)LL_RTC_BAK_GetRegister(RTC, BKP_REG_REASON);
 		if (out_info) {
@@ -89,16 +108,13 @@ reboot_reason_t retained_reboot_get(struct retained_reboot_info *out_info)
 		return res;
 	}
 
-	/* Fall back to hardware CSR flags */
-	uint32_t csr = RCC->CSR;
-	if (csr & RCC_CSR_IWDGRSTF || csr & RCC_CSR_WWDGRSTF) {
-		res = REBOOT_REASON_WDT;
+	/* Fall back to hardware CSR flags; check BOR/POR before PINRSTF because STM32L4 sets both on POR */
+	if (csr & RCC_CSR_BORRSTF) {
+		res = REBOOT_REASON_POWER_ON_RESET;
 	} else if (csr & RCC_CSR_SFTRSTF) {
 		res = REBOOT_REASON_SOFTWARE_RESET;
 	} else if (csr & RCC_CSR_PINRSTF) {
 		res = REBOOT_REASON_PIN_RESET;
-	} else if (csr & RCC_CSR_BORRSTF) {
-		res = REBOOT_REASON_POWER_ON_RESET;
 	} else {
 		res = REBOOT_REASON_UNKNOWN;
 	}
@@ -115,6 +131,7 @@ static reboot_reason_t s_host_reason = REBOOT_REASON_UNKNOWN;
 static struct retained_reboot_info s_host_info;
 
 void retained_reboot_init(void) {}
+void retained_reboot_capture_csr(uint32_t csr) { (void)csr; }
 void retained_reboot_set_reason(reboot_reason_t reason)
 {
 	s_host_reason = reason;
@@ -160,9 +177,13 @@ const char *retained_reboot_reason_str(reboot_reason_t reason)
 	case REBOOT_REASON_PIN_RESET:
 		return "PIN_RESET";
 	case REBOOT_REASON_POWER_ON_RESET:
-		return "POWER_ON_RESET";
+		return "POWER_ON";
 	case REBOOT_REASON_SOFTWARE_RESET:
 		return "SOFTWARE_RESET";
+	case REBOOT_REASON_SLEEP_WAKE_RTC:
+		return "SLEEP_WAKE_RTC";
+	case REBOOT_REASON_SLEEP_WAKE_GPIO:
+		return "SLEEP_WAKE_GPIO";
 	case REBOOT_REASON_UNKNOWN:
 	default:
 		return "UNKNOWN";

@@ -605,14 +605,13 @@ def test_autonomous_scheduler_orchestration_contract():
     assert "scheduler_calculate_next" in m_text
     assert "recorder_record_session" in m_text
 
-    # 3. Diagnosability logging tags present
-    assert "[SCHEDULER]" in m_text
-    assert "AUTONOMOUS RECORDING SESSION" in m_text
-    assert "Current UTC Time" in m_text
-    assert "Active Date Range" in m_text
-    assert "Session Duration" in m_text
-    assert "Standby wait" in m_text
-    assert "Session %u finished" in m_text
+    # 3. Diagnosability / TEST lifecycle tags present
+    assert "dispatch_recording_session" in m_text
+    assert "Entering sleep %u s" in m_text
+    assert "Session %u failed (%d); skipped" in m_text
+    assert "[TEST] SLEEP_INTERVAL_STARTED:" in m_text
+    assert "[TEST] SCHEDULER_RESUMED" in m_text
+    assert "[TEST] NEXT_RECORDING_STARTED:" in m_text
 
     # 4. Serviced while console prompt is idle (pos == 0)
     assert "if (!main_is_scheduler_paused())" in m_text

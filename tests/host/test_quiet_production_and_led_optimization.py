@@ -25,7 +25,7 @@ def test_production_logging_guards_and_levels():
     assert "CONFIG_FS_LOG_LEVEL_WRN=y" in prj
     assert "CONFIG_SDMMC_LOG_LEVEL_INF=y" not in prj
 
-    # 2. Source module log levels guard checks
+    # 2. Source module unified trace usage checks (no per-module LOG_MODULE_REGISTER)
     modules_to_check = [
         "psram_is66wvs.c",
         "psram_staging.c",
@@ -39,8 +39,8 @@ def test_production_logging_guards_and_levels():
         with open(path, "r", encoding="utf-8") as f:
             code = f.read()
 
-        assert "CONFIG_WILDSONIC_VERBOSE_LOGS" in code, f"{mod} missing verbose logs guard"
-        assert "LOG_LEVEL_WRN" in code, f"{mod} missing LOG_LEVEL_WRN default for quiet production"
+        assert '#include "wildsonic_trace.h"' in code, f"{mod} missing wildsonic_trace.h"
+        assert "LOG_MODULE_REGISTER(" not in code, f"{mod} still has raw LOG_MODULE_REGISTER"
 
 
 def test_led_indicator_architecture_and_states():
@@ -67,9 +67,9 @@ def test_led_indicator_architecture_and_states():
     # Verify non-blocking work queue usage
     assert "k_work_delayable" in c_code or "k_work_reschedule" in c_code
     assert "gpio_pin_toggle_dt" in c_code or "gpio_pin_set_dt" in c_code
-    # Verify 1 Hz (500 ms) and 5 Hz (100 ms) intervals
-    assert "500" in c_code
-    assert "100" in c_code
+    # Production/Test parity: LED stays off during capture, 5 Hz (100 ms) on error
+    assert "gpio_pin_set_dt(&s_led, 0);" in c_code
+    assert "K_MSEC(100)" in c_code
 
 
 def test_led_indicator_integration_in_recorder_and_main():
@@ -110,15 +110,16 @@ def test_sram1_vs_sram2_memory_optimization():
     assert 'section("SRAM1")' in rec_code or 'SRAM1' in rec_code
     assert "_k_mem_slab_buf_pool" in rec_code
 
-    # SD writer stack tuned to 4096 bytes
-    assert "SD_WRITER_STACK_SIZE 4096" in rec_code
+    # SD writer stack tuned to 3072 bytes for >= 4 KB SRAM0 headroom
+    assert "SD_WRITER_STACK_SIZE 3072" in rec_code
 
-    # Kernel stacks in prj.conf tuned to 4096 bytes
+    # Kernel stacks and MPU guard in prj.conf
     with open(PRJ_CONF, "r", encoding="utf-8") as f:
         prj = f.read()
 
     assert "CONFIG_MAIN_STACK_SIZE=4096" in prj
-    assert "CONFIG_ISR_STACK_SIZE=4096" in prj
+    assert "CONFIG_ISR_STACK_SIZE=2048" in prj
+    assert "CONFIG_MPU_STACK_GUARD=y" in prj
 
 
 def test_sd_write_failure_auto_recovery():
@@ -130,16 +131,17 @@ def test_sd_write_failure_auto_recovery():
     # Recovery function definition and caller at session end
     assert "int recorder_storage_recover(void)" in rec_code
     assert "recorder_storage_recover();" in rec_code
-    assert "[ERROR] Recording session failed:" in rec_code
+    assert "Recording failed: err=%d written=%llu drops=%llu sd_err=%d" in rec_code
 
 
 def test_test_build_configuration_fragment():
-    """Verify test.conf exists and configures verbose development logging."""
+    """Verify test.conf exists and enables TEST output and info-level storage logging."""
     test_conf = APP_DIR / "test.conf"
     assert test_conf.exists(), "app/test.conf must exist for clean test builds"
     with open(test_conf, "r", encoding="utf-8") as f:
         conf = f.read()
-    assert "CONFIG_WILDSONIC_VERBOSE_LOGS=y" in conf
+    assert "CONFIG_WILDSONIC_TEST_OUTPUT=y" in conf
+    assert "CONFIG_LOG_DEFAULT_LEVEL=3" in conf
     assert "CONFIG_SDMMC_LOG_LEVEL_INF=y" in conf
     assert "CONFIG_DISK_LOG_LEVEL_INF=y" in conf
     assert "CONFIG_FS_LOG_LEVEL_INF=y" in conf

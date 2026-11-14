@@ -34,7 +34,7 @@ def test_sdmmc_stage_diagnostics_and_register_capture():
     assert "CMD_TIMEOUT" in code
     assert "TX_UNDERRUN" in code
     assert "RX_OVERRUN" in code
-    assert "DATA_TRANSFER" in code and "FINALIZATION" in code
+    assert '(file_offset >= WAV_HEADER_BYTES) ? "DATA" : "FINAL"' in code
     assert "LL_AHB1_GRP1_IsEnabledClock(LL_AHB1_GRP1_PERIPH_DMA2)" in code
 
 
@@ -43,7 +43,7 @@ def test_all_failing_stages_instrumented():
     code = RECORDER_C.read_text(encoding="utf-8")
     assert 'log_sdmmc_stage_diagnostics("FILE_OPEN_CREATE"' in code
     assert 'log_sdmmc_stage_diagnostics("INITIAL_HEADER_WRITE"' in code
-    assert 'printk("[STAGE_DIAG] Stage: AUDIO_ACQUISITION_START' in code
+    assert 'TRACE("audio_in_start failed: %d", ret);' in code
     assert 'log_sdmmc_stage_diagnostics("FILESYSTEM_WRITE_PSRAM"' in code
     assert 'log_sdmmc_stage_diagnostics("FILESYSTEM_WRITE_QUEUE"' in code
     assert 'log_sdmmc_stage_diagnostics("WAV_HEADER_FINAL_SEEK"' in code
@@ -59,13 +59,13 @@ def test_strict_rtc_wake_cycle_seven_messages():
     rtc_code = RTC_SLEEP_C.read_text(encoding="utf-8")
     main_code = MAIN_C.read_text(encoding="utf-8")
 
-    assert 'printk("[TEST] SLEEP_REQUESTED' in rec_code
-    assert 'printk("[TEST] STOP2_ENTERED\\n");' in rtc_code
-    assert 'printk("[TEST] RTC_WAKE_ISR\\n");' in rtc_code
-    assert 'printk("[TEST] STOP2_EXITED\\n");' in rtc_code
-    assert 'printk("[TEST] CLOCKS_RESTORED\\n");' in rtc_code
-    assert 'printk("[TEST] SCHEDULER_RESUMED\\n");' in main_code
-    assert 'printk("[TEST] NEXT_RECORDING_STARTED' in main_code
+    assert 'TRACE_RAW_TEST("[TEST] SLEEP_REQUESTED' in rec_code
+    assert 'TRACE_RAW_TEST("[TEST] STOP2_ENTERED\\n");' in rtc_code
+    assert 'TRACE_RAW_TEST("[TEST] RTC_WAKE_ISR\\n");' in rtc_code
+    assert 'TRACE_RAW_TEST("[TEST] STOP2_EXITED\\n");' in rtc_code
+    assert 'TRACE_RAW_TEST("[TEST] CLOCKS_RESTORED\\n");' in rtc_code
+    assert 'TRACE_RAW_TEST("[TEST] SCHEDULER_RESUMED\\n");' in main_code
+    assert 'TRACE_RAW_TEST("[TEST] NEXT_RECORDING_STARTED' in main_code
 
 
 def test_all_eleven_sleep_preconditions_audited():
@@ -99,11 +99,10 @@ def test_all_eleven_sleep_preconditions_audited():
 
 
 def test_samples_lost_does_not_fail_completed_recording():
-    """Verify dma_stats.samples_lost only triggers -EIO if samples_written is less than expected_samples."""
+    """Verify Request 9 overload policy: dma_stats.samples_lost is accounted as lost samples without triggering -EIO."""
     code = RECORDER_C.read_text(encoding="utf-8")
-    assert "if (st.samples_written < st.expected_samples && !recorder_abort_requested && err == 0) {" in code
-    assert "if (dma_stats.samples_lost != 0) {" in code
-    assert "err = -EIO;" in code
+    assert "if (dma_stats.samples_lost != 0) {\n      err = -EIO;" not in code
+    assert "total_gaps == 0U && dma_stats.samples_lost > 0U" in code
 
 
 def test_bounded_worker_and_events_pending_drain_in_audio_stop():

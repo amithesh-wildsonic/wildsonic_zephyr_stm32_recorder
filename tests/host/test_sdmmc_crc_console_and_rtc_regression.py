@@ -68,11 +68,11 @@ def test_hal_sd_error_data_crc_fail_definition_and_decoding():
 
 
 def test_recorder_captures_rich_sdmmc_diagnostics_on_write_error():
-    """Verify recorder.c captures file offset, approximate sector, latency, and hardware registers."""
+    """Verify recorder.c captures sector, latency, stage diagnostics, and batch interruption."""
     rec_c = RECORDER_C.read_text(encoding="utf-8")
-    assert "SD writer fs_write failed: ret=%d, expected=%u, file_offset=%llu, approx_sector=%u, write_latency=%u us" in rec_c
-    assert "SDMMC hardware registers: STA=0x%08X, DCOUNT=%u, DCTRL=0x%08X, CLKCR=0x%08X" in rec_c
-    assert "Batch %u interrupted: wrote %u of %u bytes to SD before failure (%d)" in rec_c
+    assert "SD fs_write failed: err=%d len=%u sec=%u us=%u" in rec_c
+    assert "SDMMC_HW: %s STA=0x%08X (%s) DCNT=%u DCTRL=0x%08X" in rec_c
+    assert "Batch %u interrupted: %u/%u B err=%d" in rec_c
 
 
 def test_storage_error_preserves_error_code_and_finalizes_partial_wav():
@@ -233,8 +233,7 @@ def test_rtc_calendar_set_readback_verification():
 
     assert "struct rtc_calendar_time readback;" in set_body
     assert "rtc_calendar_get(&readback)" in set_body
-    assert "RTC readback mismatch: expected" in set_body
-    assert "RTC calendar updated and verified" in set_body
+    assert "RTC readback mismatch (%04u-%02u-%02u %02u:%02u:%02u)" in set_body
 
 
 def test_config_store_write_status_file_checks_all_results():
@@ -245,10 +244,9 @@ def test_config_store_write_status_file_checks_all_results():
     status_body = status_match.group(1)
 
     assert "fs_truncate(&file, 0)" in status_body
-    assert "config_store_write_status_file: fs_truncate failed" in status_body
-    assert "config_store_write_status_file: write failed" in status_body
-    assert "config_store_write_status_file: fs_close failed" in status_body
-    assert "printk(\"Configuration status file has been created\\n\");" in status_body
+    assert 'TRACE("Status file truncate failed (%d)", rc);' in status_body
+    assert 'TRACE("Status write failed (%d)", err_code);' in status_body
+    assert 'TRACE("Status file close failed (%d)", rc);' in status_body
 
 
 def test_utc_and_local_timezone_rollover_boundaries():

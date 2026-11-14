@@ -198,7 +198,7 @@ def test_source_code_preserves_first_error_and_skips_wav_finalization():
     assert "sd_file_ptr = NULL;" in rec_c
 
     # 5. Interrupted batch log exists
-    assert "Batch %u interrupted: wrote %u of %u bytes to SD before failure" in rec_c
+    assert "Batch %u interrupted: %u/%u B err=%d" in rec_c
 
     # 6. Storage recovery executed after recorder_active is cleared
     rec_active_pos = rec_c.rfind("recorder_active = false;")

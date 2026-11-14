@@ -304,6 +304,7 @@ def test_source_code_synchronization_and_guards():
     assert "s_pingpong[0].state != PINGPONG_BUF_FREE" in rec_c
     assert "s_pingpong[1].state != PINGPONG_BUF_FREE" in rec_c
 
-    # Accounting log output
-    assert '"  SD Writer Ping-Pong Overlap        : %llu ms (%u buffer swaps)\\n"' in rec_c
-    assert '"  PSRAM QSPI Transaction Count       : %u (read throughput: %u KB/s)\\n"' in rec_c
+    # Accounting log output & TEST summary lines
+    assert '"RECORDING ACCOUNTING SUMMARY:\\n"' in rec_c
+    assert 'pingpong_overlap_us' in rec_c
+    assert 'psram_qspi_txn_count' in rec_c

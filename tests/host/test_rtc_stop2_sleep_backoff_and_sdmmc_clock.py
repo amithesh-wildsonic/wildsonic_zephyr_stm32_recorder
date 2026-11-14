@@ -51,7 +51,7 @@ def test_rtc_wakeup_timer_disable_write_ready_enable_sequence():
 def test_wutwf_timeout_handling_and_diagnostics():
     """Verify WUTWF polling enforces bounded timeout and reports register diagnostics on failure."""
     rtc_c = RTC_SLEEP_C.read_text(encoding="utf-8")
-    assert "Timeout waiting for RTC WUTWF" in rtc_c
+    assert "RTC WUTWF timeout (ISR=0x%08X, CR=0x%08X)" in rtc_c
     assert "-ETIMEDOUT" in rtc_c
     assert "RTC->ISR" in rtc_c
     assert "RTC->CR" in rtc_c
@@ -71,11 +71,10 @@ def test_unexpected_wake_source_detection_and_flag_inspection_before_irq():
     assert enable_irq_idx != -1, "__enable_irq() must be called"
     assert flag_check_idx < enable_irq_idx, "Hardware flags MUST be snapshotted BEFORE __enable_irq() to prevent ISR clearing them first"
 
-    # Rich register snapshot on unexpected wake
-    assert "Unexpected wake event: RTC WUT flag not asserted" in rtc_c
-    assert "EXTI_PR1=0x%08X" in rtc_c
-    assert "PWR_SR1=0x%08X" in rtc_c
-    assert "NVIC_ISPR=" in rtc_c
+    # Register snapshot on unexpected wake
+    assert "Unexpected Stop 2 wake (PR1=0x%08X, SR1=0x%08X)" in rtc_c
+    assert "exti_pr1_snap" in rtc_c
+    assert "pwr_sr1_snap" in rtc_c
 
 
 def test_exti_and_rtc_pending_flag_cleanup():
@@ -120,17 +119,13 @@ def test_usart2_rdr_read_guarded_by_rxne():
 
 
 def test_usart2_tc_timeout_reports_rich_diagnostic_registers():
-    """Verify USART2 TC check reports full diagnostic registers on timeout."""
+    """Verify USART2 TC check enforces bounded timeout and logs ISR on timeout."""
     rtc_c = RTC_SLEEP_C.read_text(encoding="utf-8")
-    assert "USART2 transmit-complete timeout; refusing Stop2 entry" in rtc_c
-    assert "ISR=0x%08X" in rtc_c
-    assert "CR1=0x%08X" in rtc_c
-    assert "CR3=0x%08X" in rtc_c
-    assert "BRR=0x%08X" in rtc_c
-    assert "TC=%d" in rtc_c
-    assert "TXE=%d" in rtc_c
-    assert "UE=%d" in rtc_c
-    assert "TE=%d" in rtc_c
+    assert "USART2 TC timeout before Stop2 (ISR=0x%08X)" in rtc_c
+    assert "USART2->ISR" in rtc_c
+    assert "LL_USART_IsActiveFlag_TC(USART2)" in rtc_c
+    assert "rtc_sleep_disarm();" in rtc_c
+    assert "return -ETIMEDOUT;" in rtc_c
 
 
 # ==============================================================================
@@ -158,7 +153,7 @@ def test_diagnostic_rate_limiting_prevents_console_flooding():
     main_c = MAIN_C.read_text(encoding="utf-8")
     assert "s_last_sleep_error_log_ms" in main_c
     assert "k_uptime_get() - s_last_sleep_error_log_ms >= 5000" in main_c
-    assert "Autonomous sleep attempt" in main_c and "returned error:" in main_c
+    assert "Sleep %u err %d (fail %u)" in main_c
 
 
 def test_console_interactive_awake_window():
@@ -173,7 +168,7 @@ def test_scheduler_behavior_after_sleep_failure():
     main_c = MAIN_C.read_text(encoding="utf-8")
     assert "s_consecutive_sleep_failures = 0;" in main_c
     assert "s_sleep_backoff_until_ms = 0;" in main_c
-    assert "resetting consecutive failure counter" in main_c
+    assert "s_last_sleep_error = 0;" in main_c
 
 
 # ==============================================================================
@@ -208,4 +203,4 @@ def test_runtime_divider_and_clock_diagnostic_consistency():
         assert "SDMMC initialized: clk=%u Hz (div=%u), bus=%u-bit, CLKCR=0x%08x" in driver
 
     rec_c = RECORDER_C.read_text(encoding="utf-8")
-    assert "SDMMC hardware clock: %u Hz (CLKDIV=%u, CLKCR=0x%08X, bus=%s)" in rec_c
+    assert "SDMMC clock: %u Hz (CLKDIV=%u, %s)" in rec_c

@@ -2,13 +2,7 @@
 #include "sd_fault_inject.h"
 #include <errno.h>
 #include <zephyr/kernel.h>
-#include <zephyr/logging/log.h>
-
-#if defined(CONFIG_WILDSONIC_VERBOSE_LOGS)
-LOG_MODULE_REGISTER(sd_fault, LOG_LEVEL_INF);
-#else
-LOG_MODULE_REGISTER(sd_fault, LOG_LEVEL_WRN);
-#endif
+#include "wildsonic_trace.h"
 
 #if defined(CONFIG_WILDSONIC_SD_FAULT_INJECT)
 
@@ -24,37 +18,37 @@ void sd_fault_inject_f1(void) {
   k_spinlock_key_t key = k_spin_lock(&s_fault_lock);
   s_f1_active = true;
   k_spin_unlock(&s_fault_lock, key);
-  printk("[FAULT_INJECT] F1 armed: Next write will fail with CRC error (-EIO)\n");
+  TRACE_RAW_TEST("[FAULT_INJECT] F1 armed: Next write will fail with CRC error (-EIO)\n");
 }
 
 void sd_fault_inject_f2(uint32_t attempts) {
   k_spinlock_key_t key = k_spin_lock(&s_fault_lock);
   s_f2_attempts_left = attempts;
   k_spin_unlock(&s_fault_lock, key);
-  printk("[FAULT_INJECT] F2 armed: Next %u writes will fail with -EIO then succeed\n",
-         (unsigned int)attempts);
+  TRACE_RAW_TEST("[FAULT_INJECT] F2 armed: Next %u writes will fail with -EIO then succeed\n",
+                 (unsigned int)attempts);
 }
 
 void sd_fault_inject_f3(void) {
   k_spinlock_key_t key = k_spin_lock(&s_fault_lock);
   s_f3_active = true;
   k_spin_unlock(&s_fault_lock, key);
-  printk("[FAULT_INJECT] F3 armed: Dead handle simulation (returns -9/-EBADF until card reinit)\n");
+  TRACE_RAW_TEST("[FAULT_INJECT] F3 armed: Dead handle simulation (returns -9/-EBADF until card reinit)\n");
 }
 
 void sd_fault_inject_f4(void) {
   k_spinlock_key_t key = k_spin_lock(&s_fault_lock);
   s_f4_active = true;
   k_spin_unlock(&s_fault_lock, key);
-  printk("[FAULT_INJECT] F4 armed: Permanent card failure (card dead)\n");
+  TRACE_RAW_TEST("[FAULT_INJECT] F4 armed: Permanent card failure (card dead)\n");
 }
 
 void sd_fault_inject_f5(uint32_t attempts) {
   k_spinlock_key_t key = k_spin_lock(&s_fault_lock);
   s_f5_attempts_left = attempts;
   k_spin_unlock(&s_fault_lock, key);
-  printk("[FAULT_INJECT] F5 armed: Next %u mount attempts will fail (-EIO)\n",
-         (unsigned int)attempts);
+  TRACE_RAW_TEST("[FAULT_INJECT] F5 armed: Next %u mount attempts will fail (-EIO)\n",
+                 (unsigned int)attempts);
 }
 
 void sd_fault_inject_clear(void) {
@@ -65,7 +59,7 @@ void sd_fault_inject_clear(void) {
   s_f4_active = false;
   s_f5_attempts_left = 0;
   k_spin_unlock(&s_fault_lock, key);
-  printk("[FAULT_INJECT] All fault injection hooks cleared\n");
+  TRACE_RAW_TEST("[FAULT_INJECT] All fault injection hooks cleared\n");
 }
 
 void sd_fault_inject_status(void) {
@@ -77,12 +71,12 @@ void sd_fault_inject_status(void) {
   uint32_t f5 = s_f5_attempts_left;
   k_spin_unlock(&s_fault_lock, key);
 
-  printk("=== SD FAULT INJECTION STATUS ===\n");
-  printk("  F1 (Fail next write CRC)     : %s\n", f1 ? "ARMED" : "OFF");
-  printk("  F2 (Fail N writes)           : %u attempts remaining\n", (unsigned int)f2);
-  printk("  F3 (Dead handle, return -9)  : %s\n", f3 ? "ARMED" : "OFF");
-  printk("  F4 (Permanent failure)       : %s\n", f4 ? "ARMED" : "OFF");
-  printk("  F5 (Fail M mounts after wake): %u attempts remaining\n", (unsigned int)f5);
+  TRACE_RAW_TEST("=== SD FAULT INJECTION STATUS ===\n");
+  TRACE_RAW_TEST("  F1 (Fail next write CRC)     : %s\n", f1 ? "ARMED" : "OFF");
+  TRACE_RAW_TEST("  F2 (Fail N writes)           : %u attempts remaining\n", (unsigned int)f2);
+  TRACE_RAW_TEST("  F3 (Dead handle, return -9)  : %s\n", f3 ? "ARMED" : "OFF");
+  TRACE_RAW_TEST("  F4 (Permanent failure)       : %s\n", f4 ? "ARMED" : "OFF");
+  TRACE_RAW_TEST("  F5 (Fail M mounts after wake): %u attempts remaining\n", (unsigned int)f5);
 }
 
 int sd_fault_inject_check_write(uint32_t sector, uint32_t count) {
@@ -92,20 +86,20 @@ int sd_fault_inject_check_write(uint32_t sector, uint32_t count) {
   k_spinlock_key_t key = k_spin_lock(&s_fault_lock);
   if (s_f4_active) {
     k_spin_unlock(&s_fault_lock, key);
-    LOG_WRN("[FAULT_INJECT] F4 triggered: permanent card dead -> -EIO");
+    TRACE_TEST("[FAULT_INJECT] F4 triggered -> -EIO");
     return -EIO;
   }
 
   if (s_f3_active) {
     k_spin_unlock(&s_fault_lock, key);
-    LOG_WRN("[FAULT_INJECT] F3 triggered: dead handle -> -EBADF (-9)");
+    TRACE_TEST("[FAULT_INJECT] F3 triggered -> -EBADF (-9)");
     return -EBADF;
   }
 
   if (s_f1_active) {
     s_f1_active = false;
     k_spin_unlock(&s_fault_lock, key);
-    LOG_WRN("[FAULT_INJECT] F1 triggered: single CRC error -> -EIO");
+    TRACE_TEST("[FAULT_INJECT] F1 triggered -> -EIO");
     return -EIO;
   }
 
@@ -113,7 +107,7 @@ int sd_fault_inject_check_write(uint32_t sector, uint32_t count) {
     s_f2_attempts_left--;
     uint32_t rem = s_f2_attempts_left;
     k_spin_unlock(&s_fault_lock, key);
-    LOG_WRN("[FAULT_INJECT] F2 triggered: retry failure (remaining: %u) -> -EIO", rem);
+    TRACE_TEST("[FAULT_INJECT] F2 triggered (rem %u) -> -EIO", rem);
     return -EIO;
   }
 
@@ -125,7 +119,7 @@ int sd_fault_inject_check_mount(void) {
   k_spinlock_key_t key = k_spin_lock(&s_fault_lock);
   if (s_f4_active) {
     k_spin_unlock(&s_fault_lock, key);
-    LOG_WRN("[FAULT_INJECT] F4 triggered during mount -> -EIO");
+    TRACE_TEST("[FAULT_INJECT] F4 mount -> -EIO");
     return -EIO;
   }
 
@@ -133,11 +127,12 @@ int sd_fault_inject_check_mount(void) {
     s_f5_attempts_left--;
     uint32_t rem = s_f5_attempts_left;
     k_spin_unlock(&s_fault_lock, key);
-    LOG_WRN("[FAULT_INJECT] F5 triggered: mount failed (remaining: %u) -> -EIO", rem);
+    TRACE_TEST("[FAULT_INJECT] F5 mount (rem %u) -> -EIO", rem);
     return -EIO;
   }
 
-  k_spin_unlock(&s_fault_lock, key);
+  k_spinlock_key_t key2 = key;
+  k_spin_unlock(&s_fault_lock, key2);
   return 0;
 }
 
@@ -145,7 +140,7 @@ void sd_fault_inject_notify_reinit(void) {
   k_spinlock_key_t key = k_spin_lock(&s_fault_lock);
   if (s_f3_active) {
     s_f3_active = false;
-    LOG_INF("[FAULT_INJECT] Full card re-init detected: F3 cleared");
+    TRACE_TEST("[FAULT_INJECT] Re-init: F3 cleared");
   }
   k_spin_unlock(&s_fault_lock, key);
 }

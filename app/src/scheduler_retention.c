@@ -1,14 +1,8 @@
 /* SPDX-License-Identifier: Apache-2.0 */
 #include "scheduler_retention.h"
 #include <zephyr/kernel.h>
-#include <zephyr/logging/log.h>
+#include "wildsonic_trace.h"
 #include <errno.h>
-
-#if defined(CONFIG_WILDSONIC_VERBOSE_LOGS)
-LOG_MODULE_REGISTER(sched_ret, LOG_LEVEL_INF);
-#else
-LOG_MODULE_REGISTER(sched_ret, LOG_LEVEL_WRN);
-#endif
 
 #if defined(CONFIG_SOC_SERIES_STM32L4X)
 #include <stm32l4xx_ll_pwr.h>
@@ -134,8 +128,7 @@ int scheduler_retention_restore(time_t *end_utc)
 
 	uint32_t ver = bkp_read(REG_VER);
 	if (ver != SCHEDULER_RETENTION_VERSION) {
-		LOG_WRN("Retention version mismatch: got 0x%08X, expected 0x%08X",
-		        ver, SCHEDULER_RETENTION_VERSION);
+		TRACE("Retention version mismatch: 0x%08X", ver);
 		return -EINVAL;
 	}
 
@@ -145,15 +138,14 @@ int scheduler_retention_restore(time_t *end_utc)
 
 	uint32_t expected_cksum = calc_checksum(magic, ver, low, high);
 	if (stored_cksum != expected_cksum) {
-		LOG_ERR("Retention checksum mismatch: got 0x%08X, expected 0x%08X",
-		        stored_cksum, expected_cksum);
+		TRACE("Retention checksum mismatch: 0x%08X", stored_cksum);
 		return -EBADMSG;
 	}
 
 	uint64_t raw_ts = ((uint64_t)high << 32) | (uint64_t)low;
 	/* Sanity check: valid unix time between ~2024 and 2099 */
 	if (raw_ts < 1704067200ULL || raw_ts > 4102444800ULL) {
-		LOG_WRN("Retention timestamp out of bounds: %llu", (unsigned long long)raw_ts);
+		TRACE("Retention timestamp invalid: %llu", (unsigned long long)raw_ts);
 		return -EINVAL;
 	}
 
@@ -168,7 +160,6 @@ void scheduler_retention_invalidate(void)
 	bkp_write(REG_TS_LOW, 0);
 	bkp_write(REG_TS_HIGH, 0);
 	bkp_write(REG_CKSUM, 0);
-	LOG_INF("Invalidated scheduler retention backup registers");
 }
 
 static inline uint32_t calc_ble_checksum(uint32_t magic, uint32_t ver, uint32_t fp)
@@ -203,8 +194,7 @@ int ble_retention_restore_fingerprint(uint32_t *fingerprint)
 
 	uint32_t ver = bkp_read(REG_BLE_VER);
 	if (ver != BLE_PROV_RETENTION_VERSION) {
-		LOG_WRN("BLE retention version mismatch: got 0x%08X, expected 0x%08X",
-		        ver, BLE_PROV_RETENTION_VERSION);
+		TRACE("BLE retention ver mismatch: 0x%08X", ver);
 		return -EINVAL;
 	}
 
@@ -213,8 +203,7 @@ int ble_retention_restore_fingerprint(uint32_t *fingerprint)
 
 	uint32_t expected_cksum = calc_ble_checksum(magic, ver, fp);
 	if (stored_cksum != expected_cksum) {
-		LOG_ERR("BLE retention checksum mismatch: got 0x%08X, expected 0x%08X",
-		        stored_cksum, expected_cksum);
+		TRACE("BLE retention cksum mismatch: 0x%08X", stored_cksum);
 		return -EBADMSG;
 	}
 
@@ -228,6 +217,5 @@ void ble_retention_invalidate_fingerprint(void)
 	bkp_write(REG_BLE_VER, 0);
 	bkp_write(REG_BLE_FP, 0);
 	bkp_write(REG_BLE_CKSUM, 0);
-	LOG_INF("Invalidated BLE retention backup registers");
 }
 
